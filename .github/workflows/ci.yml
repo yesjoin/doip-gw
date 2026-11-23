@@ -61,3 +61,18 @@ jobs:
           echo "$OUT"
           echo "$OUT" | grep -q "0x8001" || { echo "::error::doip-dump 没认出 0x8001"; exit 1; }
           echo "$OUT" | grep -q "ReadDataByIdentifier" || { echo "::error::doip-dump 没认出 0x22 服务"; exit 1; }
+
+      - name: 端到端：实体 + 客户端走真 UDP（loopback）
+        run: |
+          ./build/doip-discover --serve --port 13455 --seconds 3 > /tmp/serve.log 2>&1 &
+          SRV=$!
+          sleep 0.5
+          if ! ./build/doip-discover --host 127.0.0.1 --port 13455 --wait-ms 800; then
+            echo "::error::客户端没收到应答"
+            cat /tmp/serve.log
+            exit 1
+          fi
+          wait $SRV || true
+          cat /tmp/serve.log
+          grep -q "回了 1 个应答" /tmp/serve.log || { echo "::error::实体侧没记录到应答"; exit 1; }
+

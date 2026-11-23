@@ -13,21 +13,35 @@ if(DOIP_WERROR)
     add_compile_options(-Werror)
 endif()
 
-# ---- M0：报文编解码库 ----
+find_package(Threads REQUIRED)
+
+# ---- M0：报文编解码库（纯逻辑，不碰 socket）----
 add_library(doip-codec STATIC src/DoIpCodec.cpp)
 target_include_directories(doip-codec PUBLIC include)
 
-# ---- M0 自测：字节层 ----
+# ---- M1：发现层（应答逻辑 + UDP 服务器）----
+add_library(doip-discovery STATIC src/DoIpDiscovery.cpp)
+target_link_libraries(doip-discovery PUBLIC doip-codec)
+
+# ---- M0 自测 ----
 add_executable(codec-selftest tests/codec_selftest.cpp)
 target_link_libraries(codec-selftest PRIVATE doip-codec)
 
-# ---- M0 工具：把十六进制翻译成人话 ----
+# ---- M1 自测（用了 std::thread 起服务器，所以要 pthread）----
+add_executable(discovery-selftest tests/discovery_selftest.cpp)
+target_link_libraries(discovery-selftest PRIVATE doip-discovery Threads::Threads)
+
+# ---- 工具 ----
 add_executable(doip-dump tools/doip_dump.cpp)
 target_link_libraries(doip-dump PRIVATE doip-codec)
 
+add_executable(doip-discover tools/doip_discover.cpp)
+target_link_libraries(doip-discover PRIVATE doip-discovery Threads::Threads)
+
 # ---------------------------------------------------------------------------
-# 测试注册：ctest 一条命令跑全部（项目二 M6 的经验，一开始就接上）
+# 测试注册：ctest 一条命令跑全部
 # ---------------------------------------------------------------------------
 enable_testing()
-add_test(NAME doip-codec COMMAND codec-selftest)
-set_tests_properties(doip-codec PROPERTIES LABELS unit)
+add_test(NAME doip-codec     COMMAND codec-selftest)
+add_test(NAME doip-discovery COMMAND discovery-selftest)
+set_tests_properties(doip-codec doip-discovery PROPERTIES LABELS unit)
