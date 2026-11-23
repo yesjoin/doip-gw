@@ -157,18 +157,59 @@ bool IsoTpClient::recvFrame (std::uint8_t data[8], std::uint8_t &dlc, int timeou
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// 清掉"迟到帧"
+//
+// 为什么必须有这个：M4 的时候网关总是第一个用总线的人，一个请求接一个请求，
+// 中间没有别人插话。但 M5 接上第三方客户端、或者总线上还跑着项目一的 tester 时，
+// 我们的 socket 里会躺着**上一轮/别人家的 7E8 帧**：
+//
+//   tester 单聊 ECU 时 ECU 回了 20 字节 VIN（FF + 2 个 CF），
+//   这些帧我们的 socket 也收到了（总线是共享的），只是没人读，就堆在缓冲区里。
+//
+// 下一次 request() 发完首帧去等流控，第一帧读出来的却是那堆旧 CF
+// → "首帧之后收到的不是流控帧" → 整条请求失败。
+// 现象很像"网关偶发超时"，实际是**没清仓**。
+//
+// 所以每次发请求前先把缓冲区读空（0 超时，读一条算一条），并记账 staleSkipped。
+// ---------------------------------------------------------------------------
+std::size_t IsoTpClient::drainStale ()
+{
+    std::size_t n = 0;
+    while (true)
+    {
+        std::uint8_t d[8];
+        std::uint8_t dlc = 0;
+        std::string  e;
+        if (!recvFrame (d, dlc, 0, e)) break;
+        ++n;
+        ++st_.staleSkipped;
+    }
+    return n;
+}
+
 bool IsoTpClient::waitFlowControl (FlowControl &fc, std::string &err)
 {
-    std::uint8_t d[8];
-    std::uint8_t dlc = 0;
-    if (!recvFrame (d, dlc, static_cast<int> (tim_.p2Ms), err)) { ++st_.timeouts; return false; }
-    if (kindOf (d) != FrameKind::FlowControl)
+    // 等 FC 时也可能先撞上迟到帧/噪声帧：跳过，但整体不超过 p2 的预算。
+    const auto deadline = std::chrono::steady_clock::now () + std::chrono::milliseconds (tim_.p2Ms);
+    while (true)
     {
-        err = "首帧之后收到的不是流控帧（协议要求先等 FC）";
-        return false;
+        const auto now = std::chrono::steady_clock::now ();
+        if (now >= deadline) { ++st_.timeouts; err = "等流控超时"; return false; }
+        const int left = static_cast<int> (
+            std::chrono::duration_cast<std::chrono::milliseconds> (deadline - now).count ());
+
+        std::uint8_t d[8];
+        std::uint8_t dlc = 0;
+        if (!recvFrame (d, dlc, left <= 0 ? 1 : left, err)) { ++st_.timeouts; return false; }
+        if (kindOf (d) != FrameKind::FlowControl)
+        {
+            ++st_.staleSkipped;    // 不是 FC：当迟到帧丢掉，接着等
+            continue;
+        }
+        ++st_.flowRecv;
+        return parseFlowControl (d, fc, err);
     }
-    ++st_.flowRecv;
-    return parseFlowControl (d, fc, err);
 }
 
 bool IsoTpClient::request (const std::vector<std::uint8_t> &uds,
@@ -177,6 +218,9 @@ bool IsoTpClient::request (const std::vector<std::uint8_t> &uds,
 {
     ++st_.requests;
     resp.clear ();
+
+    // 发之前先清仓：共享总线上，缓冲区里可能躺着上一轮/别人家的旧帧
+    drainStale ();
 
     std::vector<std::vector<std::uint8_t>> frames;
     if (!segmentMessage (uds, frames, err, cfg_.padByte)) return false;
@@ -224,6 +268,13 @@ bool IsoTpClient::request (const std::vector<std::uint8_t> &uds,
         {
             // 我们没发 FF 却收到 FC：是上一轮的残留或别人家的，跳过
             ++st_.flowRecv;
+            continue;
+        }
+
+        // 没在等 FF 的时候收到连续帧 → 同样是迟到帧（上一条响应的尾巴），丢掉
+        if (kindOf (d) == FrameKind::ConsecutiveFrame && !asm_.receiving ())
+        {
+            ++st_.staleSkipped;
             continue;
         }
 

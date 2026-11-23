@@ -1,15 +1,15 @@
 // ============================================================================
-// doip_gateway.cpp —— M4 的成品：以太网进、CAN 出的诊断网关
+// doip_gateway.cpp —— M4/M5 的成品：以太网进、CAN 出的诊断网关
 //
 // 用法：
-//   doip-gateway --iface vcan0 --port 13400 --seconds 20 [--tx 7E0] [--rx 7E8]
+//   doip-gateway --iface vcan0 --port 13400 --seconds 20 [--tx 7E0] [--rx 7E8] [--vin ...]
 //
-// 另一边（项目一）：
-//   ~/uds-ecu/build/uds-demo --ecu --iface vcan0 --wait-s 60
-// 然后：
-//   ./build/doip-client --port 13400 --sa 0E00 --diag "22 F1 90"
-//   → 以太网上是 0x8001，CAN 上是 7E0 的首帧 + 连续帧，回来的是 20 字节 VIN。
+// M5 加的一件事：同一个端口号上再开 UDP 车辆发现。
+//   真实 DoIP 实体的发现请求（UDP 13400）和路由激活（TCP 13400）是同一个端口号，
+//   只是协议不同，所以这里 UDP/TCP 绑同一个 --port 不会冲突。
+//   不加这一步，第三方客户端根本"看不见"网关，只能靠手工填 IP。
 // ============================================================================
+#include "DoIpDiscovery.h"
 #include "DoIpGateway.h"
 #include "DoIpTcpServer.h"
 
@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <thread>
 
 using namespace doip;
 
@@ -28,6 +29,10 @@ int main (int argc, char **argv)
     IsoTpConfig iso;
     IsoTpTiming tim;
 
+    // 实体的 VIN 必须和 CAN 侧 ECU 的 VIN 一致，否则同一辆车会报出两个 VIN。
+    EntityConfig ent;
+    ent.vin = "LSVAA0000A1234567";
+
     for (int i = 1; i < argc; ++i)
     {
         const std::string a = argv[i];
@@ -37,11 +42,12 @@ int main (int argc, char **argv)
         else if (a == "--tx" && i + 1 < argc)       iso.txId = std::strtoul (argv[++i], nullptr, 16);
         else if (a == "--rx" && i + 1 < argc)       iso.rxId = std::strtoul (argv[++i], nullptr, 16);
         else if (a == "--stmin" && i + 1 < argc)    tim.stminDefault = static_cast<std::uint32_t> (std::atoi (argv[++i]));
+        else if (a == "--vin" && i + 1 < argc)      ent.vin = argv[++i];
         else
         {
             std::fprintf (stderr,
                           "用法：%s [--iface vcan0] [--port 13400] [--seconds 20] "
-                          "[--tx 7E0] [--rx 7E8] [--stmin 10]\n", argv[0]);
+                          "[--tx 7E0] [--rx 7E8] [--stmin 10] [--vin LSVAA0000A1234567]\n", argv[0]);
             return 2;
         }
     }
@@ -68,9 +74,28 @@ int main (int argc, char **argv)
         return 1;
     }
 
-    std::printf ("DoIP→ISO-TP 网关：TCP %u ↔ %s（发 0x%03X，收 0x%03X），跑 %d 秒\n\n",
+    std::printf ("DoIP→ISO-TP 网关：TCP %u ↔ %s（发 0x%03X，收 0x%03X），跑 %d 秒\n",
                  static_cast<unsigned> (srv.port ()), iface.c_str (),
                  static_cast<unsigned> (iso.txId), static_cast<unsigned> (iso.rxId), seconds);
+
+    // ---- M5：UDP 车辆发现（和 TCP 用同一个端口号，协议不同不冲突） ----
+    UdpDiscoveryServer udp (ent, port);
+    bool udpOn = false;
+    std::thread udpThread;
+    if (udp.open (err))
+    {
+        udpOn = true;
+        udp.logger = [] (const std::string &line) { std::printf ("  [UDP] %s\n", line.c_str ()); };
+        udpThread = std::thread ([&udp, seconds] { udp.runFor (std::chrono::seconds (seconds)); });
+        std::printf ("UDP %u 车辆发现已开：VIN=%s，逻辑地址=0x%04X（第三方客户端可以直接扫到）\n\n",
+                     static_cast<unsigned> (udp.port ()), ent.vin.c_str (),
+                     static_cast<unsigned> (ent.logicalAddress));
+    }
+    else
+    {
+        std::printf ("[警告] UDP %u 起不来（%s），只能手工填 IP 连接\n\n",
+                     static_cast<unsigned> (port), err.c_str ());
+    }
 
     srv.logger = [] (const std::string &line) { std::printf ("  %s\n", line.c_str ()); };
     srv.diagnosticSink = [&gw] (const DiagnosticRequest &req,
@@ -79,19 +104,28 @@ int main (int argc, char **argv)
 
     srv.runFor (std::chrono::seconds (seconds));
 
+    if (udpOn)
+    {
+        udp.requestStop ();
+        if (udpThread.joinable ()) udpThread.join ();
+    }
+
     std::printf ("\n--- 以太网侧 ---\n");
+    if (udpOn)
+        std::printf ("发现：收到 %zu 条 UDP，回了 %zu 条\n", udp.datagrams (), udp.answered ());
     std::printf ("接入 %zu，激活 %zu，诊断请求 %zu（ACK %zu / NACK %zu）\n",
                  srv.connectionsAccepted (), srv.activationsOk (), srv.diagnosticRequests (),
                  srv.diagnosticAcks (), srv.diagnosticNacks ());
     std::printf ("--- CAN 侧 ---\n");
     std::printf ("转发 %zu 条，失败 %zu 条，最长排队 %zu ms\n",
                  gw.handled (), gw.failed (), gw.maxWaitMs ());
-    std::printf ("ISO-TP：发帧 %llu，收帧 %llu，流控 收 %llu / 发 %llu，超时 %llu，序号错 %llu\n",
+    std::printf ("ISO-TP：发帧 %llu，收帧 %llu，流控 收 %llu / 发 %llu，超时 %llu，序号错 %llu，迟到帧丢弃 %llu\n",
                  static_cast<unsigned long long> (gw.stats ().framesSent),
                  static_cast<unsigned long long> (gw.stats ().framesRecv),
                  static_cast<unsigned long long> (gw.stats ().flowRecv),
                  static_cast<unsigned long long> (gw.stats ().flowSent),
                  static_cast<unsigned long long> (gw.stats ().timeouts),
-                 static_cast<unsigned long long> (gw.stats ().seqErrors));
+                 static_cast<unsigned long long> (gw.stats ().seqErrors),
+                 static_cast<unsigned long long> (gw.stats ().staleSkipped));
     return 0;
 }

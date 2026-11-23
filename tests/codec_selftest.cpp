@@ -201,6 +201,15 @@ int main ()
     raP.pop_back ();
     check (!decodePayload (raP, ra2, err), "0x0005 只有 10 字节 → 拒绝（不猜）");
 
+    // 早期版本的 0x0005 只有 7 字节（没有 OEM 4 字节）—— 第三方客户端 doipclient 发的就是这种。
+    std::vector<std::uint8_t> raP7 = {0x0E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    RoutingActivationRequest ra7;
+    check (decodePayload (raP7, ra7, err), "0x0005 的 7 字节变体也收（互通性优先）");
+    check (ra7.sourceAddress == 0x0E00 && ra7.activationType == 0x00 && ra7.oemSpecific == 0,
+           "7 字节变体：SA/类型解出来，OEM 字段当 0");
+    check (!decodePayload ({0x0E, 0x00, 0x00, 0x00, 0x00, 0x00}, ra7, err), "6 字节 → 还是拒绝（别乱猜）");
+    check (encodePayload (ra).size () == 11, "发送侧始终发标准的 11 字节（收可以宽，发必须严）");
+
     RoutingActivationResponse rr;
     rr.testerAddress = 0x0E00;
     rr.entityAddress = 0x0001;

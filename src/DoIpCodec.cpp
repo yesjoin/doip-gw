@@ -263,7 +263,10 @@ bool decodePayload (const std::vector<std::uint8_t> &p, VehicleAnnouncement &out
 }
 
 // ---------------------------------------------------------------------------
-// 0x0005 路由激活请求（11 字节）
+// 0x0005 路由激活请求
+//   11 字节 = SA(2) + 类型(1) + reserved(4) + OEM(4)   ← ISO 13400-2:2019
+//    7 字节 = SA(2) + 类型(1) + reserved(4)            ← 早期版本/部分客户端
+// 接收侧两种都收（第三方客户端 doipclient 发的是 7 字节那种），发送侧只发 11 字节。
 // ---------------------------------------------------------------------------
 std::vector<std::uint8_t> encodePayload (const RoutingActivationRequest &v)
 {
@@ -277,15 +280,15 @@ std::vector<std::uint8_t> encodePayload (const RoutingActivationRequest &v)
 
 bool decodePayload (const std::vector<std::uint8_t> &p, RoutingActivationRequest &out, std::string &err)
 {
-    if (p.size () != 11)
+    if (p.size () != 11 && p.size () != 7)
     {
-        err = "0x0005 应为 11 字节，实际 " + std::to_string (p.size ());
+        err = "0x0005 应为 11 或 7 字节，实际 " + std::to_string (p.size ());
         return false;
     }
     out.sourceAddress  = read16 (p.data ());
     out.activationType = p[2];
     out.reserved       = read32 (p.data () + 3);
-    out.oemSpecific    = read32 (p.data () + 7);
+    out.oemSpecific    = (p.size () == 11) ? read32 (p.data () + 7) : 0;
     return true;
 }
 

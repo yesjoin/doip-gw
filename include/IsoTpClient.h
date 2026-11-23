@@ -54,6 +54,7 @@ public:
         std::uint64_t flowSent      = 0;
         std::uint64_t timeouts      = 0;
         std::uint64_t seqErrors     = 0;
+        std::uint64_t staleSkipped  = 0;   // 上一条事务的迟到帧 / 别的 tester 的帧，丢了多少
     };
     const Stats &stats () const { return st_; }
 
@@ -61,6 +62,8 @@ private:
     bool sendFrame (const std::uint8_t data[8], std::string &err);
     bool recvFrame (std::uint8_t data[8], std::uint8_t &dlc, int timeoutMs, std::string &err);
     bool waitFlowControl (FlowControl &fc, std::string &err);
+    // 把缓冲区里已经躺着的旧帧先清掉（见 .cpp 里的说明：共享总线上这是必需的）
+    std::size_t drainStale ();
     static std::uint32_t stminToMs (std::uint8_t stmin);
 
     std::string  iface_;

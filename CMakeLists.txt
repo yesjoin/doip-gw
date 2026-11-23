@@ -74,7 +74,8 @@ add_executable(doip-client tools/doip_client.cpp)
 target_link_libraries(doip-client PRIVATE doip-routing doip-diag Threads::Threads)
 
 add_executable(doip-gateway tools/doip_gateway.cpp)
-target_link_libraries(doip-gateway PRIVATE doip-tcp doip-isotp Threads::Threads)
+# doip-discovery：M5 起网关也要回答 UDP 车辆发现（真实实体发现和激活是同一个端口号）
+target_link_libraries(doip-gateway PRIVATE doip-tcp doip-isotp doip-discovery Threads::Threads)
 
 # ---------------------------------------------------------------------------
 # 测试注册：ctest 一条命令跑全部
