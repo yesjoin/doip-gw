@@ -15,6 +15,7 @@
 // 心跳的时间参数可以调小，自测才有办法在 1 秒内跑完"超时断开"。
 // ============================================================================
 #include "DoIpCodec.h"
+#include "DoIpDiagnostic.h"
 #include "DoIpRouting.h"
 
 #include <chrono>
@@ -32,6 +33,7 @@ struct TcpServerConfig
     std::uint16_t entityAddress    = 0x0001;
     std::size_t   maxConnections   = 4;
     std::uint32_t maxPayload       = kDefaultMaxPayload;
+    std::size_t   maxUds           = 512;     // 单条诊断的 UDS 上限（超过 → 0x8003 0x04）
 
     // 心跳：激活后静默超过 idleBeforeAliveCheck → 发 0x0007；
     //       发出去后 aliveCheckTimeout 内没收到 0x0008 → 断开。
@@ -61,8 +63,15 @@ public:
     std::size_t activationsOk () const { return activations_; }
     std::size_t aliveCheckTimeouts () const { return aliveTimeouts_; }
     std::size_t activeConnections () const;
+    std::size_t diagnosticRequests () const { return diagRequests_; }
+    std::size_t diagnosticAcks () const { return diagAcks_; }
+    std::size_t diagnosticNacks () const { return diagNacks_; }
 
     std::function<void (const std::string &)> logger;
+
+    // M3 的下游。为空时：只回 0x8002，不产生响应报文（通道仍能验完）。
+    // M4 把它接成 ISO-TP 通道。
+    DiagnosticSink diagnosticSink;
 
 private:
     struct Conn
@@ -83,6 +92,7 @@ private:
     void log (const std::string &s);
 
     TcpServerConfig cfg_;
+    DiagnosticChannel diag_;
     std::uint16_t   port_;
     int             listenFd_ = -1;
     bool            stop_     = false;
@@ -90,6 +100,9 @@ private:
     std::size_t     accepted_    = 0;
     std::size_t     activations_ = 0;
     std::size_t     aliveTimeouts_ = 0;
+    std::size_t     diagRequests_ = 0;
+    std::size_t     diagAcks_     = 0;
+    std::size_t     diagNacks_    = 0;
 };
 
 } // namespace doip

@@ -311,8 +311,18 @@ int main ()
 
         std::vector<std::uint8_t> g;
         const Rc rc = recvMessage (c2, g, 600);
-        check (rc == Rc::Closed || (rc == Rc::Data && g.size () == 0),
-               "未激活的 socket 上发 0x8001 → 服务器断开连接");
+        // M2 时这里期望"直接断开"；M3 有了 0x8003 码表，改成"先回 0x8003 0x02 再断开"。
+        // 同一件事两种做法：M2 没码表就不猜，查清了就补上 —— 这叫升级，不是推翻。
+        check (rc == Rc::Closed || rc == Rc::Data, "未激活的 socket 上发 0x8001 → 服务器有反应");
+        if (rc == Rc::Data)
+        {
+            Message nm;
+            parseMessage (g.data (), g.size (), nm);
+            check (nm.header.payloadType == 0x8003, "回的是 0x8003");
+            check (g.size () == 13 && g[12] == 0x02, "码值 0x02（源地址不在连接表里）");
+            std::vector<std::uint8_t> after;
+            recvMessage (c2, after, 600);
+        }
         ::close (c2);
     }
 

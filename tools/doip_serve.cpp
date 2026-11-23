@@ -50,9 +50,14 @@ int main (int argc, char **argv)
                  static_cast<long long> (cfg.aliveCheckTimeout.count ()));
 
     srv.logger = [] (const std::string &line) { std::printf ("  %s\n", line.c_str ()); };
+    // M3：挂一个**假 ECU**。它答 3E 00 / 22 F1 86，其余回 7F xx 31。
+    // 目的只有一个：让"以太网这一侧"先端到端跑通。M4 把这一行换成真的 ISO-TP。
+    srv.diagnosticSink = stubEcuAnswer;
     srv.runFor (std::chrono::seconds (seconds));
 
     std::printf ("\n接入 %zu 个连接，成功激活 %zu 次，心跳超时断开 %zu 次。\n",
                  srv.connectionsAccepted (), srv.activationsOk (), srv.aliveCheckTimeouts ());
+    std::printf ("诊断请求 %zu 条：ACK %zu，NACK %zu。\n",
+                 srv.diagnosticRequests (), srv.diagnosticAcks (), srv.diagnosticNacks ());
     return 0;
 }

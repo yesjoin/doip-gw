@@ -39,7 +39,9 @@ std::string hex4 (std::uint16_t v)
 } // namespace
 
 DoIpTcpServer::DoIpTcpServer (const TcpServerConfig &cfg)
-    : cfg_ (cfg), port_ (cfg.port)
+    : cfg_ (cfg),
+      diag_ (DiagnosticPolicy{cfg.entityAddress, cfg.maxUds}),
+      port_ (cfg.port)
 {
 }
 
@@ -277,16 +279,80 @@ bool DoIpTcpServer::handleConn (Conn &c)
         }
         else if (t == PayloadType::DiagnosticMessage)
         {
-            if (!c.routing.activated ())
+            ++diagRequests_;
+            DiagOutcome o = diag_.handle (m.payload, c.routing.activated (), c.routing.activatedSource ());
+
+            // 载荷连 SA/TA 都读不出：这是"字节流已经不可信"，走 0x0000 0x04 然后断开
+            if (o.code == 0 && o.action == DiagAction::Nack)
             {
-                // 未激活就发诊断：规范上这是非法序列。
-                // 本项目采取保守做法 —— 断开，而不是猜一个 NACK 码值糊过去。
-                log ("未激活的 socket 上收到 0x8001 → 断开连接（先激活再诊断）");
-                dropConn (c, "未激活就发诊断");
+                log (std::string ("0x8001 结构不对（") + o.reason + "）→ 回 0x0000 0x04 并断开");
+                sendBytes (c.fd, buildGenericNack (GenericNack::InvalidPayloadLength));
+                dropConn (c, "诊断报文结构不对");
                 return false;
             }
-            // 已激活：诊断本身是 M3 的活，M2 只把顺序守住
-            log ("0x8001 已激活，诊断业务在 M3 处理（本条暂时忽略）");
+
+            if (o.action == DiagAction::Nack)
+            {
+                ++diagNacks_;
+                DiagnosticNegativeAck na;
+                na.sourceAddress = cfg_.entityAddress;     // 回执里的源是我
+                na.targetAddress = o.targetAddress;        // 目标写请求里的目标（可能不是我）
+                na.nackCode      = o.code;
+                sendBytes (c.fd, build (PayloadType::DiagnosticNegativeAck, encodePayload (na)));
+                log ("0x8001 拒绝：0x8003 " + std::string (nameOf (static_cast<DiagNack> (o.code))) +
+                     "（" + o.reason + "）");
+
+                // 没激活就发诊断：回了码之后仍然断开 —— 规范上这条连接本来就不该发诊断
+                if (!c.routing.activated ())
+                {
+                    dropConn (c, "未激活就发诊断（已回 0x8003 0x02）");
+                    return false;
+                }
+                continue;
+            }
+
+            // ---- 受理：先回 0x8002，再去算业务 ----
+            ++diagAcks_;
+            DiagnosticPositiveAck pa;
+            pa.sourceAddress = cfg_.entityAddress;
+            pa.targetAddress = o.sourceAddress;
+            pa.ackCode       = 0x00;                      // 唯一值：ACK
+            sendBytes (c.fd, build (PayloadType::DiagnosticPositiveAck, encodePayload (pa)));
+            log ("0x8001 ← " + hex4 (o.sourceAddress) + "，" + std::to_string (o.uds.size ()) +
+                 " 字节 UDS → 回 0x8002 ACK");
+
+            if (!diagnosticSink)
+            {
+                log ("没有装下游，只回 ACK（M3 允许这样，M4 必须接上 ISO-TP）");
+                continue;
+            }
+
+            DiagnosticRequest req;
+            req.sourceAddress = o.sourceAddress;
+            req.targetAddress = o.targetAddress;
+            req.uds           = o.uds;
+
+            std::vector<std::uint8_t> resp;
+            std::string err;
+            if (!diagnosticSink (req, resp, err))
+            {
+                ++diagNacks_;
+                DiagnosticNegativeAck na;
+                na.sourceAddress = cfg_.entityAddress;
+                na.targetAddress = o.sourceAddress;
+                na.nackCode      = static_cast<std::uint8_t> (DiagNack::TransportProtocolError);
+                sendBytes (c.fd, build (PayloadType::DiagnosticNegativeAck, encodePayload (na)));
+                log ("下游出错 → 0x8003 0x08：" + err);
+                continue;
+            }
+
+            DiagnosticMessage back;
+            back.sourceAddress = cfg_.entityAddress;
+            back.targetAddress = o.sourceAddress;
+            back.uds           = resp;
+            sendBytes (c.fd, build (PayloadType::DiagnosticMessage, encodePayload (back)));
+            log ("下游答了 " + std::to_string (resp.size ()) + " 字节 → 用 0x8001 送回 " +
+                 hex4 (o.sourceAddress));
         }
         else
         {

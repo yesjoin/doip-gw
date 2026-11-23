@@ -7,7 +7,8 @@
 // 打印的每一行都和 doip-serve 那侧对得上，方便"两边对照看"。
 // ============================================================================
 #include "DoIpCodec.h"
-#include "DoIpRouting.h"   // 为了 nameOf(ActivationResponseCode)
+#include "DoIpDiagnostic.h"   // DiagNack 名字表
+#include "DoIpRouting.h"      // 为了 nameOf(ActivationResponseCode)
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -16,6 +17,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -71,6 +73,103 @@ static bool recvMessage (int fd, std::vector<std::uint8_t> &whole, int ms, std::
     }
 }
 
+// 带缓冲的收：服务器会把 0x8002 和 0x8001 响应连着发，
+// 一次 recv 可能同时读到两条，只看第一条会把响应丢掉。
+static bool recvMsgBuf (int fd, Message &out, std::vector<std::uint8_t> &buf, int ms, std::string &why)
+{
+    const auto deadline = std::chrono::steady_clock::now () + std::chrono::milliseconds (ms);
+    while (true)
+    {
+        ParseResult pr = parseMessage (buf.data (), buf.size (), out);
+        if (pr.error == ParseError::None)
+        {
+            buf.erase (buf.begin (), buf.begin () + static_cast<std::ptrdiff_t> (pr.consumed));
+            return true;
+        }
+        if (pr.error != ParseError::NeedMoreData)
+        {
+            why = "报文格式不对";
+            return false;
+        }
+
+        const auto now = std::chrono::steady_clock::now ();
+        if (now >= deadline) { why = "超时"; return false; }
+        const int left = static_cast<int> (
+            std::chrono::duration_cast<std::chrono::milliseconds> (deadline - now).count ());
+
+        pollfd p;
+        p.fd      = fd;
+        p.events  = POLLIN;
+        p.revents = 0;
+        if (::poll (&p, 1, left <= 0 ? 1 : left) <= 0) { why = "超时"; return false; }
+
+        std::uint8_t tmp[2048];
+        const ssize_t got = ::recv (fd, tmp, sizeof (tmp), 0);
+        if (got <= 0) { why = "对端关闭了连接"; return false; }
+        buf.insert (buf.end (), tmp, tmp + got);
+    }
+}
+
+// "22 F1 90" / "22f190" 都认
+static bool parseHex (const std::string &s, std::vector<std::uint8_t> &out)
+{
+    out.clear ();
+    std::size_t i = 0;
+    while (i < s.size ())
+    {
+        while (i < s.size () && (s[i] == ' ' || s[i] == '\t')) ++i;
+        if (i >= s.size ()) break;
+        if (i + 1 >= s.size ()) return false;
+        auto val = [&] (char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        };
+        const int hi = val (s[i]);
+        const int lo = val (s[i + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out.push_back (static_cast<std::uint8_t> ((hi << 4) | lo));
+        i += 2;
+    }
+    return !out.empty ();
+}
+
+static std::string udsServiceNameStr (std::uint8_t sid)
+{
+    if (sid == 0x7F) return "负响应";
+    if (sid > 0x40 && sid < 0x7F)
+    {
+        char b[64];
+        std::snprintf (b, sizeof (b), "正响应（对应 0x%02X）", static_cast<unsigned> (sid - 0x40));
+        return std::string (b);
+    }
+    switch (sid)
+    {
+    case 0x10: return "DiagnosticSessionControl";
+    case 0x11: return "ECUReset";
+    case 0x14: return "ClearDiagnosticInformation";
+    case 0x19: return "ReadDTCInformation";
+    case 0x22: return "ReadDataByIdentifier";
+    case 0x27: return "SecurityAccess";
+    case 0x2E: return "WriteDataByIdentifier";
+    case 0x31: return "RoutineControl";
+    case 0x34: return "RequestDownload";
+    case 0x36: return "TransferData";
+    case 0x37: return "RequestTransferExit";
+    case 0x3E: return "TesterPresent";
+    default:   return "未知服务";
+    }
+}
+
+static void printHex (const std::vector<std::uint8_t> &b)
+{
+    for (std::size_t i = 0; i < b.size (); ++i)
+    {
+        std::printf ("%02X%s", b[i], (i + 1 == b.size ()) ? "" : " ");
+    }
+}
+
 int main (int argc, char **argv)
 {
     std::string host = "127.0.0.1";
@@ -78,6 +177,11 @@ int main (int argc, char **argv)
     std::uint16_t sa   = 0x0E00;
     std::uint8_t type  = 0x00;
     bool alive = false;
+    std::uint16_t ta = 0x0001;              // 诊断目标（M3 只有实体自己）
+    std::uint16_t dsa = 0;                  // 诊断报文里的 SA（默认跟随 --sa）
+    bool hasDsa = false;                    // 用来演示"冒用别人地址"
+    std::string diagHex;                    // --diag "22 F1 86"
+    bool hasDiag = false;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -86,10 +190,15 @@ int main (int argc, char **argv)
         else if (a == "--port" && i + 1 < argc)  port = static_cast<std::uint16_t> (std::atoi (argv[++i]));
         else if (a == "--sa" && i + 1 < argc)    sa = static_cast<std::uint16_t> (std::strtoul (argv[++i], nullptr, 16));
         else if (a == "--type" && i + 1 < argc)  type = static_cast<std::uint8_t> (std::strtoul (argv[++i], nullptr, 16));
+        else if (a == "--ta" && i + 1 < argc)    ta = static_cast<std::uint16_t> (std::strtoul (argv[++i], nullptr, 16));
+        else if (a == "--dsa" && i + 1 < argc)   { dsa = static_cast<std::uint16_t> (std::strtoul (argv[++i], nullptr, 16)); hasDsa = true; }
         else if (a == "--alive")                 alive = true;
+        else if (a == "--diag" && i + 1 < argc)  { diagHex = argv[++i]; hasDiag = true; }
         else
         {
-            std::fprintf (stderr, "用法：%s [--host 127.0.0.1] [--port 13400] [--sa 0E00] [--type 00] [--alive]\n", argv[0]);
+            std::fprintf (stderr,
+                          "用法：%s [--host 127.0.0.1] [--port 13400] [--sa 0E00] [--ta 0001] "
+                          "[--dsa 0E01] [--type 00] [--diag \"22 F1 86\"] [--alive]\n", argv[0]);
             return 2;
         }
     }
@@ -169,7 +278,100 @@ int main (int argc, char **argv)
         return 1;
     }
 
-    // 2) 心跳（可选）
+    // 2) 诊断（可选）：0x8001 → 0x8002 ACK → 0x8001 响应
+    std::vector<std::uint8_t> inbuf;         // 这个缓冲要跨多次 recv 用
+    if (hasDiag)
+    {
+        std::vector<std::uint8_t> uds;
+        if (!parseHex (diagHex, uds))
+        {
+            std::fprintf (stderr, "--diag 里的十六进制不合法：%s\n", diagHex.c_str ());
+            ::close (fd);
+            return 2;
+        }
+
+        DiagnosticMessage dm;
+        dm.sourceAddress = hasDsa ? dsa : sa;
+        dm.targetAddress = ta;
+        dm.uds           = uds;
+        const std::vector<std::uint8_t> dbytes =
+            build (PayloadType::DiagnosticMessage, encodePayload (dm));
+        std::printf ("→ 0x8001 诊断：SA=0x%04X TA=0x%04X UDS=", dm.sourceAddress, dm.targetAddress);
+        printHex (uds);
+        std::printf ("（%s，%zu 字节）\n", udsServiceNameStr (uds[0]).c_str (), uds.size ());
+        if (!sendVec (fd, dbytes))
+        {
+            std::fprintf (stderr, "发送失败\n");
+            ::close (fd);
+            return 1;
+        }
+
+        Message ack;
+        if (!recvMsgBuf (fd, ack, inbuf, 3000, why))
+        {
+            std::printf ("← 没拿到回执：%s\n", why.c_str ());
+            ::close (fd);
+            return 1;
+        }
+
+        if (ack.header.payloadType == 0x8003)
+        {
+            DiagnosticNegativeAck na;
+            decodePayload (ack.payload, na, why);
+            const std::string nm = nameOf (static_cast<DiagNack> (na.nackCode));
+            std::printf ("← 0x8003 NACK：SA=0x%04X TA=0x%04X code=0x%02X (%s)\n",
+                         na.sourceAddress, na.targetAddress,
+                         static_cast<unsigned> (na.nackCode), nm.c_str ());
+            ::close (fd);
+            return 1;
+        }
+
+        if (ack.header.payloadType != 0x8002)
+        {
+            std::printf ("← 收到 0x%04X，不是 0x8002\n", static_cast<unsigned> (ack.header.payloadType));
+            ::close (fd);
+            return 1;
+        }
+
+        DiagnosticPositiveAck pa;
+        if (!decodePayload (ack.payload, pa, why))
+        {
+            std::printf ("← 0x8002 解不开：%s\n", why.c_str ());
+            ::close (fd);
+            return 1;
+        }
+        std::printf ("← 0x8002 ACK：SA=0x%04X TA=0x%04X code=0x%02X\n",
+                     pa.sourceAddress, pa.targetAddress, static_cast<unsigned> (pa.ackCode));
+
+        Message resp;
+        if (!recvMsgBuf (fd, resp, inbuf, 3000, why))
+        {
+            std::printf ("← 没有收到诊断响应：%s\n", why.c_str ());
+            ::close (fd);
+            return 1;
+        }
+        if (resp.header.payloadType != 0x8001)
+        {
+            std::printf ("← 响应类型是 0x%04X，不是 0x8001\n",
+                         static_cast<unsigned> (resp.header.payloadType));
+            ::close (fd);
+            return 1;
+        }
+
+        DiagnosticMessage dr;
+        if (!decodePayload (resp.payload, dr, why))
+        {
+            std::printf ("← 0x8001 响应解不开：%s\n", why.c_str ());
+            ::close (fd);
+            return 1;
+        }
+        std::printf ("← 0x8001 响应：SA=0x%04X TA=0x%04X UDS=",
+                     dr.sourceAddress, dr.targetAddress);
+        printHex (dr.uds);
+        std::printf ("（%s）\n", udsServiceNameStr (dr.uds.empty () ? 0 : dr.uds[0]).c_str ());
+    }
+
+    // 3) 心跳（可选）
     if (alive)
     {
         std::printf ("→ 0x0007 心跳请求\n");

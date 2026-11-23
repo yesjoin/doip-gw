@@ -92,11 +92,11 @@ head -4 "$LOG/client.log" | sed 's/^/      /'
 step "7/7 端到端：实体 + 客户端走真 TCP（loopback，端口 13456）"
 # 心跳周期调到 5000ms：这条用例要的是"能激活、心跳能一问一答"，
 # 不让服务器主动发心跳来抢戏（那条逻辑由 routing-selftest 用 150ms 单独测）。
-"$BUILD/doip-serve" --port 13456 --seconds 3 --idle-ms 5000 > "$LOG/tcpserve.log" 2>&1 &
+"$BUILD/doip-serve" --port 13456 --seconds 4 --idle-ms 5000 > "$LOG/tcpserve.log" 2>&1 &
 TCP=$!
 sleep 0.4
-if "$BUILD/doip-client" --host 127.0.0.1 --port 13456 --sa 0E00 --alive > "$LOG/tcpclient.log" 2>&1; then
-    ok "客户端走完 连接→激活→心跳"
+if "$BUILD/doip-client" --host 127.0.0.1 --port 13456 --sa 0E00 --alive --diag "22 F1 86" > "$LOG/tcpclient.log" 2>&1; then
+    ok "客户端走完 连接→激活→心跳→诊断"
 else
     bad "客户端 TCP 流程失败"
     cat "$LOG/tcpclient.log" | sed 's/^/      /'
@@ -104,9 +104,11 @@ fi
 wait $TCP || true
 grep -q "code=0x10"      "$LOG/tcpclient.log" && ok "0x0006 应答码 0x10（激活成功）" || bad "应答码不是 0x10"
 grep -q "0x0008 心跳应答" "$LOG/tcpclient.log" && ok "0x0007 问到了 0x0008"           || bad "心跳没应答"
+grep -q "0x8002 ACK"     "$LOG/tcpclient.log" && ok "诊断收到 0x8002 回执"            || bad "没有 0x8002 回执"
+grep -q "UDS=62 F1 86 01" "$LOG/tcpclient.log" && ok "诊断响应 62 F1 86 01"           || bad "诊断响应不对"
 grep -q "成功激活 1 次"    "$LOG/tcpserve.log"  && ok "实体侧确认激活 1 次"             || bad "实体侧没记录到激活"
 echo "      --- 客户端看到 ---"
-head -5 "$LOG/tcpclient.log" | sed 's/^/      /'
+head -8 "$LOG/tcpclient.log" | sed 's/^/      /'
 
 echo
 echo "--------------------------------"

@@ -31,6 +31,11 @@ target_link_libraries(doip-routing PUBLIC doip-codec)
 add_library(doip-tcp STATIC src/DoIpTcpServer.cpp)
 target_link_libraries(doip-tcp PUBLIC doip-routing doip-codec Threads::Threads)
 
+# ---- M3：诊断报文通道（0x8001 校验 + 0x8002/0x8003 回执 + 下游接口）----
+add_library(doip-diag STATIC src/DoIpDiagnostic.cpp)
+target_link_libraries(doip-diag PUBLIC doip-codec)
+target_link_libraries(doip-tcp PUBLIC doip-diag)
+
 # ---- M0 自测 ----
 add_executable(codec-selftest tests/codec_selftest.cpp)
 target_link_libraries(codec-selftest PRIVATE doip-codec)
@@ -43,6 +48,10 @@ target_link_libraries(discovery-selftest PRIVATE doip-discovery Threads::Threads
 add_executable(routing-selftest tests/routing_selftest.cpp)
 target_link_libraries(routing-selftest PRIVATE doip-tcp Threads::Threads)
 
+# ---- M3 自测（A 段纯逻辑 + B 段真 TCP 全链路）----
+add_executable(diagnostic-selftest tests/diagnostic_selftest.cpp)
+target_link_libraries(diagnostic-selftest PRIVATE doip-tcp Threads::Threads)
+
 # ---- 工具 ----
 add_executable(doip-dump tools/doip_dump.cpp)
 target_link_libraries(doip-dump PRIVATE doip-codec)
@@ -54,7 +63,7 @@ add_executable(doip-serve tools/doip_serve.cpp)
 target_link_libraries(doip-serve PRIVATE doip-tcp Threads::Threads)
 
 add_executable(doip-client tools/doip_client.cpp)
-target_link_libraries(doip-client PRIVATE doip-routing Threads::Threads)
+target_link_libraries(doip-client PRIVATE doip-routing doip-diag Threads::Threads)
 
 # ---------------------------------------------------------------------------
 # 测试注册：ctest 一条命令跑全部
@@ -63,4 +72,5 @@ enable_testing()
 add_test(NAME doip-codec     COMMAND codec-selftest)
 add_test(NAME doip-discovery COMMAND discovery-selftest)
 add_test(NAME doip-routing   COMMAND routing-selftest)
-set_tests_properties(doip-codec doip-discovery doip-routing PROPERTIES LABELS unit)
+add_test(NAME doip-diagnostic COMMAND diagnostic-selftest)
+set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic PROPERTIES LABELS unit)
