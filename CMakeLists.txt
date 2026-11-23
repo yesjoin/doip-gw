@@ -36,6 +36,10 @@ add_library(doip-diag STATIC src/DoIpDiagnostic.cpp)
 target_link_libraries(doip-diag PUBLIC doip-codec)
 target_link_libraries(doip-tcp PUBLIC doip-diag)
 
+# ---- M4：ISO-TP（拆帧/重组纯逻辑 + SocketCAN 客户端 + 网关桥接）----
+add_library(doip-isotp STATIC src/IsoTpStack.cpp src/IsoTpClient.cpp src/DoIpGateway.cpp)
+target_link_libraries(doip-isotp PUBLIC doip-diag Threads::Threads)
+
 # ---- M0 自测 ----
 add_executable(codec-selftest tests/codec_selftest.cpp)
 target_link_libraries(codec-selftest PRIVATE doip-codec)
@@ -52,6 +56,10 @@ target_link_libraries(routing-selftest PRIVATE doip-tcp Threads::Threads)
 add_executable(diagnostic-selftest tests/diagnostic_selftest.cpp)
 target_link_libraries(diagnostic-selftest PRIVATE doip-tcp Threads::Threads)
 
+# ---- M4 自测（纯逻辑：拆帧/重组/流控/往返，不需要 vcan0）----
+add_executable(isotp-selftest tests/isotp_selftest.cpp)
+target_link_libraries(isotp-selftest PRIVATE doip-isotp Threads::Threads)
+
 # ---- 工具 ----
 add_executable(doip-dump tools/doip_dump.cpp)
 target_link_libraries(doip-dump PRIVATE doip-codec)
@@ -65,6 +73,9 @@ target_link_libraries(doip-serve PRIVATE doip-tcp Threads::Threads)
 add_executable(doip-client tools/doip_client.cpp)
 target_link_libraries(doip-client PRIVATE doip-routing doip-diag Threads::Threads)
 
+add_executable(doip-gateway tools/doip_gateway.cpp)
+target_link_libraries(doip-gateway PRIVATE doip-tcp doip-isotp Threads::Threads)
+
 # ---------------------------------------------------------------------------
 # 测试注册：ctest 一条命令跑全部
 # ---------------------------------------------------------------------------
@@ -73,4 +84,5 @@ add_test(NAME doip-codec     COMMAND codec-selftest)
 add_test(NAME doip-discovery COMMAND discovery-selftest)
 add_test(NAME doip-routing   COMMAND routing-selftest)
 add_test(NAME doip-diagnostic COMMAND diagnostic-selftest)
-set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic PROPERTIES LABELS unit)
+add_test(NAME doip-isotp     COMMAND isotp-selftest)
+set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic doip-isotp PROPERTIES LABELS unit)
