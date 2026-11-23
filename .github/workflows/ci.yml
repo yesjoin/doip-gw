@@ -1,0 +1,63 @@
+# =============================================================================
+# ci.yml —— doip-gw 的持续集成（M0 就接，不等到最后补）
+#
+# 从项目二抄来的三条铁律：
+#   1. 干净环境：每次全新 checkout，没有残留 build/
+#   2. 参数一致：和 tools/ci_local.sh 一模一样，本地绿 ≈ CI 绿
+#   3. gcc 腿带 -Werror，"零警告"由机器保证；clang 腿只查可移植性
+# =============================================================================
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-test:
+    name: 构建 + 自测（${{ matrix.compiler }}）
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - compiler: gcc
+            werror: ON
+          - compiler: clang
+            werror: OFF
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 选编译器
+        run: |
+          if [ "${{ matrix.compiler }}" = "clang" ]; then
+            echo "CC=clang"    >> "$GITHUB_ENV"
+            echo "CXX=clang++" >> "$GITHUB_ENV"
+          else
+            echo "CC=gcc"      >> "$GITHUB_ENV"
+            echo "CXX=g++"     >> "$GITHUB_ENV"
+          fi
+
+      - name: 记录环境（红了先看这段）
+        run: |
+          $CXX --version | head -1
+          cmake --version | head -1
+          uname -srm
+
+      - name: 配置
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DDOIP_WERROR=${{ matrix.werror }}
+
+      - name: 构建
+        run: cmake --build build -j"$(nproc)"
+
+      - name: 自测（ctest）
+        run: cd build && ctest --output-on-failure
+
+      - name: 工具冒烟：把一段十六进制翻译成人话
+        run: |
+          OUT=$(./build/doip-dump "02 FD 80 01 00 00 00 07 0E 00 00 01 22 F1 90")
+          echo "$OUT"
+          echo "$OUT" | grep -q "0x8001" || { echo "::error::doip-dump 没认出 0x8001"; exit 1; }
+          echo "$OUT" | grep -q "ReadDataByIdentifier" || { echo "::error::doip-dump 没认出 0x22 服务"; exit 1; }
