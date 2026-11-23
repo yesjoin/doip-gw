@@ -23,6 +23,14 @@ target_include_directories(doip-codec PUBLIC include)
 add_library(doip-discovery STATIC src/DoIpDiscovery.cpp)
 target_link_libraries(doip-discovery PUBLIC doip-codec)
 
+# ---- M2：路由激活状态机（纯逻辑，每个连接一个实例）----
+add_library(doip-routing STATIC src/DoIpRouting.cpp)
+target_link_libraries(doip-routing PUBLIC doip-codec)
+
+# ---- M2：TCP 13400 服务器（收字节、拼报文、心跳）----
+add_library(doip-tcp STATIC src/DoIpTcpServer.cpp)
+target_link_libraries(doip-tcp PUBLIC doip-routing doip-codec Threads::Threads)
+
 # ---- M0 自测 ----
 add_executable(codec-selftest tests/codec_selftest.cpp)
 target_link_libraries(codec-selftest PRIVATE doip-codec)
@@ -31,6 +39,10 @@ target_link_libraries(codec-selftest PRIVATE doip-codec)
 add_executable(discovery-selftest tests/discovery_selftest.cpp)
 target_link_libraries(discovery-selftest PRIVATE doip-discovery Threads::Threads)
 
+# ---- M2 自测（A 段纯逻辑 + B 段真 TCP）----
+add_executable(routing-selftest tests/routing_selftest.cpp)
+target_link_libraries(routing-selftest PRIVATE doip-tcp Threads::Threads)
+
 # ---- 工具 ----
 add_executable(doip-dump tools/doip_dump.cpp)
 target_link_libraries(doip-dump PRIVATE doip-codec)
@@ -38,10 +50,17 @@ target_link_libraries(doip-dump PRIVATE doip-codec)
 add_executable(doip-discover tools/doip_discover.cpp)
 target_link_libraries(doip-discover PRIVATE doip-discovery Threads::Threads)
 
+add_executable(doip-serve tools/doip_serve.cpp)
+target_link_libraries(doip-serve PRIVATE doip-tcp Threads::Threads)
+
+add_executable(doip-client tools/doip_client.cpp)
+target_link_libraries(doip-client PRIVATE doip-routing Threads::Threads)
+
 # ---------------------------------------------------------------------------
 # 测试注册：ctest 一条命令跑全部
 # ---------------------------------------------------------------------------
 enable_testing()
 add_test(NAME doip-codec     COMMAND codec-selftest)
 add_test(NAME doip-discovery COMMAND discovery-selftest)
-set_tests_properties(doip-codec doip-discovery PROPERTIES LABELS unit)
+add_test(NAME doip-routing   COMMAND routing-selftest)
+set_tests_properties(doip-codec doip-discovery doip-routing PROPERTIES LABELS unit)

@@ -76,3 +76,21 @@ jobs:
           cat /tmp/serve.log
           grep -q "回了 1 个应答" /tmp/serve.log || { echo "::error::实体侧没记录到应答"; exit 1; }
 
+      - name: 端到端：实体 + 客户端走真 TCP（loopback）
+        run: |
+          ./build/doip-serve --port 13456 --seconds 3 --idle-ms 5000 > /tmp/tcpserve.log 2>&1 &
+          SRV=$!
+          sleep 0.5
+          if ! ./build/doip-client --host 127.0.0.1 --port 13456 --sa 0E00 --alive > /tmp/tcpclient.log 2>&1; then
+            echo "::error::客户端 TCP 激活/心跳失败"
+            cat /tmp/tcpclient.log
+            cat /tmp/tcpserve.log
+            exit 1
+          fi
+          cat /tmp/tcpclient.log
+          wait $SRV || true
+          cat /tmp/tcpserve.log
+          grep -q "code=0x10" /tmp/tcpclient.log       || { echo "::error::应答码不是 0x10"; exit 1; }
+          grep -q "0x0008 心跳应答" /tmp/tcpclient.log   || { echo "::error::心跳没应答"; exit 1; }
+          grep -q "成功激活 1 次" /tmp/tcpserve.log      || { echo "::error::实体侧没记录到激活"; exit 1; }
+

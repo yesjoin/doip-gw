@@ -1,0 +1,406 @@
+// ============================================================================
+// DoIpTcpServer.cpp —— M2 实现
+//
+// 读这段代码时盯三处：
+//   ① handleConn 里的 while + consumed 循环 —— 这就是"粘包"的解法
+//   ② dropConn 里那句 routing.reset() —— "激活状态跟连接走"的唯一入口
+//   ③ pumpTimers —— 心跳的两个时钟（该发了 / 等超时了）
+// ============================================================================
+#include "DoIpTcpServer.h"
+
+#if defined (__unix__) || defined (__APPLE__)
+#    define DOIP_HAS_POSIX 1
+#    include <arpa/inet.h>
+#    include <fcntl.h>
+#    include <netinet/in.h>
+#    include <poll.h>
+#    include <sys/socket.h>
+#    include <sys/types.h>
+#    include <unistd.h>
+#else
+#    define DOIP_HAS_POSIX 0
+#endif
+
+#include <cstdio>
+#include <cstring>
+
+namespace doip
+{
+namespace
+{
+
+std::string hex4 (std::uint16_t v)
+{
+    char b[16];
+    std::snprintf (b, sizeof (b), "0x%04X", static_cast<unsigned> (v));
+    return std::string (b);
+}
+
+} // namespace
+
+DoIpTcpServer::DoIpTcpServer (const TcpServerConfig &cfg)
+    : cfg_ (cfg), port_ (cfg.port)
+{
+}
+
+DoIpTcpServer::~DoIpTcpServer ()
+{
+    close ();
+}
+
+void DoIpTcpServer::log (const std::string &s)
+{
+    if (logger) logger (s);
+}
+
+bool DoIpTcpServer::open (std::string &err)
+{
+#if DOIP_HAS_POSIX
+    close ();
+
+    listenFd_ = ::socket (AF_INET, SOCK_STREAM, 0);
+    if (listenFd_ < 0)
+    {
+        err = "socket() 失败";
+        return false;
+    }
+
+    // SO_REUSEADDR：TIME_WAIT 状态下也能立刻重绑，
+    // 不然"刚跑完一轮测试，端口要等 60 秒"会让你以为是代码坏了。
+    int one = 1;
+    ::setsockopt (listenFd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof (one));
+
+    sockaddr_in addr;
+    std::memset (&addr, 0, sizeof (addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons (port_);
+    addr.sin_addr.s_addr = htonl (INADDR_ANY);
+
+    if (::bind (listenFd_, reinterpret_cast<sockaddr *> (&addr), sizeof (addr)) < 0)
+    {
+        err = "bind 失败（端口 " + std::to_string (port_) + " 被占用？）";
+        close ();
+        return false;
+    }
+
+    if (::listen (listenFd_, static_cast<int> (cfg_.maxConnections > 4 ? cfg_.maxConnections : 4)) < 0)
+    {
+        err = "listen() 失败";
+        close ();
+        return false;
+    }
+
+    // listen fd 设成非阻塞：acceptPending 里是 while(true) 循环，
+    // 阻塞模式下"没有新连接了"这一步会永久卡在 accept()，整个服务器就死了
+    // （M2 第一次跑就是栽在这——客户端连上、服务器一声不响，wchan=inet_csk_accept）。
+    const int flags = ::fcntl (listenFd_, F_GETFL, 0);
+    if (flags >= 0) ::fcntl (listenFd_, F_SETFL, flags | O_NONBLOCK);
+
+    sockaddr_in actual;
+    std::memset (&actual, 0, sizeof (actual));
+    socklen_t len = sizeof (actual);
+    if (::getsockname (listenFd_, reinterpret_cast<sockaddr *> (&actual), &len) == 0)
+    {
+        port_ = ntohs (actual.sin_port);
+    }
+    return true;
+#else
+    err = "本平台没有 POSIX socket，M2 只支持 Linux/macOS";
+    return false;
+#endif
+}
+
+void DoIpTcpServer::close ()
+{
+#if DOIP_HAS_POSIX
+    for (auto &c : conns_)
+    {
+        if (c.fd >= 0) ::close (c.fd);
+        c.fd = -1;
+    }
+    conns_.clear ();
+
+    if (listenFd_ >= 0)
+    {
+        ::close (listenFd_);
+        listenFd_ = -1;
+    }
+#endif
+}
+
+std::size_t DoIpTcpServer::activeConnections () const
+{
+    std::size_t n = 0;
+    for (const auto &c : conns_) if (c.fd >= 0) ++n;
+    return n;
+}
+
+bool DoIpTcpServer::sendBytes (int fd, const std::vector<std::uint8_t> &b)
+{
+#if DOIP_HAS_POSIX
+    std::size_t sent = 0;
+    while (sent < b.size ())
+    {
+        const ssize_t n = ::send (fd, b.data () + sent, b.size () - sent, 0);
+        if (n <= 0) return false;
+        sent += static_cast<std::size_t> (n);
+    }
+    return true;
+#else
+    (void) fd; (void) b;
+    return false;
+#endif
+}
+
+void DoIpTcpServer::acceptPending ()
+{
+#if DOIP_HAS_POSIX
+    while (true)
+    {
+        sockaddr_in peer;
+        std::memset (&peer, 0, sizeof (peer));
+        socklen_t plen = sizeof (peer);
+        const int fd = ::accept (listenFd_, reinterpret_cast<sockaddr *> (&peer), &plen);
+        if (fd < 0) break;
+
+        if (conns_.size () >= cfg_.maxConnections)
+        {
+            // 超了就直接关，不要"先收下再想办法" —— 那会掩盖容量问题。
+            ::close (fd);
+            log ("连接数已满（" + std::to_string (cfg_.maxConnections) + "），拒绝新连接");
+            continue;
+        }
+
+        Conn c;
+        c.fd           = fd;
+        c.routing      = RoutingActivation (cfg_.entityAddress);
+        c.lastActivity = std::chrono::steady_clock::now ();
+        conns_.push_back (c);
+        ++accepted_;
+        log ("接受连接（第 " + std::to_string (accepted_) + " 个）");
+    }
+#endif
+}
+
+bool DoIpTcpServer::handleConn (Conn &c)
+{
+#if DOIP_HAS_POSIX
+    std::uint8_t buf[4096];
+    const ssize_t got = ::recv (c.fd, buf, sizeof (buf), 0);
+    if (got <= 0)
+    {
+        // 0 = 对端正常关闭；<0 = 出错。两种都按"连接结束"处理。
+        dropConn (c, got == 0 ? "对端关闭了连接" : "recv 出错");
+        return false;
+    }
+
+    c.in.insert (c.in.end (), buf, buf + got);
+    c.lastActivity = std::chrono::steady_clock::now ();
+
+    // ---- 核心循环：粘包的解药 ----
+    // 每次解一条，吃掉 consumed 个字节，剩下的留给下一轮。
+    // 判据是 parseMessage 的三种结论：
+    //   NeedMoreData → 半包，跳出循环等下次 recv
+    //   其它错误     → TCP 上要回 NACK，然后断开（字节流已经不可信了）
+    //   None         → 处理掉这条，继续解下一条
+    while (!c.in.empty ())
+    {
+        Message m;
+        ParseResult pr = parseMessage (c.in.data (), c.in.size (), m, cfg_.maxPayload);
+
+        if (pr.error == ParseError::NeedMoreData)
+        {
+            break;                                  // 半包：一个字节都别丢
+        }
+
+        if (pr.error != ParseError::None)
+        {
+            log (std::string ("坏报文（") + nameOf (pr.error) + "）→ 回 0x0000 负应答并断开");
+            std::vector<std::uint8_t> nack = buildGenericNack (
+                static_cast<GenericNack> (pr.nackCode));
+            sendBytes (c.fd, nack);
+            dropConn (c, "字节流已不可信");
+            return false;
+        }
+
+        c.in.erase (c.in.begin (), c.in.begin () + static_cast<std::ptrdiff_t> (pr.consumed));
+
+        const PayloadType t = toType (m.header.payloadType);
+        std::string err;
+
+        if (t == PayloadType::RoutingActivationReq)
+        {
+            RoutingActivationRequest req;
+            if (!decodePayload (m.payload, req, err))
+            {
+                log ("0x0005 载荷长度不对（" + err + "）→ 回 0x0000 负应答并断开");
+                std::vector<std::uint8_t> nack = buildGenericNack (GenericNack::InvalidPayloadLength);
+                sendBytes (c.fd, nack);
+                dropConn (c, "路由激活请求格式不对");
+                return false;
+            }
+
+            ActivationOutcome out = c.routing.handle (req);
+
+            RoutingActivationResponse res;
+            res.testerAddress = req.sourceAddress;      // 回谁就问谁
+            res.entityAddress = cfg_.entityAddress;     // 我是谁
+            res.responseCode  = out.code;
+            res.reserved      = 0;
+            res.oemSpecific   = 0;
+
+            std::vector<std::uint8_t> bytes =
+                build (PayloadType::RoutingActivationRes, encodePayload (res));
+            sendBytes (c.fd, bytes);
+            log ("0x0005 ← " + hex4 (req.sourceAddress) + "，" + out.reason +
+                 " → 回 " + nameOf (static_cast<ActivationResponseCode> (out.code)));
+
+            if (out.activated && out.code == static_cast<std::uint8_t> (ActivationResponseCode::Success))
+            {
+                ++activations_;
+                c.lastActivity = std::chrono::steady_clock::now ();
+            }
+        }
+        else if (t == PayloadType::AliveCheckReq)
+        {
+            // 客户端问"你还活着吗" → 回我的地址（规范里 0x0008 带的是**应答方**的地址）
+            AliveCheckResponse a;
+            a.sourceAddress = cfg_.entityAddress;
+            sendBytes (c.fd, build (PayloadType::AliveCheckRes, encodePayload (a)));
+            log ("0x0007 心跳请求 → 回 0x0008 " + hex4 (cfg_.entityAddress));
+        }
+        else if (t == PayloadType::AliveCheckRes)
+        {
+            // 客户端回应了我们的心跳
+            c.aliveSent = false;
+            log ("0x0008 客户端还活着，停止计时");
+        }
+        else if (t == PayloadType::DiagnosticMessage)
+        {
+            if (!c.routing.activated ())
+            {
+                // 未激活就发诊断：规范上这是非法序列。
+                // 本项目采取保守做法 —— 断开，而不是猜一个 NACK 码值糊过去。
+                log ("未激活的 socket 上收到 0x8001 → 断开连接（先激活再诊断）");
+                dropConn (c, "未激活就发诊断");
+                return false;
+            }
+            // 已激活：诊断本身是 M3 的活，M2 只把顺序守住
+            log ("0x8001 已激活，诊断业务在 M3 处理（本条暂时忽略）");
+        }
+        else
+        {
+            log (std::string ("TCP 上收到 ") + nameOf (t) + "，M2 不处理");
+        }
+    }
+    return true;
+#else
+    (void) c;
+    return false;
+#endif
+}
+
+void DoIpTcpServer::dropConn (Conn &c, const std::string &why)
+{
+#if DOIP_HAS_POSIX
+    if (c.fd >= 0)
+    {
+        ::close (c.fd);
+        c.fd = -1;
+    }
+    // ★ 唯一的状态清空入口。
+    // 漏了这一句，"TCP 断了但激活状态还在"，重连就能直接发诊断 ——
+    // 看起来更顺，实际是权限被继承。
+    c.routing.reset ();
+    c.in.clear ();
+    c.aliveSent = false;
+    log ("关闭连接：" + why);
+#else
+    (void) c; (void) why;
+#endif
+}
+
+void DoIpTcpServer::pumpTimers (std::chrono::steady_clock::time_point now)
+{
+    for (auto &c : conns_)
+    {
+        if (c.fd < 0) continue;
+        if (!c.routing.activated ()) continue;      // 未激活的连接不做心跳
+
+        if (!c.aliveSent)
+        {
+            if (now - c.lastActivity > cfg_.idleBeforeAliveCheck)
+            {
+                // 静默太久：主动问一句
+                c.aliveSent     = true;
+                c.aliveDeadline = now + cfg_.aliveCheckTimeout;
+                sendBytes (c.fd, build (PayloadType::AliveCheckReq, {}));
+                log ("静默超过 " + std::to_string (cfg_.idleBeforeAliveCheck.count ()) +
+                     "ms → 发 0x0007 心跳请求，等 " +
+                     std::to_string (cfg_.aliveCheckTimeout.count ()) + "ms");
+            }
+        }
+        else if (now > c.aliveDeadline)
+        {
+            ++aliveTimeouts_;
+            dropConn (c, "心跳超时（发过 0x0007 但没收到 0x0008）");
+        }
+    }
+}
+
+void DoIpTcpServer::runFor (std::chrono::milliseconds dur)
+{
+#if DOIP_HAS_POSIX
+    if (listenFd_ < 0) return;
+
+    const auto deadline = std::chrono::steady_clock::now () + dur;
+    stop_ = false;
+
+    while (!stop_)
+    {
+        const auto now = std::chrono::steady_clock::now ();
+        if (now >= deadline) break;
+
+        auto left = std::chrono::duration_cast<std::chrono::milliseconds> (deadline - now);
+        if (left > std::chrono::milliseconds (100)) left = std::chrono::milliseconds (100);
+
+        // 把 listen fd 和所有连接 fd 一起丢进 poll。
+        // 同时记一份"第 j 个 fd 对应 conns_ 里的哪个下标" ——
+        // 不能事后靠顺序去猜，一旦 accept 插进来新连接，猜法就错位了。
+        std::vector<pollfd>      fds;
+        std::vector<std::size_t> owner;
+        fds.push_back (pollfd{listenFd_, POLLIN, 0});
+        owner.push_back (conns_.size ());          // 用 size() 当"这是 listen fd"的哨兵
+        for (std::size_t i = 0; i < conns_.size (); ++i)
+        {
+            if (conns_[i].fd < 0) continue;
+            fds.push_back (pollfd{conns_[i].fd, POLLIN, 0});
+            owner.push_back (i);
+        }
+
+        const int n = ::poll (fds.data (), fds.size (), static_cast<int> (left.count ()));
+        if (n > 0)
+        {
+            if ((fds[0].revents & POLLIN) != 0) acceptPending ();
+
+            for (std::size_t j = 1; j < fds.size (); ++j)
+            {
+                if ((fds[j].revents & (POLLIN | POLLHUP | POLLERR)) == 0) continue;
+                if (owner[j] >= conns_.size ()) continue;
+                if (conns_[owner[j]].fd < 0) continue;
+                handleConn (conns_[owner[j]]);
+            }
+        }
+
+        pumpTimers (std::chrono::steady_clock::now ());
+
+        // 清理已关闭的连接
+        for (std::size_t i = conns_.size (); i > 0; --i)
+        {
+            if (conns_[i - 1].fd < 0) conns_.erase (conns_.begin () + static_cast<std::ptrdiff_t> (i - 1));
+        }
+    }
+#endif
+}
+
+} // namespace doip
