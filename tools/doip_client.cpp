@@ -13,6 +13,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -193,6 +194,7 @@ int main (int argc, char **argv)
     bool hasDiag = false;
     bool all = false;                       // M11：--all 收齐所有响应（功能寻址用）
     long windowMs = 900;                    // 静默窗口：多久没有新响应当"收工"（毫秒）
+    bool trace = false;                     // M12：--trace 打每条响应的到达时刻与首末跨度
 
     for (int i = 1; i < argc; ++i)
     {
@@ -207,11 +209,16 @@ int main (int argc, char **argv)
         else if (a == "--diag" && i + 1 < argc)  { diagHex = argv[++i]; hasDiag = true; }
         else if (a == "--all")                   all = true;
         else if (a == "--window" && i + 1 < argc) windowMs = std::atol (argv[++i]);
+        else if (a == "--trace")                  trace = true;
         else
         {
             std::fprintf (stderr,
                           "用法：%s [--host 127.0.0.1] [--port 13400] [--sa 0E00] [--ta 0001] "
-                          "[--dsa 0E01] [--type 00] [--diag \"22 F1 86\"] [--all] [--window 900] [--alive]\n", argv[0]);
+                          "[--dsa 0E01] [--type 00] [--diag \"22 F1 86\"] [--all] [--window 900] "
+                          "[--trace] [--alive]\n", argv[0]);
+            std::fprintf (stderr,
+                          "     --trace 只对 --all 生效：每条打 RESPn_AT，末尾打 FIRST_AT/LAST_AT/SPAN_AT（毫秒，"
+                          "从发出诊断请求算起）\n");
             return 2;
         }
     }
@@ -235,6 +242,11 @@ int main (int argc, char **argv)
         std::fprintf (stderr, "连不上 %s:%u（实体端起了吗？）\n", host.c_str (), static_cast<unsigned> (port));
         ::close (fd);
         return 1;
+    }
+    // M12：诊断仪这边也关掉 Nagle —— 请求和 ACK 都是小报文，别让它们互相等
+    {
+        int nodelay = 1;
+        ::setsockopt (fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof (nodelay));
     }
     std::printf ("已连接 %s:%u\n", host.c_str (), static_cast<unsigned> (port));
 
@@ -336,6 +348,7 @@ int main (int argc, char **argv)
                          na.sourceAddress, na.targetAddress,
                          static_cast<unsigned> (na.nackCode), nm.c_str ());
             if (all) std::printf ("RESPONSE_COUNT=0\n");   // 连门都没进，更没有答案
+            if (all && trace) std::printf ("FIRST_AT=-1\nLAST_AT=-1\nSPAN_AT=-1\n");   // 没有时间可谈
             ::close (fd);
             return 1;
         }
@@ -364,6 +377,13 @@ int main (int argc, char **argv)
         if (all)
         {
             DiagResponseCollector collector;
+            // ★ M12：所有时刻都相对"诊断请求发出那一刻"。
+            //   为什么不用绝对时间：两张对照表（流式 / 攒批）要比的是"首条等了多久"，
+            //   跨进程的绝对时间会带入启动差，只有相对量可比。
+            const long t0 = nowMs ();
+            long firstAt = -1;
+            long lastAt  = -1;
+            std::size_t traced = 0;
             std::printf ("→ 收集响应：静默窗口 %ldms（每来一条就重新计时）\n", windowMs);
 
             while (true)
@@ -399,6 +419,12 @@ int main (int argc, char **argv)
                     std::printf ("← 一条 0x8001 解不开：%s（跳过）\n", why.c_str ());
                     continue;
                 }
+
+                const long at = nowMs () - t0;
+                if (firstAt < 0) firstAt = at;      // 第一条的到达时刻 = "首条答案时延"
+                lastAt = at;
+                if (trace) std::printf ("RESP%zu_AT=%ld\n", traced, at);
+                ++traced;
 
                 const auto oc = collector.add (dr.sourceAddress, dr.uds, nowMs ());
                 std::printf ("← #%zu 0x8001：SA=0x%04X UDS=", collector.arrivals (), dr.sourceAddress);
@@ -444,6 +470,13 @@ int main (int argc, char **argv)
             }
             std::printf ("COLLECTOR_DUPLICATES=%zu\n", collector.duplicates ());
             std::printf ("COLLECTOR_CHANGES=%zu\n", collector.changes ());
+            if (trace)
+            {
+                // SPAN = 最后一条 - 第一条：看得出"是不是被最慢那台拖成了整批"
+                std::printf ("FIRST_AT=%ld\n", firstAt);
+                std::printf ("LAST_AT=%ld\n", lastAt);
+                std::printf ("SPAN_AT=%ld\n", (firstAt < 0 || lastAt < 0) ? -1 : lastAt - firstAt);
+            }
         }
         else
         {

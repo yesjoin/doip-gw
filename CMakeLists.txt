@@ -78,6 +78,10 @@ target_include_directories(collector-selftest PRIVATE include)
 add_executable(pool-selftest tests/pool_selftest.cpp)
 target_link_libraries(pool-selftest PRIVATE doip-diag Threads::Threads)
 
+# M12：流式交付的记账（纯逻辑，不链任何 socket 库）
+add_executable(stream-selftest tests/stream_selftest.cpp)
+target_include_directories(stream-selftest PRIVATE include)
+
 # ---- 工具 ----
 add_executable(doip-dump tools/doip_dump.cpp)
 target_link_libraries(doip-dump PRIVATE doip-codec)
@@ -112,4 +116,5 @@ add_test(NAME doip-isotp     COMMAND isotp-selftest)
 add_test(NAME doip-route     COMMAND route-selftest)
 add_test(NAME doip-pool      COMMAND pool-selftest)
 add_test(NAME doip-collector COMMAND collector-selftest)
-set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic doip-isotp doip-route doip-pool doip-collector PROPERTIES LABELS unit)
+add_test(NAME doip-stream    COMMAND stream-selftest)
+set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic doip-isotp doip-route doip-pool doip-collector doip-stream PROPERTIES LABELS unit)

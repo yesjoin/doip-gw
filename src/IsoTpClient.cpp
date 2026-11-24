@@ -232,21 +232,43 @@ bool IsoTpClient::recvFrame (std::uint8_t data[64], std::size_t &len, int timeou
 // → "首帧之后收到的不是流控帧" → 整条请求失败。
 // 现象很像"网关偶发超时"，实际是**没清仓**。
 //
-// 所以每次发请求前先把缓冲区读空（0 超时，读一条算一条），并记账 staleSkipped。
+// 所以每次发请求前先把缓冲区读空，并记账 staleSkipped。
+//
+// ★ M12 抓到的坑：这里原来是 `while (recvFrame (d, dlc, 0, e))`——
+//   recvFrame 的第一步是 `if (now >= deadline) return "接收超时"`，
+//   timeout=0 时 deadline 就是"现在"，所以它**一条都没读过**，drainStale 一直是个空操作。
+//   平时看不出来（清仓失败只是让"偶发超时"多一点点），但 M12 一边到一边发把它放大了：
+//   另一台网关的一帧应答躺在缓冲区里没人读，下一次广播 recvFunctional 就把它当成本次的答案 ——
+//   上一轮慢 120ms 的那台，这一轮"0ms 就答了"，而它真正的答案留到下一轮，错位一轮轮传下去。
+//   所以这里改成真正的非阻塞清仓：poll(0) 说没数据就停，读到的帧按自己的 rxId 记账。
 // ---------------------------------------------------------------------------
 std::size_t IsoTpClient::drainStale ()
 {
+#if HAVE_SOCKETCAN
     std::size_t n = 0;
     while (true)
     {
-        std::uint8_t d[kFdFrameBytes];
-        std::size_t  dlc = 0;
-        std::string  e;
-        if (!recvFrame (d, dlc, 0, e)) break;
+        pollfd p;
+        p.fd      = fd_;
+        p.events  = POLLIN;
+        p.revents = 0;
+        if (::poll (&p, 1, 0) <= 0) break;          // 没数据了（或者出错）：收工
+
+        canfd_frame f;
+        std::memset (&f, 0, sizeof (f));
+        const ssize_t got = ::read (fd_, &f, sizeof (f));
+        if (got != static_cast<ssize_t> (sizeof (can_frame)) &&
+            got != static_cast<ssize_t> (sizeof (canfd_frame))) break;
+
+        // 别人的帧读掉但不算"迟到帧"：总线是共享的，噪声不该记在我们头上
+        if (idFromRecv (f.can_id) != cfg_.rxId) continue;
         ++n;
         ++st_.staleSkipped;
     }
     return n;
+#else
+    return 0;
+#endif
 }
 
 bool IsoTpClient::waitFlowControl (FlowControl &fc, std::string &err)

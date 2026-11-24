@@ -23,6 +23,11 @@
 //
 // ⑤ **"问一台"和"问一类"是两种动作**（M8）。功能地址走 broadcast()，
 //    M10 起它有自己的线程：广播要独占所有通道（总线只有一条），但**不能占住 I/O 线程**。
+//
+// ⑥ **M12：一轮广播的答案不再"攒齐再发"，收一条就交出去一条。**
+//    做法是一个 `ReplySink` 回调：广播每收到一条应答就调一次，带上看这次广播的 jobId。
+//    但 srv 不能在这里直接写 socket —— 它在**所有通道的 busMu 都被持有**时被调用，
+//    所以实现里它只往队列里塞一下，真正的 send 仍旧发生在 I/O 线程。
 // ============================================================================
 #include "DoIpDiagnostic.h"
 #include "IsoTpClient.h"
@@ -32,6 +37,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -64,6 +70,14 @@ public:
                      std::string &err);
 
     DiagnosticMultiResult broadcast (const DiagnosticRequest &req);
+
+    // ---- M12：流式交付 ----
+    // 设了这个回调，广播每收到一条应答就立刻调一次（jobId = 这次广播的编号；
+    // 同步路径 jobId=0，不会触发）。★ 回调是在"所有通道总线锁都被持有"的状态下被调用的：
+    // 里面只许往队列里塞一下，绝不许等 I/O、也不许回调网关，否则广播会被诊断仪拖住。
+    using ReplySink = std::function<void (std::uint64_t jobId, const DiagnosticReply &)>;
+    void setReplySink (ReplySink sink) { replySink_ = std::move (sink); }
+    std::size_t streamedReplies () const { return streamed_.load (); }
 
     // ---- M10 异步接口：投递 → 立刻返回 id ----
     // 返回 0 表示"连排队都没排上"（地址不认识 / 通道没开），此时 immediate 里已经有结论。
@@ -118,7 +132,9 @@ private:
 
     void workerLoop (std::uint16_t ta);
     void functionalLoop ();
-    DiagnosticMultiResult broadcastLocked (const DiagnosticRequest &req);   // 调用方已持有全部 busMu
+    // 调用方已持有全部 busMu；jobId=0 表示"同步路径，不流式"
+    DiagnosticMultiResult broadcastLocked (std::uint64_t jobId, const DiagnosticRequest &req);
+    DiagnosticMultiResult broadcastJob (std::uint64_t jobId, const DiagnosticRequest &req);  // 自己抢 funcMu + 全部 busMu
     void lockAllBuses (std::vector<std::unique_lock<std::mutex>> &locks);   // 按 TA 升序，防死锁
     void finishJob (std::uint64_t id, JobResult r);
 
@@ -141,6 +157,8 @@ private:
     std::atomic<std::size_t> funcRep_{0};
     std::atomic<std::size_t> silent_{0};
     std::atomic<std::size_t> abandoned_{0};
+    std::atomic<std::size_t> streamed_{0};   // M12：已经边到边发出去的应答条数
+    ReplySink                replySink_;    // M12：为空 = 老行为（攒齐再发）
 };
 
 } // namespace doip

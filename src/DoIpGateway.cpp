@@ -165,7 +165,8 @@ void DiagnosticGateway::functionalLoop ()
         std::size_t prev = maxWaitMs_.load ();
         while (w > prev && !maxWaitMs_.compare_exchange_weak (prev, w)) {}
 
-        DiagnosticMultiResult mr = broadcast (job.req);
+        // ★ M12：带 jobId 进来，每收到一条就往外交一条（不再攒齐）
+        DiagnosticMultiResult mr = broadcastJob (job.id, job.req);
 
         JobResult r;
         r.ok       = mr.ok;
@@ -358,13 +359,22 @@ bool DiagnosticGateway::operator() (const DiagnosticRequest &req,
 // ---------------------------------------------------------------------------
 DiagnosticMultiResult DiagnosticGateway::broadcast (const DiagnosticRequest &req)
 {
+    // 同步入口（M8 的 operator() 走这里）：jobId=0 → 不流式，行为和 M11 之前一样。
+    return broadcastJob (0, req);
+}
+
+// M12：给一次广播一个 jobId，边收边交给 replySink。
+// 和 broadcast(req) 的唯一差别就是"答案在路上就交出去"，
+// 收锁的顺序、独占所有通道、失败语义，全都照旧。
+DiagnosticMultiResult DiagnosticGateway::broadcastJob (std::uint64_t jobId, const DiagnosticRequest &req)
+{
     std::lock_guard<std::mutex> one (funcMu_);          // 同一时刻只允许一次广播
     std::vector<std::unique_lock<std::mutex>> locks;
     lockAllBuses (locks);
-    return broadcastLocked (req);
+    return broadcastLocked (jobId, req);
 }
 
-DiagnosticMultiResult DiagnosticGateway::broadcastLocked (const DiagnosticRequest &req)
+DiagnosticMultiResult DiagnosticGateway::broadcastLocked (std::uint64_t jobId, const DiagnosticRequest &req)
 {
     DiagnosticMultiResult out;
 
@@ -424,6 +434,15 @@ DiagnosticMultiResult DiagnosticGateway::broadcastLocked (const DiagnosticReques
             out.replies.push_back (rep);
             ++kv.second->handled;
             ++funcRep_;
+
+            // ★ M12：这条答案不等其他通道了，立刻交出去。
+            //   注意此刻**所有 busMu 都在本线程手里**，而且 out 还没返回，
+            //   所以 sink 只许"塞进队列"——它要是去写 socket，整轮广播就被诊断仪拖住。
+            if (replySink_ && jobId != 0)
+            {
+                replySink_ (jobId, rep);
+                ++streamed_;
+            }
         }
         else
         {

@@ -115,13 +115,46 @@ static Rc recvSome (int fd, std::vector<std::uint8_t> &out, int ms)
     return Rc::Data;
 }
 
-// 收一条"完整报文"：不足就继续收，直到凑齐或断开/超时
+// 收一条"完整报文"：不足就继续收，直到凑齐或断开/超时。
+//
+// ★ M12 抓到的坑：这里原来没有收包缓冲——recv 一次读回两条应答时，
+//   函数把 **两条** 都塞进 whole 就 return 了：
+//     · 调用方检查 size() == 21 失败
+//     · 下一次调用再也等不到数据（第二条已经被这次读走了）
+//   看起来像"服务器把粘包的第二条吞了"，其实是测试桩自己吞的。
+//   M12 在服务端开了 TCP_NODELAY 之后，两条小应答经常同段到达，这个毛病就稳定复现。
+//   所以按 fd 记一份"还没交出去的余字节"，一条一条往外发。
+static std::vector<std::uint8_t> g_pending;   // 已 recv 到、还没交给调用方的字节
+static int                       g_pendingFd = -1;
+
 static Rc recvMessage (int fd, std::vector<std::uint8_t> &whole, int ms)
 {
+    if (fd != g_pendingFd)          // 换了连接：上一家的余字节绝不能带过来
+    {
+        g_pending.clear ();
+        g_pendingFd = fd;
+    }
     whole.clear ();
+
     const auto deadline = std::chrono::steady_clock::now () + std::chrono::milliseconds (ms);
     while (true)
     {
+        // 先把缓冲区里的存货交出去
+        if (!g_pending.empty ())
+        {
+            Message m;
+            ParseResult pr = parseMessage (g_pending.data (), g_pending.size (), m);
+            if (pr.error == ParseError::None)
+            {
+                whole.assign (g_pending.begin (),
+                              g_pending.begin () + static_cast<std::ptrdiff_t> (pr.consumed));
+                g_pending.erase (g_pending.begin (),
+                                 g_pending.begin () + static_cast<std::ptrdiff_t> (pr.consumed));
+                return Rc::Data;
+            }
+            if (pr.error != ParseError::NeedMoreData) return Rc::Timeout;   // 格式坏了，别死等
+        }
+
         const auto now = std::chrono::steady_clock::now ();
         if (now >= deadline) return Rc::Timeout;
         const int left = static_cast<int> (
@@ -131,12 +164,7 @@ static Rc recvMessage (int fd, std::vector<std::uint8_t> &whole, int ms)
         const Rc rc = recvSome (fd, part, left <= 0 ? 1 : left);
         if (rc == Rc::Closed || rc == Rc::Timeout) return rc;
 
-        whole.insert (whole.end (), part.begin (), part.end ());
-
-        Message m;
-        ParseResult pr = parseMessage (whole.data (), whole.size (), m);
-        if (pr.error == ParseError::None) return Rc::Data;   // 凑齐了
-        if (pr.error != ParseError::NeedMoreData) return Rc::Timeout; // 格式坏了，别死等
+        g_pending.insert (g_pending.end (), part.begin (), part.end ());
     }
 }
 #endif

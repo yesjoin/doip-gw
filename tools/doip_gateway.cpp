@@ -106,6 +106,7 @@ int main (int argc, char **argv)
 
     std::vector<std::string> routeSpecs;
     std::vector<std::string> funcSpecs;
+    bool stream = true;          // M12：默认流式；--no-stream 用来做 A/B 对照
 
     for (int i = 1; i < argc; ++i)
     {
@@ -117,12 +118,13 @@ int main (int argc, char **argv)
         else if (a == "--vin" && i + 1 < argc)      ent.vin = argv[++i];
         else if (a == "--route" && i + 1 < argc)    routeSpecs.push_back (argv[++i]);
         else if (a == "--func" && i + 1 < argc)     funcSpecs.push_back (argv[++i]);
+        else if (a == "--no-stream")                stream = false;   // M12：退回 M11 的"攒齐再发"
         else
         {
             std::fprintf (stderr,
                           "用法：%s [--iface vcan0] [--port 13400] [--seconds 20] [--stmin 10]\n"
                           "          [--vin LSVAA0000A1234567] [--route TA:TX:RX[:名字]]...\n"
-                          "          [--func 功能地址:广播ID[:名字]]...\n"
+                          "          [--func 功能地址:广播ID[:名字]]... [--no-stream]\n"
                           "      例：%s --route 0002:7E0:7E8:ECU_A --route 0003:7A0:7A8:ECU_B\n"
                           "          --func 0xE400:0x7DF:ALL\n",
                           argv[0], argv[0]);
@@ -252,6 +254,17 @@ int main (int argc, char **argv)
     };
     srv.asyncAbandon = [&gw] (std::uint64_t id) { gw.abandon (id); };
 
+    // ★ M12：把"网关收到一条答案"接到"服务器往诊断仪发一条"。
+    //   只在 stream=true 时接；--no-stream 不接，就是 M11 的攒批行为，
+    //   用来对照"首条答案到底被最慢那台拖了多久"。
+    if (stream)
+    {
+        gw.setReplySink ([&srv] (std::uint64_t id, const DiagnosticReply &rep) {
+            srv.onStreamReply (id, rep);   // 只入队，不写 socket（此时网关握着全部总线锁）
+        });
+    }
+    std::printf ("交付方式：%s\n", stream ? "流式（收一条转一条）" : "攒批（等一轮全收齐，--no-stream）");
+
     srv.runFor (std::chrono::seconds (seconds));
 
     if (udpOn)
@@ -271,6 +284,12 @@ int main (int argc, char **argv)
                  srv.orphanResults (), srv.busyRejects ());
     std::printf ("作废 %zu 条（连接断开时还在途，结果不转交给下一台诊断仪）\n",
                  gw.abandonedJobs ());
+    if (stream)
+    {
+        std::printf ("流式交付 %zu 条（收到就转，不等一轮收齐；同一 job 交卷时只补差额）；"
+                     "流式时连接已断 %zu 条（丢弃不转交）\n",
+                     srv.streamedReplies (), srv.streamDropped ());
+    }
     std::printf ("--- CAN 侧 ---\n");
     std::printf ("转发 %zu 条，失败 %zu 条（其中目标地址不认识 %zu 条），最长排队 %zu ms\n",
                  gw.handled (), gw.failed (), gw.unknownTargets (), gw.maxWaitMs ());

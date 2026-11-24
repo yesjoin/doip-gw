@@ -14,6 +14,7 @@
 #    include <fcntl.h>
 #    include <netinet/in.h>
 #    include <poll.h>
+#    include <netinet/tcp.h>
 #    include <sys/socket.h>
 #    include <sys/types.h>
 #    include <unistd.h>
@@ -95,6 +96,17 @@ bool DoIpTcpServer::open (std::string &err)
     // listen fd 设成非阻塞：acceptPending 里是 while(true) 循环，
     // 阻塞模式下"没有新连接了"这一步会永久卡在 accept()，整个服务器就死了
     // （M2 第一次跑就是栽在这——客户端连上、服务器一声不响，wchan=inet_csk_accept）。
+    // ★ M12：自唤醒管道。广播线程"往队列里塞了一条答案"这件事不是 fd 事件，
+    // 睡在 poll 上的 I/O 线程看不见；写一个字节到这个管道，poll 立刻返回。
+    if (::pipe (wakeFd_) == 0)
+    {
+        for (int k = 0; k < 2; ++k)
+        {
+            const int f = ::fcntl (wakeFd_[k], F_GETFL, 0);
+            if (f >= 0) ::fcntl (wakeFd_[k], F_SETFL, f | O_NONBLOCK);   // 写端非阻塞：队列满也不许卡住广播线程
+        }
+    }
+
     const int flags = ::fcntl (listenFd_, F_GETFL, 0);
     if (flags >= 0) ::fcntl (listenFd_, F_SETFL, flags | O_NONBLOCK);
 
@@ -126,6 +138,11 @@ void DoIpTcpServer::close ()
     {
         ::close (listenFd_);
         listenFd_ = -1;
+    }
+
+    for (int k = 0; k < 2; ++k)
+    {
+        if (wakeFd_[k] >= 0) { ::close (wakeFd_[k]); wakeFd_[k] = -1; }
     }
 #endif
 }
@@ -171,6 +188,15 @@ void DoIpTcpServer::acceptPending ()
             ::close (fd);
             log ("连接数已满（" + std::to_string (cfg_.maxConnections) + "），拒绝新连接");
             continue;
+        }
+
+        // ★ M12：TCP_NODELAY。ACK(0x8002) 和紧随其后的第一条答案(0x8001)是两条小报文，
+        // 不开这个，Nagle 会把第二条压住等前一条的 ACK —— 40ms 的"延迟确认"就是这么来的。
+        // 关掉 Nagle 之后，同样的答案从"43ms 到手"变成"1ms 到手"，而且这部分延迟
+        // 根本不是网关的排队，量的时候别把它记在账上。
+        {
+            int nodelay = 1;
+            ::setsockopt (fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof (nodelay));
         }
 
         Conn c;
@@ -451,6 +477,72 @@ bool DoIpTcpServer::handleConn (Conn &c)
 }
 
 // ---------------------------------------------------------------------------
+// M12：流式交付的两半
+//
+// 上半 `onStreamReply` 由**广播线程**调（它手里握着所有通道的 busMu）：
+// 只许把答案塞进队列，一微秒都不许多待——否则整轮广播被诊断仪的网络拖住。
+// 下半 `drainStream` 由 **I/O 线程**每轮 poll 之后调：真正写 socket 的永远只有它。
+// 这就是"一条总线一个主人、一个 socket 一个主人"的延续，而不是新发明。
+// ---------------------------------------------------------------------------
+void DoIpTcpServer::wakeIo ()
+{
+    if (wakeFd_[1] < 0) return;
+    const char one = 1;
+    // 必须接住返回值：glibc 给 write() 标了 warn_unused_result，
+    // （void）强转在 -O0 下放过，-O2 一编就红 —— ci_local 故意用 -O2 就是这个原因。
+    const ssize_t wr = ::write (wakeFd_[1], &one, 1);
+    (void) wr;   // 非阻塞；管道满了（EAGAIN）也无所谓，反正已经有一次"醒着"
+}
+
+void DoIpTcpServer::onStreamReply (std::uint64_t jobId, const DiagnosticReply &rep)
+{
+    {
+        std::lock_guard<std::mutex> g (streamMu_);
+        streamQ_.push_back (PendingStream{jobId, rep});
+    }
+    wakeIo ();   // 叫醒 I/O 线程：这条答案别等 poll 自己超时
+}
+
+void DoIpTcpServer::drainStream ()
+{
+    std::vector<PendingStream> taken;
+    {
+        std::lock_guard<std::mutex> g (streamMu_);
+        taken.swap (streamQ_);          // 拿锁只做交换，send 全在锁外做
+    }
+
+    for (const auto &ps : taken)
+    {
+        bool delivered = false;
+        for (auto &c : conns_)
+        {
+            if (c.fd < 0 || c.pendingJob != ps.jobId) continue;
+
+            DiagnosticMessage back;
+            back.sourceAddress = ps.reply.sourceAddress;   // 谁答的，SA 就写谁
+            back.targetAddress = c.pendingSa;
+            back.uds           = ps.reply.uds;
+            delivered = sendBytes (c.fd, build (PayloadType::DiagnosticMessage, encodePayload (back)));
+            if (delivered)
+            {
+                ++streamed_;
+                ++diagReplies_;
+                ledger_.noteStreamed (ps.jobId);   // 交卷时要靠它知道"别再发一遍"
+                log ("job=" + std::to_string (ps.jobId) + " 流式送达 1 条（SA=" +
+                     hex4 (ps.reply.sourceAddress) + "），不等其他通道");
+            }
+            break;
+        }
+        if (!delivered)
+        {
+            ++streamDropped_;
+            log ("job=" + std::to_string (ps.jobId) +
+                 " 流式送达时连接已断/发送失败 → 丢弃（不转给下一个诊断仪）");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // M10：结果回家
 //
 // 找的是 **jobId**，不是"最后一条请求的连接"。这两者在小规模测试里看不出差别，
@@ -471,6 +563,7 @@ void DoIpTcpServer::deliver (const AsyncResult &res)
 
         if (!res.r.ok)
         {
+            ledger_.forget (res.jobId);   // 失败的 job 也可能流过一部分（部分通道答了），账要销
             ++diagNacks_;
             DiagnosticNegativeAck na;
             na.sourceAddress = targetEcu;             // 回执的源 = 请求里的 TA（和 ACK 的规矩一致）
@@ -483,17 +576,28 @@ void DoIpTcpServer::deliver (const AsyncResult &res)
             return;
         }
 
-        for (const auto &rep : res.r.replies)
+        // ★ M12：已经流式发出去的那几条不能再发一遍。
+        //   交卷时 replies 里是**全部**答案，流式发过的是最前面的 already 条
+        //   （广播按通道顺序收、按通道顺序外发，两边顺序一致）。
+        const std::size_t total   = res.r.replies.size ();
+        const std::size_t already = ledger_.streamed (res.jobId);
+        ledger_.forget (res.jobId);
+
+        std::size_t sent = 0;
+        for (std::size_t i = (already < total ? already : total); i < total; ++i)
         {
+            const auto &rep = res.r.replies[i];
             DiagnosticMessage back;
             back.sourceAddress = rep.sourceAddress;   // 谁答的，SA 就是谁
             back.targetAddress = testerSa;
             back.uds           = rep.uds;
             sendBytes (c.fd, build (PayloadType::DiagnosticMessage, encodePayload (back)));
             ++diagReplies_;
+            ++sent;
         }
         log ("job=" + std::to_string (res.jobId) + " 回来 " +
-             std::to_string (res.r.replies.size ()) + " 条 → 逐条用 0x8001 送回");
+             std::to_string (total) + " 条（流式已发 " + std::to_string (already) +
+             " 条）→ 补齐 " + std::to_string (sent) + " 条");
         return;
     }
 
@@ -516,6 +620,7 @@ void DoIpTcpServer::dropConn (Conn &c, const std::string &why)
     if (c.pendingJob != 0)
     {
         if (asyncAbandon) asyncAbandon (c.pendingJob);
+        ledger_.forget (c.pendingJob);   // M12：这个 job 的流式账也一起销，迟到答案不许再发
         log ("连接断开时还有在途请求 job=" + std::to_string (c.pendingJob) + " → 已作废");
         c.pendingJob    = 0;
         c.pendingSa     = 0;
@@ -584,7 +689,13 @@ void DoIpTcpServer::runFor (std::chrono::milliseconds dur)
         std::vector<pollfd>      fds;
         std::vector<std::size_t> owner;
         fds.push_back (pollfd{listenFd_, POLLIN, 0});
-        owner.push_back (conns_.size ());          // 用 size() 当"这是 listen fd"的哨兵
+        owner.push_back (conns_.size ());          // 用 size() 当"这是 listen fd / 唤醒管道"的哨兵
+        const bool hasWake = wakeFd_[0] >= 0;
+        if (hasWake)
+        {
+            fds.push_back (pollfd{wakeFd_[0], POLLIN, 0});
+            owner.push_back (conns_.size ());      // 同上：哨兵，循环里单独处理
+        }
         for (std::size_t i = 0; i < conns_.size (); ++i)
         {
             if (conns_[i].fd < 0) continue;
@@ -597,7 +708,14 @@ void DoIpTcpServer::runFor (std::chrono::milliseconds dur)
         {
             if ((fds[0].revents & POLLIN) != 0) acceptPending ();
 
-            for (std::size_t j = 1; j < fds.size (); ++j)
+            if (hasWake && (fds[1].revents & POLLIN) != 0)
+            {
+                // 必须读空：不读空 poll 下一轮会一直报"可读"，变成忙等。
+                char buf[64];
+                while (::read (wakeFd_[0], buf, sizeof (buf)) > 0) {}
+            }
+
+            for (std::size_t j = (hasWake ? 2 : 1); j < fds.size (); ++j)
             {
                 if ((fds[j].revents & (POLLIN | POLLHUP | POLLERR)) == 0) continue;
                 if (owner[j] >= conns_.size ()) continue;
@@ -607,6 +725,11 @@ void DoIpTcpServer::runFor (std::chrono::milliseconds dur)
         }
 
         pumpTimers (std::chrono::steady_clock::now ());
+
+        // ★ M12：先把"边到边"的答案放出去，再去捞整轮的结果。
+        //   顺序有意：一条答案在广播还没结束时就应该到诊断仪手里，
+        //   放到 asyncTake 后面等于又攒了一轮（最慢那台说了算）。
+        drainStream ();
 
         // ★ M10：把已经完成的 CAN 结果送回各自的连接。
         //   放在 poll 之后的每一轮都做一次，而不是"等到有事件才做"——

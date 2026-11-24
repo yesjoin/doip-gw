@@ -22,10 +22,12 @@
 #include "DoIpCodec.h"
 #include "DoIpDiagnostic.h"
 #include "DoIpRouting.h"
+#include "StreamLedger.h"   // M12：边收边发的记账（纯逻辑）
 
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -86,6 +88,10 @@ public:
     std::size_t orphanResults () const { return orphanResults_; }
     // M10：同一连接上来第二条请求时被拒的次数（没有流水线语义）
     std::size_t busyRejects () const { return busyRejects_; }
+    // M12：边到边发出去的应答条数（不等一轮广播收齐）
+    std::size_t streamedReplies () const { return streamed_; }
+    // M12：流式送达时连接已经断了（过期答案，丢弃并记账）
+    std::size_t streamDropped () const { return streamDropped_; }
 
     std::function<void (const std::string &)> logger;
 
@@ -102,6 +108,11 @@ public:
     std::function<bool (AsyncResult &)> asyncTake;
     // 连接断开时把在途请求作废（结果回来也不许转给别人）
     std::function<void (std::uint64_t)> asyncAbandon;
+
+    // ---- M12：流式交付 ----
+    // 网关广播每收到一条应答就调这里一次。**它在网关持有全部 busMu 的状态下被调用**，
+    // 所以这里只做一件事：塞进队列，立刻返回；真正的 send 在 runFor 的 drainStream 里。
+    void onStreamReply (std::uint64_t jobId, const DiagnosticReply &rep);
 
 private:
     struct Conn
@@ -123,6 +134,7 @@ private:
     void pumpTimers (std::chrono::steady_clock::time_point now);
     bool sendBytes (int fd, const std::vector<std::uint8_t> &b);
     void deliver (const AsyncResult &res);                      // 结果 → 对应连接
+    void drainStream ();                                        // M12：把流式答案逐条送出
     void log (const std::string &s);
 
     TcpServerConfig cfg_;
@@ -140,6 +152,23 @@ private:
     std::size_t     diagReplies_  = 0;
     std::size_t     orphanResults_ = 0;
     std::size_t     busyRejects_   = 0;
+
+    // M12：流式交付
+    struct PendingStream
+    {
+        std::uint64_t    jobId = 0;
+        DiagnosticReply  reply;
+    };
+    std::mutex               streamMu_;      // 广播线程写、I/O 线程读
+    std::vector<PendingStream> streamQ_;     // 待发送的流式答案
+    StreamLedger             ledger_;        // job → 已经流式发了几条（防重复发）
+    std::size_t              streamed_      = 0;
+    std::size_t              streamDropped_ = 0;
+    // ★ 自唤醒管道：[0] 塞进 poll 集合，[1] 由广播线程写一个字节。
+    //   没有它，答案进了队列也只能等 poll 自己超时（最长 100ms）才送出去，
+    //   "首条答案几毫秒到手"就成了空话。
+    int                      wakeFd_[2] = {-1, -1};
+    void wakeIo ();
 };
 
 } // namespace doip
