@@ -71,6 +71,10 @@ target_link_libraries(isotp-selftest PRIVATE doip-isotp Threads::Threads)
 add_executable(route-selftest tests/route_selftest.cpp)
 target_link_libraries(route-selftest PRIVATE doip-route doip-diag doip-codec)
 
+# ---- M10 自测（排队与交卷台的纯逻辑：FIFO / 容量 / stop / 作废）----
+add_executable(pool-selftest tests/pool_selftest.cpp)
+target_link_libraries(pool-selftest PRIVATE doip-diag Threads::Threads)
+
 # ---- 工具 ----
 add_executable(doip-dump tools/doip_dump.cpp)
 target_link_libraries(doip-dump PRIVATE doip-codec)
@@ -103,4 +107,5 @@ add_test(NAME doip-routing   COMMAND routing-selftest)
 add_test(NAME doip-diagnostic COMMAND diagnostic-selftest)
 add_test(NAME doip-isotp     COMMAND isotp-selftest)
 add_test(NAME doip-route     COMMAND route-selftest)
-set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic doip-isotp doip-route PROPERTIES LABELS unit)
+add_test(NAME doip-pool      COMMAND pool-selftest)
+set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic doip-isotp doip-route doip-pool PROPERTIES LABELS unit)

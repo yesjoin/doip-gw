@@ -330,6 +330,52 @@ bool DoIpTcpServer::handleConn (Conn &c)
             req.targetAddress = o.targetAddress;
             req.uds           = o.uds;
 
+            // ---- M10：异步下游优先 ----
+            // 与 M8 的区别：这里**不在这里等结果**，投完就返回 poll 循环。
+            // 结果是主循环从 asyncTake 里捞出来的（见 runFor 末尾的 drain）。
+            if (asyncSubmit)
+            {
+                // 同一连接同一时刻只许一条在途：DoIP 没有流水线语义，
+                // 硬塞第二条的结果是"两条请求的响应互相冒充"。
+                if (c.pendingJob != 0)
+                {
+                    ++diagNacks_;
+                    ++busyRejects_;
+                    DiagnosticNegativeAck na;
+                    na.sourceAddress = o.targetAddress;
+                    na.targetAddress = o.sourceAddress;
+                    na.nackCode      = static_cast<std::uint8_t> (DiagNack::TransportProtocolError);
+                    sendBytes (c.fd, build (PayloadType::DiagnosticNegativeAck, encodePayload (na)));
+                    log ("上一条请求还没回（job=" + std::to_string (c.pendingJob) +
+                         "），这条当场拒：0x8003 0x08");
+                    continue;
+                }
+
+                DiagnosticMultiResult immediate;
+                const std::uint64_t id = asyncSubmit (req, immediate);
+
+                if (id == 0)
+                {
+                    ++diagNacks_;
+                    DiagnosticNegativeAck na;
+                    na.sourceAddress = o.targetAddress;
+                    na.targetAddress = o.sourceAddress;
+                    na.nackCode      = immediate.nackCode == 0
+                                       ? static_cast<std::uint8_t> (DiagNack::TransportProtocolError)
+                                       : immediate.nackCode;
+                    sendBytes (c.fd, build (PayloadType::DiagnosticNegativeAck, encodePayload (na)));
+                    log ("投递当场被拒 → 0x8003：" + immediate.reason);
+                    continue;
+                }
+
+                c.pendingJob    = id;
+                c.pendingSa     = o.sourceAddress;
+                c.pendingTarget = o.targetAddress;
+                log ("0x8001 已投递（job=" + std::to_string (id) + "，TA=" +
+                     hex4 (o.targetAddress) + "），I/O 先回 ACK 不等结果");
+                continue;
+            }
+
             // ---- M8：多响应下游（功能寻址）优先 ----
             // 一条请求 → N 条应答，每条都单独一条 0x8001：拼成一条的话，
             // 诊断仪只知道"有人答了"，不知道是几台、各自说了什么。
@@ -404,6 +450,58 @@ bool DoIpTcpServer::handleConn (Conn &c)
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// M10：结果回家
+//
+// 找的是 **jobId**，不是"最后一条请求的连接"。这两者在小规模测试里看不出差别，
+// 但两条连接一问一答交错时，"最后一条"就是错的——这正是"串包"在以太网侧的样子。
+// 找不到连接 = 连接已经断了：结果必须丢，并记 orphanResults_。
+// ---------------------------------------------------------------------------
+void DoIpTcpServer::deliver (const AsyncResult &res)
+{
+    for (auto &c : conns_)
+    {
+        if (c.fd < 0 || c.pendingJob != res.jobId) continue;
+
+        const std::uint16_t testerSa  = c.pendingSa;
+        const std::uint16_t targetEcu = c.pendingTarget;
+        c.pendingJob    = 0;
+        c.pendingSa     = 0;
+        c.pendingTarget = 0;
+
+        if (!res.r.ok)
+        {
+            ++diagNacks_;
+            DiagnosticNegativeAck na;
+            na.sourceAddress = targetEcu;             // 回执的源 = 请求里的 TA（和 ACK 的规矩一致）
+            na.targetAddress = testerSa;
+            na.nackCode      = res.r.nackCode == 0
+                               ? static_cast<std::uint8_t> (DiagNack::TransportProtocolError)
+                               : res.r.nackCode;
+            sendBytes (c.fd, build (PayloadType::DiagnosticNegativeAck, encodePayload (na)));
+            log ("job=" + std::to_string (res.jobId) + " 失败 → 0x8003：" + res.r.reason);
+            return;
+        }
+
+        for (const auto &rep : res.r.replies)
+        {
+            DiagnosticMessage back;
+            back.sourceAddress = rep.sourceAddress;   // 谁答的，SA 就是谁
+            back.targetAddress = testerSa;
+            back.uds           = rep.uds;
+            sendBytes (c.fd, build (PayloadType::DiagnosticMessage, encodePayload (back)));
+            ++diagReplies_;
+        }
+        log ("job=" + std::to_string (res.jobId) + " 回来 " +
+             std::to_string (res.r.replies.size ()) + " 条 → 逐条用 0x8001 送回");
+        return;
+    }
+
+    ++orphanResults_;
+    log ("job=" + std::to_string (res.jobId) +
+         " 回来时找不到连接（已断开）→ 结果丢弃，不转给下一个诊断仪");
+}
+
 void DoIpTcpServer::dropConn (Conn &c, const std::string &why)
 {
 #if DOIP_HAS_POSIX
@@ -412,6 +510,18 @@ void DoIpTcpServer::dropConn (Conn &c, const std::string &why)
         ::close (c.fd);
         c.fd = -1;
     }
+    // M10：断开时在途请求要作废。
+    //   不作废的话，这条结果会留在交卷台上，等下一个诊断仪来"接住"它——
+    //   在以太网侧这就是把别人的答案递给下一个人，和 M5 的"迟到帧"是同一类错。
+    if (c.pendingJob != 0)
+    {
+        if (asyncAbandon) asyncAbandon (c.pendingJob);
+        log ("连接断开时还有在途请求 job=" + std::to_string (c.pendingJob) + " → 已作废");
+        c.pendingJob    = 0;
+        c.pendingSa     = 0;
+        c.pendingTarget = 0;
+    }
+
     // ★ 唯一的状态清空入口。
     // 漏了这一句，"TCP 断了但激活状态还在"，重连就能直接发诊断 ——
     // 看起来更顺，实际是权限被继承。
@@ -497,6 +607,15 @@ void DoIpTcpServer::runFor (std::chrono::milliseconds dur)
         }
 
         pumpTimers (std::chrono::steady_clock::now ());
+
+        // ★ M10：把已经完成的 CAN 结果送回各自的连接。
+        //   放在 poll 之后的每一轮都做一次，而不是"等到有事件才做"——
+        //   结果到达不会唤醒 poll（它不是 fd 事件），不主动捞就会一直躺在交卷台上。
+        if (asyncTake)
+        {
+            AsyncResult ar;
+            while (asyncTake (ar)) deliver (ar);
+        }
 
         // 清理已关闭的连接
         for (std::size_t i = conns_.size (); i > 0; --i)

@@ -234,27 +234,23 @@ int main (int argc, char **argv)
 
     srv.logger = [] (const std::string &line) { std::printf ("  %s\n", line.c_str ()); };
 
-    // M8：统一走"多响应"下游。
-    //   物理地址 → 一条（和 M6 完全一样的行为）
-    //   功能地址 → 广播收集（条数由谁在听决定）
-    // 服务器那边因此只有一套逻辑，不用"看 TA 决定走哪个 sink"。
-    srv.diagnosticSinkMulti = [&gw] (const DiagnosticRequest &req) -> DiagnosticMultiResult
+    // ★ M10：异步投递。
+    //   注意这里**没有**任何"等"的动作：投完立刻 return，I/O 线程继续 poll。
+    //   于是"一台慢 ECU 拖住整个网关"这件事从根上消失了 —— 慢只慢它自己那条通道。
+    srv.asyncSubmit = [&gw] (const DiagnosticRequest &req, DiagnosticMultiResult &immediate) -> std::uint64_t
     {
-        if (gw.table ().knownFunctional (req.targetAddress)) return gw.broadcast (req);
-
-        DiagnosticMultiResult r;
-        std::vector<std::uint8_t> resp;
-        std::string e2;
-        if (!gw (req, resp, e2))
-        {
-            r.nackCode = static_cast<std::uint8_t> (DiagNack::TransportProtocolError);
-            r.reason   = e2;
-            return r;
-        }
-        r.ok = true;
-        r.replies.push_back (DiagnosticReply{req.targetAddress, resp});
-        return r;
+        return gw.submit (req, immediate);
     };
+    srv.asyncTake = [&gw] (AsyncResult &out) -> bool
+    {
+        std::uint64_t id = 0;
+        DiagnosticMultiResult r;
+        if (!gw.takeResult (id, r)) return false;
+        out.jobId = id;
+        out.r     = std::move (r);
+        return true;
+    };
+    srv.asyncAbandon = [&gw] (std::uint64_t id) { gw.abandon (id); };
 
     srv.runFor (std::chrono::seconds (seconds));
 
@@ -270,6 +266,11 @@ int main (int argc, char **argv)
     std::printf ("接入 %zu，激活 %zu，诊断请求 %zu（ACK %zu / NACK %zu）\n",
                  srv.connectionsAccepted (), srv.activationsOk (), srv.diagnosticRequests (),
                  srv.diagnosticAcks (), srv.diagnosticNacks ());
+    // M10 的两个数：结果孤儿（连接已断）与忙拒（同一连接上一条还没回）
+    std::printf ("在途丢弃 %zu 条（结果回来时连接已断），忙拒 %zu 条（上一条请求还没回）\n",
+                 srv.orphanResults (), srv.busyRejects ());
+    std::printf ("作废 %zu 条（连接断开时还在途，结果不转交给下一台诊断仪）\n",
+                 gw.abandonedJobs ());
     std::printf ("--- CAN 侧 ---\n");
     std::printf ("转发 %zu 条，失败 %zu 条（其中目标地址不认识 %zu 条），最长排队 %zu ms\n",
                  gw.handled (), gw.failed (), gw.unknownTargets (), gw.maxWaitMs ());
@@ -281,7 +282,7 @@ int main (int argc, char **argv)
     for (const auto &cs : gw.channelStats ())
     {
         std::printf ("  TA=0x%04X（%s/%s%s）：转发 %zu 条，失败 %zu 条，发帧 %llu，收帧 %llu，"
-                     "超时 %llu，序号错 %llu，迟到帧丢弃 %llu，广播应答 %llu\n",
+                     "超时 %llu，序号错 %llu，迟到帧丢弃 %llu，广播应答 %llu，排队峰值 %zu，最长排队 %zu ms\n",
                      static_cast<unsigned> (cs.ta),
                      formatCanId (cs.txId).c_str (), formatCanId (cs.rxId).c_str (),
                      cs.fd ? "，FD" : "",
@@ -291,7 +292,8 @@ int main (int argc, char **argv)
                      static_cast<unsigned long long> (cs.stats.timeouts),
                      static_cast<unsigned long long> (cs.stats.seqErrors),
                      static_cast<unsigned long long> (cs.stats.staleSkipped),
-                     static_cast<unsigned long long> (cs.stats.funcResponses));
+                     static_cast<unsigned long long> (cs.stats.funcResponses),
+                     cs.queuePeak, cs.maxQueueWaitMs);
     }
     return 0;
 }

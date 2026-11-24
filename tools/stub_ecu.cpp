@@ -236,6 +236,7 @@ int main (int argc, char **argv)
     std::uint32_t rx = 0x7A0;      // 我收的（tester → ECU）
     std::uint32_t funcRx = 0;      // M8：额外的广播监听 ID（0 = 不听广播）
     bool useFd = false;            // M9：这一台按 CAN FD 说话（帧长 64）
+    int  delayMs = 0;              // M10：应答前先睡一会儿（模拟"这台 ECU 慢"）
     std::string vin = "LSVZZ0000B7654321";
     std::string hw  = "HW02";
     int seconds = 20;
@@ -250,12 +251,13 @@ int main (int argc, char **argv)
         else if (a == "--vin" && i + 1 < argc)    vin = argv[++i];
         else if (a == "--hw" && i + 1 < argc)     hw = argv[++i];
         else if (a == "--fd")                     useFd = true;
+        else if (a == "--delay-ms" && i + 1 < argc) delayMs = std::atoi (argv[++i]);
         else if (a == "--seconds" && i + 1 < argc) seconds = std::atoi (argv[++i]);
         else
         {
             std::fprintf (stderr,
                           "用法：%s [--iface vcan0] [--rx 7A0] [--tx 7A8] [--func-rx 7DF] [--fd] "
-                          "[--vin LSVZZ0000B7654321] [--hw HW02] [--seconds 20]\n", argv[0]);
+                          "[--delay-ms 0] [--vin LSVZZ0000B7654321] [--hw HW02] [--seconds 20]\n", argv[0]);
             return 2;
         }
     }
@@ -291,6 +293,11 @@ int main (int argc, char **argv)
                  iface.c_str (), formatCanId (rx).c_str (), formatCanId (tx).c_str (),
                  useFd ? "CAN FD（帧长 64，单帧最多 62 字节）" : "经典 CAN（帧长 8，单帧 7 字节）",
                  vin.c_str (), hw.c_str (), seconds);
+    if (delayMs > 0)
+    {
+        // M10：故意慢一点，用来证明"一台慢 ECU 不拖累别的通道"
+        std::printf ("           每条应答前先睡 %d ms（模拟慢 ECU）\n", delayMs);
+    }
     if (funcRx != 0)
     {
         std::printf ("           另外还听广播 %s（功能寻址，只能单帧收 / 单帧答）\n",
@@ -357,6 +364,8 @@ int main (int argc, char **argv)
         }
 
         // r == Complete：答它
+        // M10：慢 ECU 就在这里慢——它慢的只是自己那条通道，别的通道照常跑
+        if (delayMs > 0) ::usleep (static_cast<useconds_t> (delayMs) * 1000);
         const auto resp = answer (req, vin, hw);
 
         // 功能寻址的应答也必须塞进单帧。经典帧 7 字节；FD 帧能到 62 字节。

@@ -1,6 +1,6 @@
 #pragma once
 // ============================================================================
-// DoIpTcpServer.h —— M2：TCP 13400 连接 + 路由激活 + 心跳
+// DoIpTcpServer.h —— M2 TCP 连接 → M10 "I/O 线程永不等 CAN"
 //
 // 这一层干三件事：
 //   ① 收连接、收字节、把字节拼成完整报文（TCP 会粘包也会半包）
@@ -10,9 +10,14 @@
 // 和 M1 的 UDP 有一个关键区别：
 //   **TCP 上收到坏报文要回 0x0000 负应答，然后断开。**
 //   因为 TCP 是有连接的，对面在等你说话；UDP 上没有这层义务（还要避免广播风暴）。
-//   同一个"坏报文"，两层处理不同 —— 这就是"传输层决定错误模型"。
 //
-// 心跳的时间参数可以调小，自测才有办法在 1 秒内跑完"超时断开"。
+// ★ M10 的两条新约定：
+//   ① "受理"和"答复"可以分两次：0x8002 ACK 立刻回，0x8001 响应等 CAN 回来再回。
+//      实现上就是每条连接记一个 `pendingJob`（0 = 没有在途请求），
+//      再加上一条"同一连接同一时刻只许一条在途"的规矩（DoIP 没有流水线语义）。
+//   ② 结果从哪来：`asyncTake` 每轮 poll 之后被调用一次，把已完成的结果交进来；
+//      服务器只按 jobId 找连接，找不到（连接已断）就**丢弃并记账**，绝不转给下一个诊断仪。
+//      这条规矩和 M5 的"迟到帧丢弃"是同一件事的以太网版本。
 // ============================================================================
 #include "DoIpCodec.h"
 #include "DoIpDiagnostic.h"
@@ -36,13 +41,19 @@ struct TcpServerConfig
     std::size_t   maxUds           = 512;     // 单条诊断的 UDS 上限（超过 → 0x8003 0x04）
 
     // M6：谁能当诊断目标。为空 = 只认 entityAddress 自己（M3 语义）。
-    // 网关会接成"查路由表"，于是 TA 打到背后的 ECU 也算合法目标。
     std::function<bool (std::uint16_t)> targetKnown;
 
     // 心跳：激活后静默超过 idleBeforeAliveCheck → 发 0x0007；
     //       发出去后 aliveCheckTimeout 内没收到 0x0008 → 断开。
     std::chrono::milliseconds idleBeforeAliveCheck{2000};
     std::chrono::milliseconds aliveCheckTimeout{1000};
+};
+
+// 一条"回来的结果"：jobId 用来找连接，其余是结论
+struct AsyncResult
+{
+    std::uint64_t      jobId = 0;
+    DiagnosticMultiResult r;
 };
 
 class DoIpTcpServer
@@ -70,18 +81,27 @@ public:
     std::size_t diagnosticRequests () const { return diagRequests_; }
     std::size_t diagnosticAcks () const { return diagAcks_; }
     std::size_t diagnosticNacks () const { return diagNacks_; }
-    // M8：一次请求生成了几条 0x8001 响应（功能寻址时 > 1）
     std::size_t diagnosticReplies () const { return diagReplies_; }
+    // M10：连接断了以后才回来的结果（本该丢弃，这里只计数）
+    std::size_t orphanResults () const { return orphanResults_; }
+    // M10：同一连接上来第二条请求时被拒的次数（没有流水线语义）
+    std::size_t busyRejects () const { return busyRejects_; }
 
     std::function<void (const std::string &)> logger;
 
     // M3 的下游。为空时：只回 0x8002，不产生响应报文（通道仍能验完）。
-    // M4 把它接成 ISO-TP 通道。
     DiagnosticSink diagnosticSink;
 
     // M8 的下游（可选，优先于上面那个）：一次请求 → 多条带源地址的响应。
-    // 只有功能寻址需要它；设了它之后，所有请求都走它（物理寻址返回一条即可）。
     DiagnosticMultiSink diagnosticSinkMulti;
+
+    // ---- M10：异步下游。设了就优先走这里，同步 sink 自动失效 ----
+    // 返回 0 = 当场就失败（immediate 里是结论）；>0 = 在途，等 asyncTake 交卷
+    std::function<std::uint64_t (const DiagnosticRequest &, DiagnosticMultiResult &immediate)> asyncSubmit;
+    // 每轮 poll 之后调用一次；返回 false 表示"这一轮没有结果了"
+    std::function<bool (AsyncResult &)> asyncTake;
+    // 连接断开时把在途请求作废（结果回来也不许转给别人）
+    std::function<void (std::uint64_t)> asyncAbandon;
 
 private:
     struct Conn
@@ -92,6 +112,9 @@ private:
         std::chrono::steady_clock::time_point    lastActivity;
         bool                                     aliveSent = false;
         std::chrono::steady_clock::time_point    aliveDeadline;
+        std::uint64_t                            pendingJob = 0;   // M10：在途请求号
+        std::uint16_t                            pendingSa  = 0;   // M10：谁发的（0x8001 的 TA 写回去）
+        std::uint16_t                            pendingTarget = 0; // M10：问的谁（失败时 0x8003 的 SA 写它）
     };
 
     void acceptPending ();
@@ -99,6 +122,7 @@ private:
     void dropConn (Conn &c, const std::string &why);
     void pumpTimers (std::chrono::steady_clock::time_point now);
     bool sendBytes (int fd, const std::vector<std::uint8_t> &b);
+    void deliver (const AsyncResult &res);                      // 结果 → 对应连接
     void log (const std::string &s);
 
     TcpServerConfig cfg_;
@@ -114,6 +138,8 @@ private:
     std::size_t     diagAcks_     = 0;
     std::size_t     diagNacks_    = 0;
     std::size_t     diagReplies_  = 0;
+    std::size_t     orphanResults_ = 0;
+    std::size_t     busyRejects_   = 0;
 };
 
 } // namespace doip

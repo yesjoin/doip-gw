@@ -156,7 +156,7 @@ n=$(since "$m" | grep -c -- "7A8#")
 # ---- 6. 网关账 ----
 echo
 echo "=== 6 网关自己的账 ==="
-grep -q "下游答了" /tmp/m9_gw.log && ok "网关每条请求都记了应答条数" || bad "网关没有应答记录"
+grep -qE "回来 .* 条|下游答了" /tmp/m9_gw.log && ok "网关每条请求都记了应答条数" || bad "网关没有应答记录"
 if grep -q "下游拒绝\|超时" /tmp/m9_gw.log; then
     bad "网关日志里有失败记录（$(grep -c "下游拒绝\|超时" /tmp/m9_gw.log) 处）"
 else

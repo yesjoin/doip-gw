@@ -1,22 +1,34 @@
 // ============================================================================
-// DoIpGateway.cpp —— M6：查表 → 串行化 → 走那条通道
+// DoIpGateway.cpp —— M4 桥接 → M6 多通道 → M10 每条通道一个工作线程
+//
+// 读这段代码按这个顺序：
+//   ① start()        —— 开通道、起线程（谁拥有 socket，谁就有权发帧）
+//   ② workerLoop()   —— 一条通道的完整生命周期：取活 → 独占总线 → 交卷
+//   ③ submit()       —— 投递时的三种结局：立刻拒 / 进队 / 排队满（也是立刻拒，但要留痕）
+//   ④ broadcastLocked() —— 广播：**必须一次占住所有通道**，因为总线只有一条
+//
+// M10 的关键一步是把"锁"改名成"队列"：
+//   锁只能表达"等"，队列能表达"排了几个、排了多久、满了怎么办"。
+//   排查现场时，这三样东西比"反正串行"有用得多。
 // ============================================================================
 #include "DoIpGateway.h"
 
-#include <chrono>
+#include <algorithm>
 #include <cstdio>
+#include <cstring>
 
 namespace doip
 {
-
 namespace
 {
+
 std::string hexTa (std::uint16_t v)
 {
-    char b[8];
+    char b[16];
     std::snprintf (b, sizeof (b), "0x%04X", static_cast<unsigned> (v));
     return std::string (b);
 }
+
 } // namespace
 
 DiagnosticGateway::DiagnosticGateway (const std::string &iface,
@@ -26,107 +38,333 @@ DiagnosticGateway::DiagnosticGateway (const std::string &iface,
 {
 }
 
+DiagnosticGateway::~DiagnosticGateway ()
+{
+    stop ();
+}
+
 bool DiagnosticGateway::start (std::string &err)
 {
+    if (running_) return true;
+
+    // ---- 第一步：把 socket 全开起来，一条不成就整体失败 ----
+    // 先全部 open、再统一起线程：半开状态下起线程，等于让工作线程对着没 bind 的 fd 发帧。
     for (const auto &e : table_.entries ())
     {
         IsoTpConfig cfg;
         cfg.txId = e.txId;
         cfg.rxId = e.rxId;
-        // M9：这一条通道是按 FD 开还是按经典帧开，由路由表条目决定
         cfg.frameBytes = e.fd ? kFdFrameBytes : kClassicFrameBytes;
 
         auto ch = std::unique_ptr<Channel> (new Channel (iface_, cfg, tim_));
         std::string e2;
         if (!ch->client.open (e2))
         {
-            // 哪一条开不起来就说清是哪一条：多通道配置错的时候，"有一个失败"没法排查
             err = "路由 " + (e.name.empty () ? std::string ("?") : e.name) +
                   "（TA=" + hexTa (e.logicalAddress) + "，" +
                   formatCanId (e.txId) + "/" + formatCanId (e.rxId) +
                   (e.fd ? "，FD" : "，经典帧") + "）开不起来：" + e2;
+            for (auto &kv : chans_) kv.second->client.close ();
+            chans_.clear ();
             return false;
         }
         chans_[e.logicalAddress] = std::move (ch);
     }
+
+    // ---- 第二步：每条通道一条线程 ----
+    running_ = true;
+    for (auto &kv : chans_)
+    {
+        const std::uint16_t ta = kv.first;
+        kv.second->worker = std::thread ([this, ta] { workerLoop (ta); });
+    }
+    funcThread_ = std::thread ([this] { functionalLoop (); });
     return true;
 }
 
 void DiagnosticGateway::stop ()
 {
+    if (!running_) return;
+    running_ = false;
+
+    for (auto &kv : chans_) kv.second->queue.stop ();
+    funcQueue_.stop ();
     for (auto &kv : chans_)
     {
-        if (kv.second) kv.second->client.close ();
+        if (kv.second->worker.joinable ()) kv.second->worker.join ();
     }
+    if (funcThread_.joinable ()) funcThread_.join ();
+
+    for (auto &kv : chans_) kv.second->client.close ();
     chans_.clear ();
 }
 
-bool DiagnosticGateway::operator() (const DiagnosticRequest &req,
-                                    std::vector<std::uint8_t> &resp,
-                                    std::string &err)
+// ---------------------------------------------------------------------------
+// 一条通道的工作线程
+//
+// 顺序是刻意的：
+//   取活（队列）→ 记排队时长 → **独占总线** → 发帧收帧 → 交卷（放锁之前不放结果）
+// 放锁之后才交卷，是为了让"结果已经可用"和"总线上这条已经走完"的顺序对得上：
+// 反过来的话，下一个请求可能在结果还没登记时就开始发帧，日志里就出现"回得比问得早"。
+// ---------------------------------------------------------------------------
+void DiagnosticGateway::workerLoop (std::uint16_t ta)
 {
-    resp.clear ();
+    auto it = chans_.find (ta);
+    if (it == chans_.end ()) return;
+    Channel &ch = *it->second;
 
-    // ---- 查表。查不到就到此为止：宁可回 0x03，也不许猜一台 ECU ----
-    const RouteEntry *route = table_.lookup (req.targetAddress);
-    if (route == nullptr)
+    ChannelJob job;
+    while (ch.queue.pop (job))
     {
-        ++unknown_;
-        ++failed_;
-        char buf[96];
-        std::snprintf (buf, sizeof (buf), "目标地址 0x%04X 不在路由表里",
-                       static_cast<unsigned> (req.targetAddress));
-        err = buf;
-        return false;
+        const auto waited = std::chrono::duration_cast<std::chrono::milliseconds> (
+            std::chrono::steady_clock::now () - job.enqueued).count ();
+        const std::size_t w = static_cast<std::size_t> (waited < 0 ? 0 : waited);
+        std::size_t prev = ch.maxQueueWaitMs.load ();
+        while (w > prev && !ch.maxQueueWaitMs.compare_exchange_weak (prev, w)) {}
+
+        JobResult r;
+        {
+            // 这条通道的总线使用权。M10 只是把锁的粒度从"全局"改到"每通道"。
+            std::lock_guard<std::mutex> bus (ch.busMu);
+            std::vector<std::uint8_t> resp;
+            std::string err;
+            if (ch.client.request (job.req.uds, resp, err))
+            {
+                r.ok = true;
+                r.replies.push_back (DiagnosticReply{job.req.targetAddress, resp});
+            }
+            else
+            {
+                r.ok = false;
+                r.nackCode = static_cast<std::uint8_t> (DiagNack::TransportProtocolError);
+                r.reason = err;
+            }
+        }
+
+        if (r.ok) { ++ch.handled; ++handled_; }
+        else      { ++ch.failed; ++failed_; }
+        finishJob (job.id, std::move (r));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 广播线程（M8 的 broadcast 搬到独立线程）
+//
+// 为什么广播不能占 I/O 线程：广播要"挨条通道收 150ms"，两条通道就是 300ms，
+// 这段时间里 I/O 线程连 accept 都做不了。而广播本身又是"全网动作"，
+// 它确实**必须**独占所有通道（总线只有一条），所以只能在专用线程里独占。
+// ---------------------------------------------------------------------------
+void DiagnosticGateway::functionalLoop ()
+{
+    ChannelJob job;
+    while (funcQueue_.pop (job))
+    {
+        const auto waited = std::chrono::duration_cast<std::chrono::milliseconds> (
+            std::chrono::steady_clock::now () - job.enqueued).count ();
+        const std::size_t w = static_cast<std::size_t> (waited < 0 ? 0 : waited);
+        std::size_t prev = maxWaitMs_.load ();
+        while (w > prev && !maxWaitMs_.compare_exchange_weak (prev, w)) {}
+
+        DiagnosticMultiResult mr = broadcast (job.req);
+
+        JobResult r;
+        r.ok       = mr.ok;
+        r.nackCode = mr.nackCode;
+        r.reason   = mr.reason;
+        r.replies  = mr.replies;
+        finishJob (job.id, std::move (r));
+    }
+}
+
+// 按 TA 升序拿所有通道的总线锁：顺序固定才不会两条线程各拿一半互相等（死锁）
+void DiagnosticGateway::lockAllBuses (std::vector<std::unique_lock<std::mutex>> &locks)
+{
+    locks.clear ();
+    for (auto &kv : chans_)
+    {
+        if (kv.second) locks.emplace_back (kv.second->busMu);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 投递：三种结局都要有明确去处
+//   ① 地址不认识 / 通道没开 → id=0 + immediate 里就是结论（不占队列）
+//   ② 进程正常 → 进队，返回 id
+//   ③ 队列满了 → **仍然返回 id**，但结果已经当场写好（0x08 排队满）
+//      为什么给 id：调用方（TCP 服务器）只需要"记住一个号"，不该为"当场失败"多写一条分支。
+// ---------------------------------------------------------------------------
+std::uint64_t DiagnosticGateway::submit (const DiagnosticRequest &req, DiagnosticMultiResult &immediate)
+{
+    immediate = DiagnosticMultiResult{};
+    const std::uint64_t id = board_.add ();
+
+    if (table_.knownFunctional (req.targetAddress))
+    {
+        ChannelJob job;
+        job.id       = id;
+        job.req      = req;
+        job.enqueued = std::chrono::steady_clock::now ();
+        if (!funcQueue_.push (job))
+        {
+            ++failed_;
+            immediate.nackCode = static_cast<std::uint8_t> (DiagNack::TransportProtocolError);
+            immediate.reason   = "广播队列已满（上限 8 条），这条请求没排上";
+            board_.abandon (id);
+            return 0;
+        }
+        return id;
     }
 
     auto it = chans_.find (req.targetAddress);
     if (it == chans_.end () || !it->second)
     {
+        ++unknown_;
         ++failed_;
-        err = "这条路由的通道没有打开";
+        immediate.nackCode = static_cast<std::uint8_t> (DiagNack::UnknownTargetAddress);
+        immediate.reason   = "目标地址 " + hexTa (req.targetAddress) + " 不在路由表里";
+        board_.abandon (id);
+        return 0;
+    }
+
+    Channel &ch = *it->second;
+    ChannelJob job;
+    job.id       = id;
+    job.req      = req;
+    job.enqueued = std::chrono::steady_clock::now ();
+
+    if (!ch.queue.push (job))
+    {
+        ++failed_;
+        ++ch.failed;
+        JobResult r;
+        r.nackCode = static_cast<std::uint8_t> (DiagNack::TransportProtocolError);
+        r.reason   = "通道 " + hexTa (req.targetAddress) +
+                     " 的队列已满（上限 8 条），这条请求没排上";
+        board_.complete (id, std::move (r));
+        return id;
+    }
+    return id;
+}
+
+bool DiagnosticGateway::waitResult (std::uint64_t id, DiagnosticMultiResult &out,
+                                   std::chrono::milliseconds timeout)
+{
+    JobResult r;
+    if (!board_.wait (id, r, timeout))
+    {
+        // 超时也要把槽清掉，否则这个 id 会一直挂在表上（"漏一个槽"比"漏一条请求"更隐蔽）
+        board_.abandon (id);
+        return false;
+    }
+    out.ok       = r.ok;
+    out.nackCode = r.nackCode;
+    out.reason   = r.reason;
+    out.replies  = std::move (r.replies);
+    return true;
+}
+
+bool DiagnosticGateway::takeResult (std::uint64_t &id, DiagnosticMultiResult &out)
+{
+    JobResult r;
+    if (!board_.takeAny (id, r)) return false;
+    out.ok       = r.ok;
+    out.nackCode = r.nackCode;
+    out.reason   = r.reason;
+    out.replies  = std::move (r.replies);
+    return true;
+}
+
+void DiagnosticGateway::abandon (std::uint64_t id)
+{
+    // 连接断了：槽立刻删掉。工作线程过一会儿仍然会把结果交上来，
+    // 但板子上已经没有这个 id —— 结果自然落地无声，不会被下一台诊断仪收走。
+    ++abandoned_;
+    board_.abandon (id);
+}
+
+void DiagnosticGateway::finishJob (std::uint64_t id, JobResult r)
+{
+    board_.complete (id, std::move (r));
+}
+
+// ---- 同步外壳：M4~M9 的调用方式不变 ----
+bool DiagnosticGateway::operator() (const DiagnosticRequest &req,
+                                   std::vector<std::uint8_t> &resp,
+                                   std::string &err)
+{
+    resp.clear ();
+
+    if (table_.knownFunctional (req.targetAddress))
+    {
+        DiagnosticMultiResult mr = broadcast (req);
+        if (!mr.ok)
+        {
+            err = mr.reason;
+            return false;
+        }
+        if (mr.replies.size () != 1)
+        {
+            err = "功能地址回了 " + std::to_string (mr.replies.size ()) + " 条应答，一问一答接口装不下";
+            return false;
+        }
+        resp = mr.replies.front ().uds;
+        return true;
+    }
+
+    DiagnosticMultiResult immediate;
+    const std::uint64_t id = submit (req, immediate);
+    if (id == 0)
+    {
+        err = immediate.reason;
         return false;
     }
 
     const auto t0 = std::chrono::steady_clock::now ();
-
-    // 锁的作用不是"线程安全"，是**语义**：
-    // 同一时刻只允许一条诊断在 CAN 上走，否则响应分不清是谁的。
-    std::lock_guard<std::mutex> lock (mu_);
+    DiagnosticMultiResult mr;
+    if (!waitResult (id, mr, std::chrono::milliseconds (8000)))
+    {
+        err = "等结果超时（8 秒）";
+        return false;
+    }
 
     const auto waited = std::chrono::duration_cast<std::chrono::milliseconds> (
         std::chrono::steady_clock::now () - t0).count ();
-    if (static_cast<std::size_t> (waited) > maxWaitMs_)
-    {
+    if (static_cast<std::size_t> (waited) > maxWaitMs_.load ())
         maxWaitMs_ = static_cast<std::size_t> (waited);
-    }
 
-    const bool ok = it->second->client.request (req.uds, resp, err);
-    if (ok)
+    if (!mr.ok)
     {
-        ++handled_;
-        ++it->second->handled;
+        err = mr.reason;
+        return false;
     }
-    else
+    if (mr.replies.size () != 1)
     {
-        ++failed_;
-        ++it->second->failed;
+        err = "一问一答接口收到 " + std::to_string (mr.replies.size ()) + " 条应答";
+        return false;
     }
-    return ok;
+    resp = mr.replies.front ().uds;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
 // M8：功能寻址（一条广播 → 多条应答）
 //
-// 四步，顺序不能乱：
+// 五步，顺序不能乱：
 //   ① 查功能表：TA 不在功能段 → 0x03（地址问题，不是传输问题）
-//   ② **先给每条通道清仓**。上一条请求留下的多帧尾巴如果还在缓冲区里，
-//      会被当成"这次的应答"，现象是"回了个 VIN 给只问了 3E 00 的诊断仪"。
-//   ③ 广播**只发一次**（借第一条通道的 socket 发——发帧不看 bind 的 rx 过滤）
-//   ④ 挨条通道收，可能一条都没有：那说明"听着但不应答"（比如这台 ECU 不支持该服务）。
-//      这时候回 0x06（目标存在但不可达），不是 0x03（地址不认识）——两者错因完全不同。
+//   ② 广播要**独占所有通道**：一次广播发上总线，其它通道此刻不能有半截多帧在飞
+//   ③ **先给每条通道清仓**（上一条请求留下的尾巴会被当成这次的应答）
+//   ④ 广播**只发一次**（借第一条通道的 socket 发——发帧不看 bind 的 rx 过滤）
+//   ⑤ 挨条通道收，可能一条都没有：那是"听着但不应答" → 0x06，不是 0x03
 // ---------------------------------------------------------------------------
 DiagnosticMultiResult DiagnosticGateway::broadcast (const DiagnosticRequest &req)
+{
+    std::lock_guard<std::mutex> one (funcMu_);          // 同一时刻只允许一次广播
+    std::vector<std::unique_lock<std::mutex>> locks;
+    lockAllBuses (locks);
+    return broadcastLocked (req);
+}
+
+DiagnosticMultiResult DiagnosticGateway::broadcastLocked (const DiagnosticRequest &req)
 {
     DiagnosticMultiResult out;
 
@@ -148,8 +386,6 @@ DiagnosticMultiResult DiagnosticGateway::broadcast (const DiagnosticRequest &req
         return out;
     }
 
-    // 功能请求必须是单帧（ISO-TP 的 SF 只有 7 字节）：这一点在发之前就要拦，
-    // 因为"超过 7 字节的广播"根本不是配置问题，是**协议上做不到**（没有收件人给流控）。
     if (req.uds.empty () || req.uds.size () > 7)
     {
         ++failed_;
@@ -157,16 +393,6 @@ DiagnosticMultiResult DiagnosticGateway::broadcast (const DiagnosticRequest &req
         out.reason   = "功能寻址的请求必须是单帧（1–7 字节），现在是 " +
                        std::to_string (req.uds.size ()) + " 字节";
         return out;
-    }
-
-    const auto t0 = std::chrono::steady_clock::now ();
-    std::lock_guard<std::mutex> lock (mu_);
-
-    const auto waited = std::chrono::duration_cast<std::chrono::milliseconds> (
-        std::chrono::steady_clock::now () - t0).count ();
-    if (static_cast<std::size_t> (waited) > maxWaitMs_)
-    {
-        maxWaitMs_ = static_cast<std::size_t> (waited);
     }
 
     for (auto &kv : chans_)
@@ -193,7 +419,7 @@ DiagnosticMultiResult DiagnosticGateway::broadcast (const DiagnosticRequest &req
         if (kv.second->client.recvFunctional (r, static_cast<int> (tim_.funcWindowMs), e2))
         {
             DiagnosticReply rep;
-            rep.sourceAddress = kv.first;      // 这条应答是这台 ECU 说的
+            rep.sourceAddress = kv.first;
             rep.uds           = r;
             out.replies.push_back (rep);
             ++kv.second->handled;
@@ -201,8 +427,6 @@ DiagnosticMultiResult DiagnosticGateway::broadcast (const DiagnosticRequest &req
         }
         else
         {
-            // 没答也算"这条通道没参与"，不按失败记——功能请求本来就是"在的人答"。
-            // 但要留个痕：日志里能看出是哪条通道沉默的（e2 里写着超时/多帧跳过）
             ++kv.second->failed;
         }
     }
@@ -221,7 +445,8 @@ DiagnosticMultiResult DiagnosticGateway::broadcast (const DiagnosticRequest &req
     return out;
 }
 
-std::vector<DiagnosticGateway::ChannelStats> DiagnosticGateway::channelStats () const{
+std::vector<DiagnosticGateway::ChannelStats> DiagnosticGateway::channelStats () const
+{
     std::vector<ChannelStats> out;
     for (const auto &e : table_.entries ())
     {
@@ -233,10 +458,13 @@ std::vector<DiagnosticGateway::ChannelStats> DiagnosticGateway::channelStats () 
         auto it = chans_.find (e.logicalAddress);
         if (it != chans_.end () && it->second)
         {
-            cs.open    = it->second->client.isOpen ();
-            cs.handled = it->second->handled;
-            cs.failed  = it->second->failed;
-            cs.stats   = it->second->client.stats ();
+            cs.open           = it->second->client.isOpen ();
+            cs.handled        = it->second->handled.load ();
+            cs.failed         = it->second->failed.load ();
+            cs.queuePeak      = it->second->queue.peak ();
+            cs.maxQueueWaitMs = it->second->maxQueueWaitMs.load ();
+            cs.rejected       = it->second->queue.rejected ();
+            cs.stats          = it->second->client.stats ();
         }
         out.push_back (cs);
     }

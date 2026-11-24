@@ -12,6 +12,7 @@
 #   read       --host --port --ta 0x0002 --uds "22 F1 90"          # 激活 + 读一个 DID
 #   noact      --host --port --sa 0x0E00 --ta 0x0001               # 不激活直接发诊断（应被 0x02 拒）
 #   unknown    --host --port --sa 0x0E00 --ta 0x0004               # 发到"不存在的地址"（应 0x03）
+#   busy       --host --port --ta 0x0003 --uds "22 F1 90"        # M10：同一连接连发两条（第二条应 0x08 拒）
 #   concurrent --host --port --ta 0x0002 --uds "22 F1 90"
 #              --ta2 0x0003 --uds2 "22 F1 91"                      # 两个客户端并发，各拿各的
 #
@@ -244,6 +245,49 @@ def cmd_func(a):
               "NACK 码 0x%02X（期望 %s）" % (nack if nack is not None else 0, a.nack))
 
 
+def cmd_busy(a):
+    """M10：同一条连接上**不等回执**就连发两条。
+
+    为什么这是错的、而且要被拒：DoIP 的诊断通道是"一问一答"，没有流水线。
+    网关要是把第二条也排进队列，那么两条的 0x8001 响应回来时，
+    诊断仪只能靠"先后顺序"猜哪条是哪条——猜错就是串包。
+    所以第二条必须**当场**回 0x8003 0x08，连队都不排。
+    """
+    uds = parse_hex(a.uds)
+    s = socket.create_connection((a.host, a.port), timeout=3)
+    seen = []
+    nack = None
+    try:
+        check(raw_activate(s, a.sa), "先正常激活")
+        body = struct.pack("!HH", a.sa, a.ta) + uds
+        send_message(s, 0x8001, body)
+        send_message(s, 0x8001, body)      # 不等 ACK，第二条紧接着出去
+        s.settimeout(3)
+        for _ in range(4):
+            try:
+                m = recv_message(s)
+            except socket.timeout:
+                break
+            if not m or len(m) < 12:
+                break
+            t = struct.unpack("!H", m[2:4])[0]
+            if t == 0x8002:
+                seen.append("ACK")
+            elif t == 0x8003:
+                nack = m[12]
+                seen.append("NACK")
+            elif t == 0x8001:
+                seen.append("RESP")
+    finally:
+        s.close()
+
+    print("SEEN=%s" % ",".join(seen))
+    print("NACK_CODE=%s" % ("0x%02X" % nack if nack is not None else "none"))
+    check("ACK" in seen, "第一条被受理（0x8002）")
+    check(nack == 0x08, "第二条当场被拒：0x8003 0x08（实际 %s）"
+          % ("0x%02X" % nack if nack is not None else "none"))
+
+
 def main():
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -255,6 +299,9 @@ def main():
         sp.add_argument("--sa", type=lambda x: int(x, 0), default=0x0E00)
 
     d = sub.add_parser("discover"); common(d); d.set_defaults(fn=cmd_discover)
+    b = sub.add_parser("busy"); common(b)
+    b.add_argument("--uds", required=True)
+    b.set_defaults(fn=cmd_busy)
     r = sub.add_parser("read"); common(r)
     r.add_argument("--uds", required=True)
     r.add_argument("--expect", default=None)
