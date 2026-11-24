@@ -325,16 +325,49 @@ bool DoIpTcpServer::handleConn (Conn &c)
             log ("0x8001 ← " + hex4 (o.sourceAddress) + "，" + std::to_string (o.uds.size ()) +
                  " 字节 UDS → 回 0x8002 ACK");
 
+            DiagnosticRequest req;
+            req.sourceAddress = o.sourceAddress;
+            req.targetAddress = o.targetAddress;
+            req.uds           = o.uds;
+
+            // ---- M8：多响应下游（功能寻址）优先 ----
+            // 一条请求 → N 条应答，每条都单独一条 0x8001：拼成一条的话，
+            // 诊断仪只知道"有人答了"，不知道是几台、各自说了什么。
+            if (diagnosticSinkMulti)
+            {
+                DiagnosticMultiResult mr = diagnosticSinkMulti (req);
+                if (!mr.ok)
+                {
+                    ++diagNacks_;
+                    DiagnosticNegativeAck na;
+                    na.sourceAddress = o.targetAddress;
+                    na.targetAddress = o.sourceAddress;
+                    na.nackCode      = mr.nackCode;
+                    sendBytes (c.fd, build (PayloadType::DiagnosticNegativeAck, encodePayload (na)));
+                    log ("下游拒绝 → 0x8003 " +
+                         std::string (nameOf (static_cast<DiagNack> (mr.nackCode))) +
+                         "：" + mr.reason);
+                    continue;
+                }
+                for (const auto &rep : mr.replies)
+                {
+                    DiagnosticMessage back;
+                    back.sourceAddress = rep.sourceAddress;   // 谁答的，SA 就是谁
+                    back.targetAddress = o.sourceAddress;
+                    back.uds           = rep.uds;
+                    sendBytes (c.fd, build (PayloadType::DiagnosticMessage, encodePayload (back)));
+                    ++diagReplies_;
+                }
+                log ("下游答了 " + std::to_string (mr.replies.size ()) +
+                     " 条（广播）→ 逐条用 0x8001 送回 " + hex4 (o.sourceAddress));
+                continue;
+            }
+
             if (!diagnosticSink)
             {
                 log ("没有装下游，只回 ACK（M3 允许这样，M4 必须接上 ISO-TP）");
                 continue;
             }
-
-            DiagnosticRequest req;
-            req.sourceAddress = o.sourceAddress;
-            req.targetAddress = o.targetAddress;
-            req.uds           = o.uds;
 
             std::vector<std::uint8_t> resp;
             std::string err;
@@ -355,6 +388,7 @@ bool DoIpTcpServer::handleConn (Conn &c)
             back.targetAddress = o.sourceAddress;
             back.uds           = resp;
             sendBytes (c.fd, build (PayloadType::DiagnosticMessage, encodePayload (back)));
+            ++diagReplies_;
             log ("下游答了 " + std::to_string (resp.size ()) + " 字节 → 用 0x8001 送回 " +
                  hex4 (o.sourceAddress));
         }

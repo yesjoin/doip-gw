@@ -99,6 +99,31 @@ using DiagnosticRequest = DiagnosticMessage;
 using DiagnosticSink =
     std::function<bool (const DiagnosticRequest &, std::vector<std::uint8_t> &, std::string &)>;
 
+// ---------------------------------------------------------------------------
+// M8：一次请求可能回来**多条**响应（功能寻址）
+//
+// 为什么单响应的 sink 不够用：
+//   打到 0xE400 的那一条请求，总线上有两台 ECU 各答一句。DoIP 里这是两条 0x8001，
+//   而且 SA 各不相同（谁答的，SA 就是谁的逻辑地址）——只回一条就等于替其中一台说了话。
+// 所以这里不是"把两条拼起来"（拼起来诊断仪就没法知道第二台也答了），
+// 而是**带地址的响应列表**：SA 由网关填（应答通道的 TA），UDS 由下游填。
+// ---------------------------------------------------------------------------
+struct DiagnosticReply
+{
+    std::uint16_t             sourceAddress = 0;   // 这条应答是谁说的（通道 TA）
+    std::vector<std::uint8_t> uds;
+};
+
+struct DiagnosticMultiResult
+{
+    bool                            ok       = false;
+    std::uint8_t                    nackCode = static_cast<std::uint8_t> (DiagNack::TransportProtocolError);
+    std::string                     reason;
+    std::vector<DiagnosticReply>    replies;
+};
+
+using DiagnosticMultiSink = std::function<DiagnosticMultiResult (const DiagnosticRequest &)>;
+
 // M3 用的"假 ECU"：**故意不是真的**。M4 会把它换成项目一的 ISO-TP 通道。
 // 它答三件事，让链路能端到端跑通：
 //   0x3E 00（TesterPresent）  → 7E 00

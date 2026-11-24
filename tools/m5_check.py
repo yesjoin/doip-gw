@@ -179,6 +179,71 @@ def cmd_concurrent(a):
             print("       %s 最后一条：%s" % (key, hx(results[key][-1])))
 
 
+def cmd_func(a):
+    """M8：功能寻址。一条请求打到一个功能地址，可能回来**多条**响应（SA 各不相同）。
+
+    为什么必须用裸 socket：`doipclient` 的 `receive_diagnostic()` 收一条就返回，
+    而功能寻址的整个考点就是"后面还有几条"——用第三方库反而看不见这个现象。
+    """
+    uds = parse_hex(a.uds)
+    reps = []          # [(sa, uds_bytes)]
+    nack = None
+
+    s = socket.create_connection((a.host, a.port), timeout=3)
+    try:
+        check(raw_activate(s, a.sa), "先正常激活")
+        send_message(s, 0x8001, struct.pack("!HH", a.sa, a.ta) + uds)
+
+        s.settimeout(a.wait)
+        while True:
+            try:
+                m = recv_message(s)
+            except socket.timeout:
+                break
+            if not m or len(m) < 12:
+                break
+            t = struct.unpack("!H", m[2:4])[0]
+            if t == 0x8002:
+                print("       0x8002 ACK（先受理、再算业务）")
+                continue
+            if t == 0x8003:
+                nack = m[12] if len(m) > 12 else 0
+                print("       0x8003 NACK：码 0x%02X" % nack)
+                print("NACK_CODE=0x%02X" % nack)
+                continue
+            if t != 0x8001:
+                continue
+            sa = struct.unpack("!H", m[8:10])[0]
+            ta = struct.unpack("!H", m[10:12])[0]
+            reps.append((sa, m[12:]))
+            print("       RESP SA=0x%04X TA=0x%04X UDS=%s" % (sa, ta, hx(m[12:])))
+    finally:
+        s.close()
+
+    print("RESPONSE_COUNT=%d" % len(reps))
+    print("RESPONSE_SAS=%s" % ",".join("0x%04X" % r[0] for r in reps))
+    for i, (sa, body) in enumerate(reps):
+        print("RESP%d_SA=0x%04X" % (i, sa))
+        print("RESP%d_HEX=%s" % (i, hx(body)))
+
+    if a.count is not None:
+        check(len(reps) == a.count,
+              "应答条数 %d（期望 %d：谁在听，谁答）" % (len(reps), a.count))
+    if a.sas:
+        want = sorted(int(x, 16) for x in a.sas.split(","))
+        got = sorted(set(r[0] for r in reps))
+        check(got == want, "应答的源地址集合是 %s（实际 %s）"
+              % (",".join("0x%04X" % w for w in want),
+                 ",".join("0x%04X" % g for g in got)))
+    if a.expect:
+        pref = parse_hex(a.expect)
+        check(all(r[1][:len(pref)] == pref for r in reps),
+              "每条应答都以 %s 开头" % a.expect)
+    if a.nack is not None:
+        check(nack == int(a.nack, 16),
+              "NACK 码 0x%02X（期望 %s）" % (nack if nack is not None else 0, a.nack))
+
+
 def main():
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -209,6 +274,16 @@ def main():
     c.add_argument("--expect2", default="7E 00")
     c.add_argument("--rounds", type=int, default=2)
     c.set_defaults(fn=cmd_concurrent)
+
+    # M8：功能寻址（一条请求 → N 条应答，SA 各不相同）
+    f = sub.add_parser("func"); common(f)
+    f.add_argument("--uds", required=True)
+    f.add_argument("--count", type=int, default=None)
+    f.add_argument("--sas", default=None, help="期望的源地址集合，逗号分隔，如 0x0003,0x0006")
+    f.add_argument("--expect", default=None, help="每条应答的 UDS 前缀")
+    f.add_argument("--nack", default=None, help="期望的 0x8003 码，如 0x06")
+    f.add_argument("--wait", type=float, default=1.0, help="收应答的等待窗口（秒）")
+    f.set_defaults(fn=cmd_func)
 
     a = p.parse_args()
     if getattr(a, "ta2", None) is None:

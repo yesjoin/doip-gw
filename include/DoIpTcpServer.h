@@ -70,12 +70,18 @@ public:
     std::size_t diagnosticRequests () const { return diagRequests_; }
     std::size_t diagnosticAcks () const { return diagAcks_; }
     std::size_t diagnosticNacks () const { return diagNacks_; }
+    // M8：一次请求生成了几条 0x8001 响应（功能寻址时 > 1）
+    std::size_t diagnosticReplies () const { return diagReplies_; }
 
     std::function<void (const std::string &)> logger;
 
     // M3 的下游。为空时：只回 0x8002，不产生响应报文（通道仍能验完）。
     // M4 把它接成 ISO-TP 通道。
     DiagnosticSink diagnosticSink;
+
+    // M8 的下游（可选，优先于上面那个）：一次请求 → 多条带源地址的响应。
+    // 只有功能寻址需要它；设了它之后，所有请求都走它（物理寻址返回一条即可）。
+    DiagnosticMultiSink diagnosticSinkMulti;
 
 private:
     struct Conn
@@ -107,6 +113,7 @@ private:
     std::size_t     diagRequests_ = 0;
     std::size_t     diagAcks_     = 0;
     std::size_t     diagNacks_    = 0;
+    std::size_t     diagReplies_  = 0;
 };
 
 } // namespace doip

@@ -16,6 +16,11 @@
 //
 // ③ **地址不认识就不发。** 查不到 TA 时立刻失败，由上层回 0x8003 0x03，
 //    绝不"猜一台 ECU 发过去"。诊断工程里，答错比不答危险得多。
+//
+// M8 补的第 ④ 件事：**"问一台"和"问一类"是两种动作。**
+//    物理地址：一条通道一发一收，答案只有一条。
+//    功能地址：广播一次，然后挨条通道收——**答案条数不由网关决定，由谁在听决定**。
+//    所以功能寻址走 broadcast()，不复用 operator()：那个函数的契约是"一问一答"。
 // ============================================================================
 #include "DoIpDiagnostic.h"
 #include "IsoTpClient.h"
@@ -47,6 +52,10 @@ public:
                      std::vector<std::uint8_t> &resp,
                      std::string &err);
 
+    // M8：功能寻址。一条广播 → 收集所有通道的应答。
+    // 语义上它**不能**复用 operator()：那个函数是"一问一答"，这里的答案条数由 ECU 决定。
+    DiagnosticMultiResult broadcast (const DiagnosticRequest &req);
+
     struct ChannelStats
     {
         std::uint16_t       ta      = 0;
@@ -62,6 +71,10 @@ public:
     std::size_t failed ()         const { return failed_; }
     std::size_t unknownTargets () const { return unknown_; }
     std::size_t maxWaitMs ()      const { return maxWaitMs_; }
+    // M8 的两个数：广播了几次、从 ECU 收回来几条应答（一次广播可以回多条）
+    std::size_t functionalRequests () const { return funcReq_; }
+    std::size_t functionalReplies ()  const { return funcRep_; }
+    std::size_t silentBroadcasts ()   const { return silent_; }   // 广播了出去、一条都没答
     const RouteTable &table ()    const { return table_; }
     std::vector<ChannelStats> channelStats () const;
 
@@ -87,6 +100,9 @@ private:
     std::size_t failed_     = 0;
     std::size_t unknown_    = 0;
     std::size_t maxWaitMs_  = 0;
+    std::size_t funcReq_    = 0;
+    std::size_t funcRep_    = 0;
+    std::size_t silent_     = 0;
 };
 
 } // namespace doip

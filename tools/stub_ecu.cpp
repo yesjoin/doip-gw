@@ -17,6 +17,13 @@
 //
 // 用法：
 //   stub-ecu --iface vcan0 --rx 7A0 --tx 7A8 --vin LSVZZ0000B7654321 --hw HW02 --seconds 20
+//
+// M8 新增 --func-rx 7DF：除了自己的物理请求 ID，**再多听一个广播 ID**。
+//   这是"功能寻址"在 ECU 这一侧的真相：不是我多了一条协议，是我多开了一个耳朵。
+//   注意两件事：
+//     ① 广播来的请求只能是单帧（网关没法给"所有 ECU"发流控）；
+//     ② 应答也必须能塞进单帧（≤7 字节），塞不进去就不答——
+//        这不是偷懒，是协议限制：多帧响应要等一个唯一的流控方向。
 // ============================================================================
 #include "CanId.h"
 #include "IsoTpStack.h"
@@ -177,6 +184,7 @@ int main (int argc, char **argv)
     std::string iface = "vcan0";
     std::uint32_t tx = 0x7A8;      // 我发的（ECU → tester）
     std::uint32_t rx = 0x7A0;      // 我收的（tester → ECU）
+    std::uint32_t funcRx = 0;      // M8：额外的广播监听 ID（0 = 不听广播）
     std::string vin = "LSVZZ0000B7654321";
     std::string hw  = "HW02";
     int seconds = 20;
@@ -187,16 +195,29 @@ int main (int argc, char **argv)
         if (a == "--iface" && i + 1 < argc)       iface = argv[++i];
         else if (a == "--tx" && i + 1 < argc)     tx = std::strtoul (argv[++i], nullptr, 16);
         else if (a == "--rx" && i + 1 < argc)     rx = std::strtoul (argv[++i], nullptr, 16);
+        else if (a == "--func-rx" && i + 1 < argc) funcRx = std::strtoul (argv[++i], nullptr, 16);
         else if (a == "--vin" && i + 1 < argc)    vin = argv[++i];
         else if (a == "--hw" && i + 1 < argc)     hw = argv[++i];
         else if (a == "--seconds" && i + 1 < argc) seconds = std::atoi (argv[++i]);
         else
         {
             std::fprintf (stderr,
-                          "用法：%s [--iface vcan0] [--rx 7A0] [--tx 7A8] "
+                          "用法：%s [--iface vcan0] [--rx 7A0] [--tx 7A8] [--func-rx 7DF] "
                           "[--vin LSVZZ0000B7654321] [--hw HW02] [--seconds 20]\n", argv[0]);
             return 2;
         }
+    }
+    if (funcRx != 0 && funcRx == rx)
+    {
+        std::fprintf (stderr, "广播监听 ID 和自己的物理接收 ID 相同（%s），没有意义\n",
+                      formatCanId (rx).c_str ());
+        return 2;
+    }
+    if (funcRx != 0 && funcRx == tx)
+    {
+        std::fprintf (stderr, "广播监听 ID 和自己的发送 ID 相同（%s），会自己听自己\n",
+                      formatCanId (tx).c_str ());
+        return 2;
     }
     if (vin.size () != 17)
     {
@@ -215,6 +236,11 @@ int main (int argc, char **argv)
     std::printf ("极简 ECU：%s 上收 %s / 发 %s，VIN=%s，HW=%s，跑 %d 秒\n",
                  iface.c_str (), formatCanId (rx).c_str (), formatCanId (tx).c_str (),
                  vin.c_str (), hw.c_str (), seconds);
+    if (funcRx != 0)
+    {
+        std::printf ("           另外还听广播 %s（功能寻址，只能单帧收 / 单帧答）\n",
+                     formatCanId (funcRx).c_str ());
+    }
 
     IsoTpAssembler asm_ (4095);
     const auto deadline = std::chrono::steady_clock::now () + std::chrono::seconds (seconds);
@@ -229,12 +255,24 @@ int main (int argc, char **argv)
         can_frame f;
         std::memset (&f, 0, sizeof (f));
         if (::read (fd, &f, sizeof (f)) < static_cast<ssize_t> (sizeof (f))) continue;
-        if (idFromRecv (f.can_id) != rx) continue;        // 不是给我的（先剥标志位再比）
+        const std::uint32_t gotId = idFromRecv (f.can_id);      // 先剥标志位再比
+        const bool onFunc = (funcRx != 0 && gotId == funcRx);   // M8：这一帧是广播来的吗
+        if (gotId != rx && !onFunc) continue;                   // 不是给我的
+
         if (f.can_dlc == 0 || f.can_dlc > 8) continue;
 
         std::uint8_t d[8];
         std::memcpy (d, f.data, f.can_dlc);
         for (std::uint8_t i = f.can_dlc; i < 8; ++i) d[i] = 0;
+
+        // 广播来的请求必须是单帧：网关没法给"所有 ECU"发流控。
+        // 收到 FF 说明对端用法错了（或者别的工具在刷）——印一句，不答。
+        if (onFunc && kindOf (d) != FrameKind::SingleFrame)
+        {
+            std::printf ("  [广播 %s 上收到非单帧，按协议无法应答，跳过]\n",
+                         formatCanId (funcRx).c_str ());
+            continue;
+        }
 
         std::vector<std::uint8_t> req;
         std::string e2;
@@ -260,7 +298,19 @@ int main (int argc, char **argv)
 
         // r == Complete：答它
         const auto resp = answer (req, vin, hw);
-        std::printf ("  ← %s  →  %s\n", hex (req).c_str (), hex (resp).c_str ());
+
+        // 功能寻址的应答也必须塞进单帧（≤7 字节）。塞不进就不答——
+        // 比如读 VIN 是 20 字节，功能寻址读 VIN 在真实车上同样"没有答案"。
+        if (onFunc && resp.size () > 7)
+        {
+            std::printf ("  ← 广播 %s，响应 %zu 字节塞不进单帧，按协议不答\n",
+                         hex (req).c_str (), resp.size ());
+            asm_.reset ();
+            continue;
+        }
+
+        std::printf ("  ← %s%s  →  %s\n", onFunc ? "[广播] " : "", hex (req).c_str (),
+                     hex (resp).c_str ());
         if (!sendUds (fd, tx, rx, resp, e2))
         {
             std::printf ("  [回不出去：%s]\n", e2.c_str ());

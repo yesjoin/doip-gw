@@ -141,6 +141,126 @@ int main ()
     }
 
     // =======================================================================
+    std::printf ("\n=== D 功能寻址：谁在听广播（M8）===\n");
+
+    // D1：功能地址段。ISO 13400 把 0xE000–0xE3FF 留给 ISO/SAE 功能组，
+    //     0xE400–0xEFFF 才是厂商自定义功能组（0xE400 是业界最常用的那个）。
+    check (!isFunctionalAddressRange (0x0DFF), "0x0DFF 还是物理地址段");
+    check (isFunctionalAddressRange (0xE000), "0xE000 起进入功能地址段");
+    check (isFunctionalAddressRange (0xEFFF), "0xEFFF 是功能段的上边界");
+    check (!isFunctionalAddressRange (0xF000), "0xF000 已经不是功能段");
+    check (!isVendorFunctionalAddress (0xE000), "0xE000 是 ISO/SAE 保留的功能组，厂商不能随便用");
+    check (!isVendorFunctionalAddress (0xE3FF), "0xE3FF 仍在保留区");
+    check (isVendorFunctionalAddress (0xE400), "0xE400 才是厂商自定义功能组的起点");
+    check (isVendorFunctionalAddress (0xEFFF), "0xEFFF 仍是厂商自定义段");
+
+    // D2：正常的一对（功能地址 + 广播 ID）
+    {
+        RouteTable t;
+        FunctionalRoute f;
+        f.logicalAddress = 0xE400;
+        f.txId           = 0x7DF;
+        f.name           = "ALL";
+        check (t.addFunctional (f, err), "0xE400 → 0x7DF 能进功能表");
+        check (t.sizeFunctional () == 1, "功能表里一条");
+        check (t.size () == 0, "功能路由不会跑进物理表（两张表是分开的）");
+        check (t.lookupFunctional (0xE400) != nullptr, "按功能地址能查到它");
+        check (t.lookupFunctional (0xE400)->txId == 0x7DF, "查到的广播 ID 是 0x7DF");
+    }
+
+    // D3：该拒的都要拒，且错误信息要说清"为什么"
+    {
+        RouteTable t;
+        FunctionalRoute f;
+        f.logicalAddress = 0x0002;      // 物理地址段
+        f.txId           = 0x7DF;
+        check (!t.addFunctional (f, err), "物理地址不能当功能地址");
+        check (err.find ("功能地址段") != std::string::npos, "错误信息点明功能地址段");
+
+        FunctionalRoute g;
+        g.logicalAddress = 0xE000;      // ISO/SAE 保留
+        g.txId           = 0x7DF;
+        check (!t.addFunctional (g, err), "0xE000 是 WWH-OBD 保留的功能组，拒绝");
+        check (err.find ("0xE400") != std::string::npos, "错误信息告诉人该从 0xE400 起");
+
+        FunctionalRoute h;
+        h.logicalAddress = 0xE400;
+        h.txId           = 0u;
+        check (!t.addFunctional (h, err), "广播 ID = 0 不合法");
+
+        h.txId = 0x20000000u;           // 超过 29 位
+        check (!t.addFunctional (h, err), "广播 ID 超过 29 位 → 拒绝");
+        check (err.find ("29") != std::string::npos, "错误信息点名 29 位上限");
+
+        FunctionalRoute a, b;
+        a.logicalAddress = 0xE400; a.txId = 0x7DF;
+        b.logicalAddress = 0xE400; b.txId = 0x7E0;
+        check (t.addFunctional (a, err), "第一条功能路由进表");
+        check (!t.addFunctional (b, err), "同一个功能地址不能注册两次");
+        check (t.sizeFunctional () == 1, "被拒之后没有半成品");
+
+        // 两条功能路由共用一个广播 ID：等于两个功能组抢同一个喇叭
+        RouteTable t2;
+        FunctionalRoute c;
+        c.logicalAddress = 0xE401; c.txId = 0x7DF;
+        check (t2.addFunctional (a, err), "t2：0xE400 → 0x7DF");
+        check (!t2.addFunctional (c, err), "t2：同一个广播 ID 不能再给第二个功能地址");
+        check (t2.sizeFunctional () == 1, "t2：被拒之后还是一条");
+    }
+
+    // D4：物理表和功能表不能互相踩 —— 这两条是 M8 最容易配错的地方
+    {
+        RouteTable t;
+        check (t.add (mk (0x0002, 0x7E0, 0x7E8, "ECU_A"), err), "先加一条物理路由");
+
+        FunctionalRoute f;
+        f.logicalAddress = 0xE400;
+        f.txId           = 0x7E0;       // 拿物理请求 ID 当广播 ID
+        check (!t.addFunctional (f, err), "广播 ID 不能和物理路由的 ID 撞");
+        check (err.find ("物理路由") != std::string::npos, "错误信息点明是物理路由占着");
+
+        FunctionalRoute g;
+        g.logicalAddress = 0xE400;
+        g.txId           = 0x7DF;
+        check (t.addFunctional (g, err), "换回 0x7DF 就能进表");
+
+        // 反过来：物理路由想占用广播 ID（比如把某台 ECU 的 rx 写成 0x7DF）
+        check (!t.add (mk (0x0003, 0x7D0, 0x7DF, "BAD"), err),
+               "物理路由的 ID 不能占用广播 ID");
+        check (err.find ("广播") != std::string::npos, "错误信息点明广播 ID");
+
+        // 功能地址也不能出现在物理表里
+        check (!t.add (mk (0xE400, 0x7A0, 0x7A8, "CONFUSED"), err),
+               "功能地址不能写进物理路由");
+    }
+
+    // D5：一张表里"物理 + 功能"并存，reachable() 是网关用来判断"这地址我能不能到"的
+    {
+        RouteTable t;
+        check (t.add (mk (0x0002, 0x7E0, 0x7E8, "ECU_A"), err), "物理那条");
+        FunctionalRoute f;
+        f.logicalAddress = 0xE400;
+        f.txId           = 0x7DF;
+        check (t.addFunctional (f, err), "功能那条");
+        check (t.reachable (0x0002), "物理地址 reachable");
+        check (t.reachable (0xE400), "功能地址也 reachable（否则一上来就被 0x03 拒了）");
+        check (!t.reachable (0x0009), "表里没有的地址 reachable = false");
+        check (t.known (0x0002) && !t.known (0xE400), "known() 只认物理表（功能地址不算物理目标）");
+        check (!t.knownFunctional (0x0002), "knownFunctional() 只认功能表");
+    }
+
+    // D6：29 位广播 ID（0x18DB33F1）也能进功能表 —— M7 的宽度和 M8 的广播是能叠的
+    {
+        RouteTable t;
+        FunctionalRoute f;
+        f.logicalAddress = 0xE401;
+        f.txId           = 0x18DB33F1u;
+        check (t.addFunctional (f, err), "29 位广播 ID 0x18DB33F1 能进功能表");
+        check (isExtendedId (t.lookupFunctional (0xE401)->txId), "它确实是扩展帧");
+        check (formatCanId (t.lookupFunctional (0xE401)->txId) == "0x18DB33F1", "日志里打成 8 位");
+    }
+
+    // =======================================================================
     std::printf ("\n=== B 通道语义：谁会被告知\"目标地址未知\" ===\n");
 
     const std::uint16_t SA = 0x0E00, ENTITY = 0x0001;
@@ -214,6 +334,6 @@ int main ()
     std::printf ("\n--------------------------------\n");
     std::printf ("通过 %d 项，失败 %d 项\n", g_pass, g_fail);
     if (g_fail == 0)
-        std::printf ("M6+M7 全绿 —— 地址不认识就拒绝，ID 宽度也不许猜。\n");
+        std::printf ("M6+M7+M8 全绿 —— 地址不认识就拒绝，ID 宽度不许猜，广播 ID 不许抢。\n");
     return g_fail == 0 ? 0 : 1;
 }

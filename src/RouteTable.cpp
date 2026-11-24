@@ -57,6 +57,15 @@ bool RouteTable::add (const RouteEntry &e, std::string &err)
         return false;
     }
 
+    // M8 加的一道：功能地址不能当物理地址用。
+    // 0xE400 是"你们全都听着"，写进物理表就会变成"发给某一台"——同一串字节，语义完全不同。
+    if (isFunctionalAddressRange (e.logicalAddress))
+    {
+        err = "目标地址 " + hex4 (e.logicalAddress) +
+              " 落在功能地址段（0xE000–0xEFFF），物理路由不能用功能地址";
+        return false;
+    }
+
     for (const auto &x : entries_)
     {
         if (x.logicalAddress == e.logicalAddress)
@@ -72,8 +81,84 @@ bool RouteTable::add (const RouteEntry &e, std::string &err)
         }
     }
 
+    // 广播 ID 是"所有 ECU 都在听的那一个"，它一旦被某条物理路由当成收发 ID，
+    // 那条通道就会开始收别的 ECU 的应答——所以物理 ID 不能占用广播 ID。
+    for (const auto &f : funcEntries_)
+    {
+        if (f.txId == e.txId || f.txId == e.rxId)
+        {
+            err = "CAN ID " + formatCanId (f.txId) + " 已经被功能路由 " +
+                  hex4 (f.logicalAddress) + " 当成广播 ID，物理通道不能用它";
+            return false;
+        }
+    }
+
     entries_.push_back (e);
     return true;
+}
+
+bool RouteTable::addFunctional (const FunctionalRoute &f, std::string &err)
+{
+    if (!isFunctionalAddressRange (f.logicalAddress))
+    {
+        err = "地址 " + hex4 (f.logicalAddress) +
+              " 不在功能地址段（0xE000–0xEFFF）";
+        return false;
+    }
+    // 0xE000–0xE3FF 是 ISO/SAE 保留的功能组（0xE000 已被 WWH-OBD 占掉），
+    // 自己练手可以绕，但真做项目时写进配置就说明配置抄错了。宁可拒绝，不给"能不能用"留想象空间。
+    if (!isVendorFunctionalAddress (f.logicalAddress))
+    {
+        err = "地址 " + hex4 (f.logicalAddress) +
+              " 落在 ISO/SAE 保留的功能组（0xE000–0xE3FF），厂商自定义应从 0xE400 起";
+        return false;
+    }
+    if (!isValidCanId (f.txId))
+    {
+        err = "广播 ID 不合法（" + formatCanId (f.txId) + "），29 位上限 0x1FFFFFFF";
+        return false;
+    }
+
+    for (const auto &x : funcEntries_)
+    {
+        if (x.logicalAddress == f.logicalAddress)
+        {
+            err = "功能地址 " + hex4 (f.logicalAddress) + " 已经注册过了";
+            return false;
+        }
+        if (x.txId == f.txId)
+        {
+            err = "广播 ID " + formatCanId (f.txId) + " 已经被功能路由 " +
+                  hex4 (x.logicalAddress) + " 占用";
+            return false;
+        }
+    }
+    for (const auto &x : entries_)
+    {
+        if (x.logicalAddress == f.logicalAddress)
+        {
+            err = "功能地址 " + hex4 (f.logicalAddress) + " 和物理路由撞了";
+            return false;
+        }
+        if (f.txId == x.txId || f.txId == x.rxId)
+        {
+            err = "广播 ID " + formatCanId (f.txId) + " 已经被物理路由 " +
+                  hex4 (x.logicalAddress) + " 占用（会让那条通道收到别的 ECU 的应答）";
+            return false;
+        }
+    }
+
+    funcEntries_.push_back (f);
+    return true;
+}
+
+const FunctionalRoute *RouteTable::lookupFunctional (std::uint16_t ta) const
+{
+    for (const auto &x : funcEntries_)
+    {
+        if (x.logicalAddress == ta) return &x;
+    }
+    return nullptr;
 }
 
 const RouteEntry *RouteTable::lookup (std::uint16_t ta) const

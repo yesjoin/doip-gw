@@ -106,25 +106,32 @@ std::uint32_t IsoTpClient::stminToMs (std::uint8_t stmin)
 
 bool IsoTpClient::sendFrame (const std::uint8_t data[8], std::string &err)
 {
+    return sendFrameAs (cfg_.txId, data, err);
+}
+
+// M8 顺手抽出来的：同一套"置位 + 写 socket"，但 ID 由调用方给。
+// 功能寻址要往 0x7DF 发，而 0x7DF 不是任何一条通道的 txId——只是"同一把 socket 换个目的 ID"。
+bool IsoTpClient::sendFrameAs (std::uint32_t id, const std::uint8_t data[8], std::string &err)
+{
 #if HAVE_SOCKETCAN
     can_frame f;
     std::memset (&f, 0, sizeof (f));
     // ★ M7：29 位 ID 必须置 CAN_EFF_FLAG，否则内核回 EINVAL，帧根本发不出去。
     //   现场表现为"启动正常、每条请求都超时"，而 candump 上一条帧都没有。
     //   标准帧则不能带这个位（内核会认为你在用 29 位帧发一个 11 位的 ID）。
-    f.can_id  = idForSend (cfg_.txId);
+    f.can_id  = idForSend (id);
     f.can_dlc = 8;
     std::memcpy (f.data, data, 8);
     if (::write (fd_, &f, sizeof (f)) != static_cast<ssize_t> (sizeof (f)))
     {
-        err = "写 CAN 帧失败（" + formatCanId (cfg_.txId) +
-              (isExtendedId (cfg_.txId) ? "，扩展帧" : "，标准帧") + "）";
+        err = "写 CAN 帧失败（" + formatCanId (id) +
+              (isExtendedId (id) ? "，扩展帧" : "，标准帧") + "）";
         return false;
     }
     ++st_.framesSent;
     return true;
 #else
-    (void) data; err = "没有 SocketCAN"; return false;
+    (void) id; (void) data; err = "没有 SocketCAN"; return false;
 #endif
 }
 
@@ -225,6 +232,79 @@ bool IsoTpClient::waitFlowControl (FlowControl &fc, std::string &err)
         ++st_.flowRecv;
         return parseFlowControl (d, fc, err);
     }
+}
+
+// ---------------------------------------------------------------------------
+// M8：功能寻址（广播）
+//
+// 三个"为什么"：
+//   ① 为什么必须是单帧（≤7 字节）：7DF 上所有 ECU 都在听，网关没法跟"所有的 ECU"
+//      要流控——流控帧总得有个收件人。所以功能请求只允许 SF，超过就是配置/用法错了。
+//   ② 为什么响应也必须是单帧：同理，ECU 发 FF 之后等不到一个唯一的流控方向，
+//      多帧响应在功能寻址上是不成立的（真 ECU 也不会这么干）。
+//   ③ 为什么"发"和"收"要拆开：广播只该在总线上出现一次。拆开之后网关发一次、
+//      再挨条通道去收，账才对得上（1 条广播 → N 条应答）。
+// ---------------------------------------------------------------------------
+bool IsoTpClient::sendFunctional (std::uint32_t funcId,
+                                  const std::vector<std::uint8_t> &uds,
+                                  std::string &err)
+{
+    if (uds.empty ())
+    {
+        err = "功能寻址的空请求没有意义";
+        return false;
+    }
+    // 单帧的 PCI 高 4 位是 0，低 4 位是长度，所以最多 7 字节：8 - 1 = 7
+    if (uds.size () > 7)
+    {
+        err = "功能寻址的请求必须是单帧（最多 7 字节），现在 " +
+              std::to_string (uds.size ()) + " 字节";
+        return false;
+    }
+    if (!isValidCanId (funcId))
+    {
+        err = "广播 ID 不合法（" + formatCanId (funcId) + "）";
+        return false;
+    }
+
+    std::uint8_t d[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    d[0] = static_cast<std::uint8_t> (uds.size ());          // SF 的 PCI
+    std::memcpy (d + 1, uds.data (), uds.size ());
+
+    ++st_.funcRequests;
+    return sendFrameAs (funcId, d, err);
+}
+
+bool IsoTpClient::recvFunctional (std::vector<std::uint8_t> &resp, int timeoutMs, std::string &err)
+{
+    resp.clear ();
+
+    std::uint8_t d[8];
+    std::uint8_t dlc = 0;
+    if (!recvFrame (d, dlc, timeoutMs, err)) return false;
+
+    const auto k = kindOf (d);
+    if (k != FrameKind::SingleFrame)
+    {
+        // 首帧/连续帧/流控：在广播场景下都没法处理（见函数头 ②）。
+        // 不装作收到了，也不假装没看见——记一笔，然后告诉调用方"这次没收到可用响应"。
+        ++st_.funcMultiSkip;
+        err = std::string ("功能寻址收到 ") +
+              (k == FrameKind::FirstFrame ? "首帧" :
+               k == FrameKind::ConsecutiveFrame ? "连续帧" : "流控帧") +
+              "（多帧响应在功能寻址上无法定向，跳过）";
+        return false;
+    }
+
+    IsoTpAssembler asm_ (cfg_.maxMsg);
+    const auto r = asm_.onFrame (d, resp, err, dlc);
+    if (r != IsoTpAssembler::Result::Complete)
+    {
+        err = "功能寻址的响应解不开";
+        return false;
+    }
+    ++st_.funcResponses;
+    return true;
 }
 
 bool IsoTpClient::request (const std::vector<std::uint8_t> &uds,
