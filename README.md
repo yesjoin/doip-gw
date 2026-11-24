@@ -1,8 +1,19 @@
 # doip-gw
 
+[![CI](https://github.com/yesjoin/doip-gw/actions/workflows/ci.yml/badge.svg)](https://github.com/yesjoin/doip-gw/actions/workflows/ci.yml)
+
 DoIP 诊断网关：以太网侧收 DoIP，CAN 侧走 ISO-TP，中间做翻译。
 
 **项目三**。前两个项目：`uds-ecu`（CAN 上的 ECU）、`dbc-toolkit`（DBC 词典与代码生成）。
+
+```bash
+git clone git@github.com:yesjoin/doip-gw.git && cd doip-gw
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j4
+(cd build && ctest)          # 6 个套件、396 条断言
+```
+
+只依赖 cmake ≥ 3.16、C++17 编译器、Linux SocketCAN（`vcan0` 可用 `tools/vcanup.sh` 拉起来）。
+GitHub Actions 跑 gcc / clang 两条腿（含 `-Werror` 与 `-O2`），真 CAN 与第三方客户端的步骤只在本地跑。
 
 ---
 
