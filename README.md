@@ -673,6 +673,145 @@ bash tools/m6_e2e.sh 13461       # 七步，双 ECU，端到端
 
 ---
 
+## M7：CAN ID 有宽度（11 位 / 29 位）
+
+M6 的路由表里存的是"一个数"，但这个数其实有两种宽度。11 位最大只到 `0x7FF`，
+再往上（`0x800`–`0x1FFFFFFF`）只能用 29 位扩展帧发。**M7 做的事就是让同一张表里两种宽度并存。**
+
+### 为什么这条不能"顺手加一下"
+
+SocketCAN 有一条**反直觉**的规矩：同一块内存里的 `can_id` 字段，发和收的语义相反。
+
+- **发**：29 位 ID 必须手动把 `CAN_EFF_FLAG`（`0x80000000`）置上，否则内核按 11 位截断，帧发出去是错的 ID。
+- **收**：内核把这个标志位置好了给你，你必须自己**剥掉**才能比对；直接拿 `can_id` 和路由表里的 `0x18DA00F1` 比，永远不相等。
+
+两条规矩方向相反。只做对一半的现象特别气人：**网关启动正常、路由表打印正常，然后每一条请求都超时，
+`candump` 一条帧都没有**——因为发的时候没置位，内核根本没把这帧当 29 位发出去。
+所以 M7 的第一步不是写代码，是承认"ID 有宽度"这件事必须**收敛到一个地方**。
+
+### 一个新文件 `include/CanId.h`
+
+```cpp
+namespace doip {
+inline constexpr std::uint32_t kCanIdMax   = 0x1FFFFFFFu;  // 29 位全 1
+inline constexpr std::uint32_t kCanEffFlag = 0x80000000u;  // SocketCAN 的"这是扩展帧"标志
+inline constexpr std::uint32_t kStdIdMax   = 0x7FFu;       // 11 位全 1
+
+bool        isExtendedId(std::uint32_t id);   // > 0x7FF
+bool        isValidCanId(std::uint32_t id);   // 0 < id <= kCanIdMax
+std::uint32_t idForSend(std::uint32_t id);    // 29 位 → 置 kCanEffFlag
+std::uint32_t idFromRecv(std::uint32_t id);   // 剥掉 kCanEffFlag（连 RTR/ERR 高位一起剥）
+std::string  formatCanId(std::uint32_t id);   // 11 位打 0x%03X，29 位打 0x%08X
+}
+```
+
+为什么单独开文件，而不是塞进 `RouteTable.h`：**"宽度"不是路由表的知识，是 CAN 的知识。**
+`IsoTpClient`、`stub-ecu`、`doip-gateway` 三处都要用同一套判断，抄三遍迟早有一处忘了剥位。
+放进 `doip-route` 库（`CMakeLists.txt` 里给它加 `src/CanId.cpp`），是因为 `formatCanId` 要打日志、
+需要 `<string>`，但整个文件**不碰 socket**，所以单测不用起 vcan0 也能跑。
+路由表本身仍然只存"32 位原值"，**什么时候置位是发帧那一刻的事**——表是配置，帧才是动作。
+
+### 路由表多一道校验，错误信息点名上限
+
+`RouteTable::add()` 现在四道校验变成五道，第 ③ 道是 `isValidCanId(txId) && isValidCanId(rxId)`：
+
+```
+路由地址与 CAN ID 对重复：TA=0x0006 → 0x18DA00F1 / 0x18DAF100（29 位）
+CAN ID 0x20000000 超出 29 位上限（29 位最大是 0x1FFFFFFF）
+```
+
+错误信息从"这数不对"变成"这数为什么不对、上限在哪"，出问题时不用回头翻代码。
+顺便，原来 `0x7A0` 是打十进制的（`RouteTable.cpp` 里 `std::to_string` 的老问题），现在统一走 `formatCanId`。
+
+### 发帧置位、收帧剥位（`src/IsoTpClient.cpp`）
+
+```cpp
+// open() 里先拦一次：ID 非法就别等内核回 EINVAL
+if (!isValidCanId(cfg_.txId) || !isValidCanId(cfg_.rxId)) return false;
+
+// sendFrame
+f.can_id = idForSend(cfg_.txId);          // 29 位自动带上 CAN_EFF_FLAG
+// 失败信息里注明"扩展帧/标准帧"，省得以后又猜
+
+// recvFrame
+if (idFromRecv(f.can_id) != cfg_.rxId) continue;   // 原来是 f.can_id & CAN_EFF_MASK
+```
+
+`CAN_EFF_MASK` 是 `0x1FFFFFFF`，用它也能剥，但**只剥了 ID 那 29 位，RTR / ERR 两个标志位还留着**。
+换成 `& kCanIdMax` 是把 32 位里所有高位一起清掉——收帧比对要的是"纯 ID"，不是"ID 加一堆标志"。
+
+### `stub-ecu` 同步改造
+
+假 ECU 是 M6 为了"第二台 ECU"自己写的，它也必须能挂 29 位 ID，否则 M7 没有对照物：
+`sendFrame` 用 `idForSend`、两处收帧比较改 `idFromRecv`、启动横幅改成 `formatCanId`。
+现在 `--rx 18DA00F1 --tx 18DAF100` 直接就能用，和项目一的 `uds-demo`（`7E0/7E8`）挂在**同一条 vcan0 上**。
+
+### 日志的宽度要能一眼看出来
+
+`DoIpGateway` 和 `doip-gateway` 里原来用 `%03X`，29 位 ID 会被打成 17 位十六进制（`18DA00F1` → 一长串），
+既不像 ID 也没法抄进脚本。现在统一 `%s` + `formatCanId`：11 位是 `0x7E0`（3 位）、29 位是 `0x18DA00F1`（8 位），
+**看位数就知道是哪种帧**。`DoIpGateway.cpp` 里为此加了个小函数 `hexTa()`，启动失败信息改成字符串拼接。
+
+### 自测从 32 项涨到 57 项（`tests/route_selftest.cpp`）
+
+新增 C 段 25 项，都冲着边界去：
+
+| 组 | 项 | 验什么 |
+|---|---|---|
+| 宽度判定 | `0x7FF` / `0x800` | 边界两侧各判一次，差一位就换帧类型 |
+| 合法性 | `0` / `0x1FFFFFFF` / `0x20000000` | 0 非法；29 位全 1 合法；再多一位必须拒 |
+| 置位/剥位 | `idForSend` / `idFromRecv` 正反跑 | 置完再剥必须回到原值，11 位要原样不动 |
+| 格式化 | 两种宽度 | 3 位 / 8 位，且都带 `0x` |
+| 入表 | 超 29 位 | `add()` 拒绝，且错误信息里含"29" |
+| 混表 | 11 位 + 29 位并存 | 同一张表两条路由互不干扰 |
+
+`ctest` 六套件全绿，累计 **421 项**（94 / 57 / 70 / 73 / 70 / **57**）。
+
+### 一条命令跑完（`tools/m7_e2e.sh`）
+
+```bash
+bash tools/m7_e2e.sh 13462      # 六步九项，双宽度，同一条 vcan0
+```
+
+三个进程同时在跑：项目一 `uds-demo`（标准帧 `7E0/7E8`，`TA=0x0002`，VIN `LSVAA0000A1234567`）、
+`stub-ecu --rx 18DA00F1 --tx 18DAF100`（扩展帧，`TA=0x0006`，VIN `LSVZZ0000B7654321`，HW `HW02`）、
+网关（两条 `--route`）+ `candump -L` 录总线。
+
+| 步骤 | 验什么 | 结果 |
+|---|---|---|
+| 1 | 路由表打印的宽度对不对 | ✅ `TA=0x0002 → 0x7E0 / 0x7E8`（3 位）、`TA=0x0006 → 0x18DA00F1 / 0x18DAF100`（8 位） |
+| 2 | 标准帧通道读 VIN | ✅ `LSVAA0000A1234567` |
+| 3 | 扩展帧通道读同一个 DID | ✅ `LSVZZ0000B7654321`（值不同，证明真打到了另一台） |
+| 4 | 扩展帧上 `22 F1 91` | ✅ `62 F1 91 48 57 30 32` |
+| 5 | 总线侧取证（`candump`） | ✅ `18DA00F1#...` 与 `7E8#...` 同时出现（8 位 = 扩展帧，`CAN_EFF_FLAG` 置对了） |
+| 6 | 两条通道分开记账 | ✅ 见下 |
+
+第 5 步是这次唯一"能推翻结论"的证据：以太网侧读到正确的 VIN，**也可能只是网关自己编的**。
+只有在总线上同时抓到 8 位的 `18DAF100` 和 3 位的 `7E8`，才能说"两种宽度真的都发出去了"。
+
+第 6 步的账可以手算对得上：
+
+```
+TA=0x0002（0x7E0/0x7E8）：转发 1 条，发帧 2，收帧 3
+TA=0x0006（0x18DA00F1/0x18DAF100）：转发 2 条，发帧 3，收帧 4
+转发 3 条，失败 0 条
+```
+
+读 VIN 是**多帧**：1 个首帧（FF）+ 2 个连续帧（CF）= 3 发，ECU 回 FF + CF + CF = 3 收，再加 1 个流控帧就是 3 发 4 收；
+读硬件版本是**单帧**：1 发 1 收。所以扩展帧那条是 3 发 4 收，标准帧那条是 1 次 VIN = 2 发 3 收。**加起来正好是打印的数。**
+
+### M7 里踩的两个小坑
+
+1. `src/IsoTpClient.cpp` 加完 `idForSend` 忘了 `#include "CanId.h"` → 六个 `was not declared in this scope`。
+   头文件分开的代价就是这个，编译器在提醒你"你用了别人的知识，得先声明"。
+2. `m7_e2e.sh` 第一版写了半截死代码（有个 `m7_vin_a.log` 从来没被生成、`echo` 字符串跨行引号错位），
+   整份重写。**验收脚本自己也要验收**——它绿了不代表它对，得看它到底断言了什么。
+
+还有一个"改完才发现"的连带影响：`m6_e2e.sh` 里断言的是老格式 `TA=0x0002 → 7E0 / 7E8`，
+日志改成 `0x7E0` 之后那两项就红了。这不是 bug，是**格式统一后必须同步的断言**——CI 第 10 步替我们抓住了它。
+
+---
+
 ## 里程碑
 
 | | 内容 | 状态 |
@@ -685,26 +824,27 @@ bash tools/m6_e2e.sh 13461       # 七步，双 ECU，端到端
 | M4 | DoIP ↔ ISO-TP 网关桥接 + 多客户端互斥 | ✅ 70 项 |
 | M5 | 第三方客户端对打 + 验收报告 | ✅ 6/6 硬指标 |
 | M6 | 路由表（TA → 收发 ID 对）+ `stub-ecu` + 双 ECU 端到端 | ✅ 32 项 + 9 项端到端 |
+| M7 | 11 位 / 29 位扩展帧并存（`CanId.h` + `CAN_EFF_FLAG` 置位/剥位） | ✅ 57 项 + 9 项端到端 |
 
 ---
 
 ## 持续集成（M0 就接）
 
 ```bash
-bash tools/ci_local.sh          # gcc 腿，开 -Werror，10 步
+bash tools/ci_local.sh          # gcc 腿，开 -Werror，11 步
 bash tools/ci_local.sh clang    # clang 腿
 ```
 
 和 `.github/workflows/ci.yml` 参数一致：配置 → 构建 → ctest → `doip-dump` 冒烟 →
 **实体+客户端走真 UDP 端到端** → **实体+客户端走真 TCP 端到端（激活 + 心跳 + 一条 `22 F1 86` 诊断）** →
-**第三方客户端 5 条硬指标** → **多 ECU 路由（两台 ECU + 路由表）**。
-后三步（真 CAN、第三方对打、多 ECU 路由）**只在本地跑**：GitHub runner 上没有 vcan0、
+**第三方客户端 5 条硬指标** → **多 ECU 路由（两台 ECU + 路由表）** → **扩展帧（标准帧 + 29 位同总线并存）**。
+后四步（真 CAN、第三方对打、多 ECU 路由、扩展帧）**只在本地跑**：GitHub runner 上没有 vcan0、
 也不装 `doipclient`，所以 `ci_local.sh` 里遇到缺环境就打印 `[SKIP]`，不算红。
-本地 10 步全绿时是**通过 23 项，失败 0 项**。
+本地 11 步全绿时是**通过 24 项，失败 0 项**。
 
 ---
 
-## 已知边界（M0 – M6）
+## 已知边界（M0 – M7）
 
 - 载荷类型 0x4001-0x4004（实体状态 / 电源模式）只认得名字，不解析（本项目不做）。
 - 不做 TLS，不做 CAN FD。
@@ -721,7 +861,7 @@ bash tools/ci_local.sh clang    # clang 腿
 - ~~M4 只桥**一个 ECU**（固定 7E0/7E8）~~ → M6 起改为**静态路由表**，`--route TA:TX:RX[:名]` 决定每条通道。
   表在启动时定型，**不支持运行期增删**（真实网关可以从诊断配置里改表，本项目不做）。
 - 路由表只支持 **1 个 TA ↔ 1 对 ID**：一个 TA 不能挂多条并行通道，也不能多个 TA 共用一对 ID（`add()` 直接拒绝）。
-- 不支持 29 位（扩展）CAN ID、不支持 CAN FD（FD 的 SF 能装 62 字节，逻辑不一样）。
+- 不支持 CAN FD（FD 的 SF 能装 62 字节，逻辑不一样）；M7 只做 11 位 / 29 位**经典帧**，两种宽度都只走物理寻址。
 - 不支持功能寻址（`7DF` 一发多收），只做物理寻址。
 - 流控只按 BS 简单处理；STmin 用 `sleep` 实现，没有做高精度定时。
 - 并发策略是"一把锁串行"，没有做优先级或超时抢占。
@@ -735,3 +875,9 @@ bash tools/ci_local.sh clang    # clang 腿
 - M6 的两台 ECU 都是我们自己写的：项目一 `uds-demo`（`7E0/7E8`）+ `stub-ecu`（`7A0/7A8`）。
   没有在真实多节点总线上验过总线负载、也没有验过两个 ECU 同时回多帧的碰撞场景
   （现在的做法是"一把锁串行 + 通道之间排队"，逻辑上不会撞，但没在 1 Mbps、高负载下称过时间）。
+
+- M7 只覆盖 ISO-TP **物理寻址**的两对 ID（`7E0/7E8` 与 `18DA00F1/18DAF100`）；
+  29 位下的功能寻址写法（`18DB33F1` 那类）没做，功能寻址整体留给 M8。
+- `--route` 的 ID 仍按整数给（`18DA00F1`），`formatCanId` 只负责打印，不做入参解析。
+- 一条路由仍只对应一对 ID，**同一个 TA 不能一半 11 位一半 29 位**（表结构没变，M7 只放开宽度上限）。
+- 没有在真实 1 Mbps 总线上量过"标准帧与扩展帧交织时的总线负载/仲裁延迟"，vcan0 不模拟仲裁。

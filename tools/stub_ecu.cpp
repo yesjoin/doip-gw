@@ -18,6 +18,7 @@
 // 用法：
 //   stub-ecu --iface vcan0 --rx 7A0 --tx 7A8 --vin LSVZZ0000B7654321 --hw HW02 --seconds 20
 // ============================================================================
+#include "CanId.h"
 #include "IsoTpStack.h"
 
 #include <linux/can.h>
@@ -72,14 +73,15 @@ void sendFrame (int fd, std::uint32_t id, const std::uint8_t d[8])
 {
     can_frame f;
     std::memset (&f, 0, sizeof (f));
-    f.can_id  = id;
+    // M7：29 位 ID 要置 CAN_EFF_FLAG，标准帧不能带（置了内核会按 29 位处理）
+    f.can_id  = idForSend (id);
     f.can_dlc = 8;
     std::memcpy (f.data, d, 8);
     // 写失败（总线掉了 / fd 关了）这里没法重试，返回负数就算了：
     // 但返回值必须"看"一眼，否则 glibc 的 warn_unused_result 会在 -O2 + -Werror 下直接编译失败
     const ssize_t n = ::write (fd, &f, sizeof (f));
     if (n < 0) {
-        std::fprintf (stderr, "[stub-ecu] CAN 写失败（id=0x%03X）\n", static_cast<unsigned> (id));
+        std::fprintf (stderr, "[stub-ecu] CAN 写失败（%s）\n", formatCanId (id).c_str ());
     }
 }
 
@@ -107,7 +109,7 @@ bool sendUds (int fd, std::uint32_t txId, std::uint32_t rxId,
         can_frame f;
         std::memset (&f, 0, sizeof (f));
         if (::read (fd, &f, sizeof (f)) < static_cast<ssize_t> (sizeof (f))) continue;
-        if ((f.can_id & CAN_EFF_MASK) != rxId) continue;      // 不是给我的，丢掉
+        if (idFromRecv (f.can_id) != rxId) continue;      // 不是给我的，丢掉（先剥标志位再比）
         std::uint8_t d[8];
         std::memcpy (d, f.data, 8);
         if (kindOf (d) != FrameKind::FlowControl) continue;
@@ -210,8 +212,8 @@ int main (int argc, char **argv)
         return 1;
     }
 
-    std::printf ("极简 ECU：%s 上收 %03X / 发 %03X，VIN=%s，HW=%s，跑 %d 秒\n",
-                 iface.c_str (), static_cast<unsigned> (rx), static_cast<unsigned> (tx),
+    std::printf ("极简 ECU：%s 上收 %s / 发 %s，VIN=%s，HW=%s，跑 %d 秒\n",
+                 iface.c_str (), formatCanId (rx).c_str (), formatCanId (tx).c_str (),
                  vin.c_str (), hw.c_str (), seconds);
 
     IsoTpAssembler asm_ (4095);
@@ -227,7 +229,7 @@ int main (int argc, char **argv)
         can_frame f;
         std::memset (&f, 0, sizeof (f));
         if (::read (fd, &f, sizeof (f)) < static_cast<ssize_t> (sizeof (f))) continue;
-        if ((f.can_id & CAN_EFF_MASK) != rx) continue;        // 不是给我的
+        if (idFromRecv (f.can_id) != rx) continue;        // 不是给我的（先剥标志位再比）
         if (f.can_dlc == 0 || f.can_dlc > 8) continue;
 
         std::uint8_t d[8];

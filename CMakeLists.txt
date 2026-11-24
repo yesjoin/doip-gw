@@ -41,7 +41,9 @@ add_library(doip-isotp STATIC src/IsoTpStack.cpp src/IsoTpClient.cpp src/DoIpGat
 target_link_libraries(doip-isotp PUBLIC doip-diag Threads::Threads)
 
 # ---- M6：路由表（TA → CAN 收发 ID），纯逻辑 ----
-add_library(doip-route STATIC src/RouteTable.cpp)
+# M7 起把 CanId 也挂在这里：宽度判断（11 位 / 29 位 + CAN_EFF_FLAG）是纯计算，
+# 塞进 doip-route 而不是 doip-isotp，是因为自测不需要 socket 就能把它测完
+add_library(doip-route STATIC src/RouteTable.cpp src/CanId.cpp)
 target_include_directories(doip-route PUBLIC include)
 target_link_libraries(doip-isotp PUBLIC doip-route)
 

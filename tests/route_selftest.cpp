@@ -1,9 +1,10 @@
 // ============================================================================
-// route_selftest.cpp —— M6 自测（纯逻辑，不需要 vcan0）
+// route_selftest.cpp —— M6 + M7 自测（纯逻辑，不需要 vcan0）
 //
-// 两段：
+// 三段：
 //   A 路由表：什么能进表、什么必须拒绝、查得到/查不到
 //   B 通道语义：目标地址什么时候算"可达"，以及几个判据的先后关系
+//   C ID 宽度：11 位 / 29 位的判断、发帧置位 / 收帧剥位、超范围配置必须拒
 //
 // B 段为什么放在这个文件：M6 把"TA 是不是我"从"只有实体自己"改成了"查路由表"。
 // 这条规则属于**通道判定**，不是网关内部实现——所以要用通道的接口来验，
@@ -88,6 +89,58 @@ int main ()
     check (t2.lookup (0x0010) && t2.lookup (0x0010)->txId == 0x18DA10F1, "29 位 ID 原样保存");
 
     // =======================================================================
+    std::printf ("\n=== C ID 宽度：11 位 / 29 位 / 发帧标志位（M7）===\n");
+
+    // C1：宽度判定 —— 0x7FF 是 11 位的顶，0x800 只能靠 29 位帧发出去
+    check (!isExtendedId (0x7E0), "0x7E0 是标准帧（11 位）");
+    check (!isExtendedId (0x7FF), "0x7FF 还是标准帧 —— 边界值不能判错");
+    check (isExtendedId (0x800), "0x800 已经必须用扩展帧");
+    check (isExtendedId (0x18DAF100), "0x18DAF100 是扩展帧");
+    check (isExtendedId (kCanIdMax), "0x1FFFFFFF（29 位上限）也算扩展帧");
+
+    // C2：合法性 —— 0 不合法，超过 29 位不合法
+    check (!isValidCanId (0), "ID = 0 不合法");
+    check (isValidCanId (1), "ID = 1 合法");
+    check (isValidCanId (kCanIdMax), "0x1FFFFFFF 合法（正好是上限）");
+    check (!isValidCanId (0x20000000), "0x20000000 超过 29 位 → 不合法");
+
+    // C3：发帧要置位、收帧要剥位。这是 SocketCAN 最经典的一对反向操作。
+    check (idForSend (0x7E0) == 0x7E0, "标准帧：发的时候原样，不带任何标志位");
+    check (idForSend (0x18DA00F1) == (0x18DA00F1u | kCanEffFlag),
+           "扩展帧：发的时候必须置 CAN_EFF_FLAG（否则内核回 EINVAL，帧发不出去）");
+    check (idFromRecv (kCanEffFlag | 0x18DAF100) == 0x18DAF100,
+           "收帧：先把 CAN_EFF_FLAG 剥掉再比，否则和 0x18DAF100 永远不相等");
+    check (idFromRecv (0x40000000u | 0x7E8) == 0x7E8,
+           "收帧：RTR 等高位标志也一起剥掉（不能把远程帧当成一个真 ID）");
+
+    // C4：日志里宽度要看得出（3 位 vs 8 位）
+    check (formatCanId (0x7E0) == "0x7E0", "标准 ID 打成 3 位：0x7E0");
+    check (formatCanId (0x18DAF100) == "0x18DAF100", "扩展 ID 打成 8 位：0x18DAF100");
+
+    // C5：超范围配置必须在加表时就被拒，而且错因要说"超 29 位"，不是笼统的"写错了"
+    {
+        RouteTable t5;
+        check (!t5.add (mk (0x0020, 0x20000000, 0x20000001, "x"), err),
+               "ID 超过 29 位 → 加表时直接拒绝");
+        check (err.find ("29") != std::string::npos, "错误信息点名 29 位上限（不然人会去查总线）");
+        check (t5.size () == 0, "被拒之后表还是空的");
+
+        check (t5.add (mk (0x0021, kCanIdMax, kCanIdMax - 1, "EDGE"), err),
+               "0x1FFFFFFF 作为边界值能进表");
+        check (t5.lookup (0x0021) && t5.lookup (0x0021)->txId == kCanIdMax, "边界值原样保存");
+    }
+
+    // C6：一张表里混着 11 位和 29 位两条 ECU —— 这是 M7 要支持的常态
+    {
+        RouteTable t6;
+        check (t6.add (mk (0x0002, 0x7E0, 0x7E8, "ECU_A"), err), "混表：标准帧那条能加");
+        check (t6.add (mk (0x0003, 0x18DA00F1, 0x18DAF100, "ECU_B29"), err), "混表：扩展帧那条也能加");
+        check (t6.size () == 2, "混表里两条并存");
+        check (!isExtendedId (t6.lookup (0x0002)->txId), "混表：第一条确实是 11 位");
+        check (isExtendedId (t6.lookup (0x0003)->txId), "混表：第二条确实是 29 位");
+    }
+
+    // =======================================================================
     std::printf ("\n=== B 通道语义：谁会被告知\"目标地址未知\" ===\n");
 
     const std::uint16_t SA = 0x0E00, ENTITY = 0x0001;
@@ -161,6 +214,6 @@ int main ()
     std::printf ("\n--------------------------------\n");
     std::printf ("通过 %d 项，失败 %d 项\n", g_pass, g_fail);
     if (g_fail == 0)
-        std::printf ("M6 全绿 —— 地址不认识就拒绝，绝不猜一台 ECU。\n");
+        std::printf ("M6+M7 全绿 —— 地址不认识就拒绝，ID 宽度也不许猜。\n");
     return g_fail == 0 ? 0 : 1;
 }

@@ -8,6 +8,7 @@
 //   响应 →  SF 收下  /  FF 先回流控帧 再逐张收 CF
 // ============================================================================
 #include "IsoTpClient.h"
+#include "CanId.h"
 
 #if defined (__linux__)
 #    define HAVE_SOCKETCAN 1
@@ -44,6 +45,14 @@ bool IsoTpClient::open (std::string &err)
 {
 #if HAVE_SOCKETCAN
     close ();
+
+    // M7：先把 ID 合法性和宽度查清，别等发帧时让内核回一句 EINVAL
+    if (!isValidCanId (cfg_.txId) || !isValidCanId (cfg_.rxId))
+    {
+        err = "CAN ID 不合法（" + formatCanId (cfg_.txId) + " / " + formatCanId (cfg_.rxId) +
+              "），29 位上限 0x1FFFFFFF";
+        return false;
+    }
 
     fd_ = ::socket (PF_CAN, SOCK_RAW, CAN_RAW);
     if (fd_ < 0)
@@ -100,12 +109,16 @@ bool IsoTpClient::sendFrame (const std::uint8_t data[8], std::string &err)
 #if HAVE_SOCKETCAN
     can_frame f;
     std::memset (&f, 0, sizeof (f));
-    f.can_id  = cfg_.txId;
+    // ★ M7：29 位 ID 必须置 CAN_EFF_FLAG，否则内核回 EINVAL，帧根本发不出去。
+    //   现场表现为"启动正常、每条请求都超时"，而 candump 上一条帧都没有。
+    //   标准帧则不能带这个位（内核会认为你在用 29 位帧发一个 11 位的 ID）。
+    f.can_id  = idForSend (cfg_.txId);
     f.can_dlc = 8;
     std::memcpy (f.data, data, 8);
     if (::write (fd_, &f, sizeof (f)) != static_cast<ssize_t> (sizeof (f)))
     {
-        err = "写 CAN 帧失败";
+        err = "写 CAN 帧失败（" + formatCanId (cfg_.txId) +
+              (isExtendedId (cfg_.txId) ? "，扩展帧" : "，标准帧") + "）";
         return false;
     }
     ++st_.framesSent;
@@ -137,8 +150,10 @@ bool IsoTpClient::recvFrame (std::uint8_t data[8], std::uint8_t &dlc, int timeou
         const ssize_t n = ::read (fd_, &f, sizeof (f));
         if (n < static_cast<ssize_t> (sizeof (f))) continue;
 
-        // 只看 "ECU → tester" 这个 ID 的帧；总线是共享介质，别把别人的帧当自己的
-        const std::uint32_t id = f.can_id & CAN_EFF_MASK;
+        // 只看 "ECU → tester" 这个 ID 的帧；总线是共享介质，别把别人的帧当自己的。
+        // 注意用 idFromRecv 剥掉标志位：内核回的 can_id 对扩展帧带着 CAN_EFF_FLAG，
+        // 直接拿它和 0x18DAF100 比会永远不相等（少一步掩码，现象就是"全超时"）。
+        const std::uint32_t id = idFromRecv (f.can_id);
         if (id != cfg_.rxId) continue;
 
         // ★ DLC 不一定是 8。项目一的 ECU 单帧就不补零（7E8#027E00 只有 3 字节），

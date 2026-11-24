@@ -140,8 +140,9 @@ int main (int argc, char **argv)
     std::printf ("路由表（%zu 条）：\n", table.size ());
     for (const auto &e : table.entries ())
     {
-        std::printf ("  TA=0x%04X → %03X / %03X  %s\n", static_cast<unsigned> (e.logicalAddress),
-                     static_cast<unsigned> (e.txId), static_cast<unsigned> (e.rxId),
+        // 宽度要在日志里看得出来：7E0 打成 0x7E0，18DAF100 打成 0x18DAF100
+        std::printf ("  TA=0x%04X → %s / %s  %s\n", static_cast<unsigned> (e.logicalAddress),
+                     formatCanId (e.txId).c_str (), formatCanId (e.rxId).c_str (),
                      e.name.empty () ? "" : e.name.c_str ());
     }
 
@@ -187,10 +188,11 @@ int main (int argc, char **argv)
                  gw.handled (), gw.failed (), gw.unknownTargets (), gw.maxWaitMs ());
     for (const auto &cs : gw.channelStats ())
     {
-        std::printf ("  TA=0x%04X（%03X/%03X）：转发 %zu 条，失败 %zu 条，发帧 %llu，收帧 %llu，"
+        std::printf ("  TA=0x%04X（%s/%s）：转发 %zu 条，失败 %zu 条，发帧 %llu，收帧 %llu，"
                      "超时 %llu，序号错 %llu，迟到帧丢弃 %llu\n",
-                     static_cast<unsigned> (cs.ta), static_cast<unsigned> (cs.txId),
-                     static_cast<unsigned> (cs.rxId), cs.handled, cs.failed,
+                     static_cast<unsigned> (cs.ta),
+                     formatCanId (cs.txId).c_str (), formatCanId (cs.rxId).c_str (),
+                     cs.handled, cs.failed,
                      static_cast<unsigned long long> (cs.stats.framesSent),
                      static_cast<unsigned long long> (cs.stats.framesRecv),
                      static_cast<unsigned long long> (cs.stats.timeouts),

@@ -20,7 +20,7 @@ step() { printf '\n=== %s ===\n' "$1"; }
 LOG=$(mktemp -d)
 trap 'rm -rf "$LOG"' EXIT
 
-step "1/10 编译器"
+step "1/11 编译器"
 if [ "$CC_NAME" = clang ]; then
     export CC=clang CXX=clang++
     WERROR=0
@@ -35,7 +35,7 @@ if ! command -v "$CXX" > /dev/null 2>&1; then
 fi
 $CXX --version | head -1 | sed 's/^/      /'
 
-step "2/10 配置（干净目录，等价于 CI 全新克隆）"
+step "2/11 配置（干净目录，等价于 CI 全新克隆）"
 rm -rf "$BUILD"
 EXTRA=""
 [ "$WERROR" -eq 1 ] && EXTRA="-DDOIP_WERROR=ON"
@@ -49,7 +49,7 @@ else
     tail -n 15 "$LOG/cfg.log" | sed 's/^/      /'
 fi
 
-step "3/10 构建 -Wall -Wextra -Wpedantic $([ "$WERROR" -eq 1 ] && echo '+ -Werror')"
+step "3/11 构建 -Wall -Wextra -Wpedantic $([ "$WERROR" -eq 1 ] && echo '+ -Werror')"
 if cmake --build "$BUILD" -j"$(nproc)" > "$LOG/build.log" 2>&1; then
     ok "构建成功"
 else
@@ -59,7 +59,7 @@ fi
 W=$(grep -c "warning:" "$LOG/build.log" 2>/dev/null) || W=0
 [ "$W" -eq 0 ] && ok "零编译警告" || echo "[WARN] 有 $W 条编译警告"
 
-step "4/10 自测（ctest）"
+step "4/11 自测（ctest）"
 if (cd "$BUILD" && ctest --output-on-failure > "$LOG/ctest.log" 2>&1); then
     ok "ctest 全绿"
 else
@@ -69,13 +69,13 @@ fi
 echo "      用例明细："
 grep -E "^ *[0-9]+/[0-9]+ Test" "$LOG/ctest.log" | sed 's/^/      /' || true
 
-step "5/10 工具冒烟：十六进制 → 人话"
+step "5/11 工具冒烟：十六进制 → 人话"
 OUT=$("$BUILD/doip-dump" "02 FD 80 01 00 00 00 07 0E 00 00 01 22 F1 90" 2>&1)
 echo "$OUT" | grep -q "0x8001"               && ok "doip-dump 认出 0x8001"          || bad "doip-dump 没认出 0x8001"
 echo "$OUT" | grep -q "ReadDataByIdentifier" && ok "doip-dump 认出 0x22 读 DID 服务" || bad "doip-dump 没认出 0x22"
 echo "$OUT" | grep -q "0x0E00"               && ok "doip-dump 认出源地址 0x0E00"     || bad "doip-dump 没认出源地址"
 
-step "6/10 端到端：实体 + 客户端走真 UDP（loopback，端口 13455）"
+step "6/11 端到端：实体 + 客户端走真 UDP（loopback，端口 13455）"
 "$BUILD/doip-discover" --serve --port 13455 --seconds 3 > "$LOG/serve.log" 2>&1 &
 SRV=$!
 sleep 0.4
@@ -91,7 +91,7 @@ grep -q "回了 1 个应答" "$LOG/serve.log"          && ok "实体侧日志确
 echo "      --- 客户端看到 ---"
 head -4 "$LOG/client.log" | sed 's/^/      /'
 
-step "7/10 端到端：实体 + 客户端走真 TCP（loopback，端口 13456）"
+step "7/11 端到端：实体 + 客户端走真 TCP（loopback，端口 13456）"
 # 心跳周期调到 5000ms：这条用例要的是"能激活、心跳能一问一答"，
 # 不让服务器主动发心跳来抢戏（那条逻辑由 routing-selftest 用 150ms 单独测）。
 "$BUILD/doip-serve" --port 13456 --seconds 4 --idle-ms 5000 > "$LOG/tcpserve.log" 2>&1 &
@@ -112,7 +112,7 @@ grep -q "成功激活 1 次"    "$LOG/tcpserve.log"  && ok "实体侧确认激�
 echo "      --- 客户端看到 ---"
 head -8 "$LOG/tcpclient.log" | sed 's/^/      /'
 
-step "8/10 端到端：真 CAN（vcan0 + 项目一的 ECU）"
+step "8/11 端到端：真 CAN（vcan0 + 项目一的 ECU）"
 # 这一步需要真总线 + 项目一的 uds-demo。CI 的 GitHub runner 上没有，
 # 所以只在装了 CAN 的机器上跑；缺东西就 SKIP，不算红。
 if [ -d /sys/class/net/vcan0 ] && [ -x "$HOME/uds-ecu/build/uds-demo" ]; then
@@ -148,7 +148,7 @@ else
     echo "[SKIP] 没有 vcan0 或没有 ~/uds-ecu/build/uds-demo，跳过真 CAN 这一步"
 fi
 
-step "9/10 第三方客户端对打（python doipclient，5 条验收硬指标）"
+step "9/11 第三方客户端对打（python doipclient，5 条验收硬指标）"
 # 为什么单独拎一步：前面所有测试都是"自己写的东西测自己写的东西"，
 # 这一步换成别人按标准写的客户端，能过才说明符合标准。
 # doipclient 是 pip 包，GitHub runner 上没装 → SKIP，不算红。
@@ -164,7 +164,7 @@ else
     echo "[SKIP] 没装第三方客户端（pip3 install --user doipclient）"
 fi
 
-step "10/10 多 ECU 路由（vcan0 + 两台 ECU + 路由表）"
+step "10/11 多 ECU 路由（vcan0 + 两台 ECU + 路由表）"
 # 这一步要两台 ECU：项目一的 uds-demo（7E0/7E8）+ 本仓库的 stub-ecu（7A0/7A8）。
 # 缺任何一样就 SKIP。
 if [ -d /sys/class/net/vcan0 ] && [ -x "$HOME/uds-ecu/build/uds-demo" ] && [ -x "$BUILD/stub-ecu" ] \
@@ -178,6 +178,20 @@ if [ -d /sys/class/net/vcan0 ] && [ -x "$HOME/uds-ecu/build/uds-demo" ] && [ -x 
     grep -E "^(通过|转发|  TA=)" "$LOG/m6.log" | sed 's/^/      /' || true
 else
     echo "[SKIP] 缺 vcan0 / uds-demo / stub-ecu / doipclient，跳过路由验收"
+fi
+
+step "11/11 扩展帧（29 位 ID，一条总线上标准帧 + 扩展帧并存）"
+if [ -d /sys/class/net/vcan0 ] && [ -x "$HOME/uds-ecu/build/uds-demo" ] && [ -x "$BUILD/stub-ecu" ] \
+   && command -v candump >/dev/null 2>&1 && python3 -c 'import doipclient' >/dev/null 2>&1; then
+    if bash "$(dirname "$0")/m7_e2e.sh" 13463 > "$LOG/m7.log" 2>&1; then
+        ok "扩展帧：同一张路由表里 11 位 / 29 位都能走"
+    else
+        bad "扩展帧端到端失败"
+        tail -n 25 "$LOG/m7.log" | sed 's/^/      /'
+    fi
+    grep -E "^通过 " "$LOG/m7.log" | sed 's/^/      /' || true
+else
+    echo "[SKIP] 缺 vcan0 / uds-demo / stub-ecu / candump / doipclient，跳过扩展帧验收"
 fi
 
 echo

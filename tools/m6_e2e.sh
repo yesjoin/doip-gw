@@ -62,8 +62,8 @@ sleep 1.5
 echo
 echo "=== 1/7 路由表长得什么样 ==="
 grep -A3 '路由表' /tmp/m6_gw.log | sed 's/^/      /'
-grep -q 'TA=0x0002 → 7E0 / 7E8' /tmp/m6_gw.log && ok "表里有 TA=2 → 7E0/7E8" || bad "路由表里没有 TA=2"
-grep -q 'TA=0x0003 → 7A0 / 7A8' /tmp/m6_gw.log && ok "表里有 TA=3 → 7A0/7A8" || bad "路由表里没有 TA=3"
+grep -q 'TA=0x0002 → 0x7E0 / 0x7E8' /tmp/m6_gw.log && ok "表里有 TA=2 → 0x7E0/0x7E8" || bad "路由表里没有 TA=2"
+grep -q 'TA=0x0003 → 0x7A0 / 0x7A8' /tmp/m6_gw.log && ok "表里有 TA=3 → 0x7A0/0x7A8" || bad "路由表里没有 TA=3"
 
 echo
 echo "=== 2/7 TA=0x0002 → 项目一的 ECU（读 VIN）==="

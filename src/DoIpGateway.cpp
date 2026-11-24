@@ -9,6 +9,16 @@
 namespace doip
 {
 
+namespace
+{
+std::string hexTa (std::uint16_t v)
+{
+    char b[8];
+    std::snprintf (b, sizeof (b), "0x%04X", static_cast<unsigned> (v));
+    return std::string (b);
+}
+} // namespace
+
 DiagnosticGateway::DiagnosticGateway (const std::string &iface,
                                      const RouteTable &table,
                                      const IsoTpTiming &tim)
@@ -29,13 +39,10 @@ bool DiagnosticGateway::start (std::string &err)
         if (!ch->client.open (e2))
         {
             // 哪一条开不起来就说清是哪一条：多通道配置错的时候，"有一个失败"没法排查
-            char buf[160];
-            std::snprintf (buf, sizeof (buf), "路由 %s（TA=0x%04X，%03X/%03X）开不起来：%s",
-                           e.name.empty () ? "?" : e.name.c_str (),
-                           static_cast<unsigned> (e.logicalAddress),
-                           static_cast<unsigned> (e.txId),
-                           static_cast<unsigned> (e.rxId), e2.c_str ());
-            err = buf;
+            err = "路由 " + (e.name.empty () ? std::string ("?") : e.name) +
+                  "（TA=" + hexTa (e.logicalAddress) + "，" +
+                  formatCanId (e.txId) + "/" + formatCanId (e.rxId) +
+                  "）开不起来：" + e2;
             return false;
         }
         chans_[e.logicalAddress] = std::move (ch);
