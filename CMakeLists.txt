@@ -40,6 +40,11 @@ target_link_libraries(doip-tcp PUBLIC doip-diag)
 add_library(doip-isotp STATIC src/IsoTpStack.cpp src/IsoTpClient.cpp src/DoIpGateway.cpp)
 target_link_libraries(doip-isotp PUBLIC doip-diag Threads::Threads)
 
+# ---- M6：路由表（TA → CAN 收发 ID），纯逻辑 ----
+add_library(doip-route STATIC src/RouteTable.cpp)
+target_include_directories(doip-route PUBLIC include)
+target_link_libraries(doip-isotp PUBLIC doip-route)
+
 # ---- M0 自测 ----
 add_executable(codec-selftest tests/codec_selftest.cpp)
 target_link_libraries(codec-selftest PRIVATE doip-codec)
@@ -60,6 +65,10 @@ target_link_libraries(diagnostic-selftest PRIVATE doip-tcp Threads::Threads)
 add_executable(isotp-selftest tests/isotp_selftest.cpp)
 target_link_libraries(isotp-selftest PRIVATE doip-isotp Threads::Threads)
 
+# ---- M6 自测（路由表 + "目标地址不认识就拒" 的通道语义，纯逻辑）----
+add_executable(route-selftest tests/route_selftest.cpp)
+target_link_libraries(route-selftest PRIVATE doip-route doip-diag doip-codec)
+
 # ---- 工具 ----
 add_executable(doip-dump tools/doip_dump.cpp)
 target_link_libraries(doip-dump PRIVATE doip-codec)
@@ -75,7 +84,12 @@ target_link_libraries(doip-client PRIVATE doip-routing doip-diag Threads::Thread
 
 add_executable(doip-gateway tools/doip_gateway.cpp)
 # doip-discovery：M5 起网关也要回答 UDP 车辆发现（真实实体发现和激活是同一个端口号）
-target_link_libraries(doip-gateway PRIVATE doip-tcp doip-isotp doip-discovery Threads::Threads)
+# doip-route：M6 的路由表（经 doip-isotp 传递进来）
+target_link_libraries(doip-gateway PRIVATE doip-tcp doip-isotp doip-discovery doip-route Threads::Threads)
+
+# ---- M6：第二台 ECU（真 SocketCAN 节点，用来验证路由打到不同地址）----
+add_executable(stub-ecu tools/stub_ecu.cpp)
+target_link_libraries(stub-ecu PRIVATE doip-isotp Threads::Threads)
 
 # ---------------------------------------------------------------------------
 # 测试注册：ctest 一条命令跑全部
@@ -86,4 +100,5 @@ add_test(NAME doip-discovery COMMAND discovery-selftest)
 add_test(NAME doip-routing   COMMAND routing-selftest)
 add_test(NAME doip-diagnostic COMMAND diagnostic-selftest)
 add_test(NAME doip-isotp     COMMAND isotp-selftest)
-set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic doip-isotp PROPERTIES LABELS unit)
+add_test(NAME doip-route     COMMAND route-selftest)
+set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic doip-isotp doip-route PROPERTIES LABELS unit)

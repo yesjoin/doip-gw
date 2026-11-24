@@ -40,7 +40,7 @@ std::string hex4 (std::uint16_t v)
 
 DoIpTcpServer::DoIpTcpServer (const TcpServerConfig &cfg)
     : cfg_ (cfg),
-      diag_ (DiagnosticPolicy{cfg.entityAddress, cfg.maxUds}),
+      diag_ (DiagnosticPolicy{cfg.entityAddress, cfg.maxUds, cfg.targetKnown}),
       port_ (cfg.port)
 {
 }
@@ -295,8 +295,11 @@ bool DoIpTcpServer::handleConn (Conn &c)
             {
                 ++diagNacks_;
                 DiagnosticNegativeAck na;
-                na.sourceAddress = cfg_.entityAddress;     // 回执里的源是我
-                na.targetAddress = o.targetAddress;        // 目标写请求里的目标（可能不是我）
+                // M6 修正：回执的源地址写**请求里的 TA**，不是实体自己。
+                // M5 时两者都是 0x0001，看不出差别；一给两台 ECU 分地址，
+                // 第三方客户端立刻拒收 ACK（它按"我发的目标地址"匹配应答源）。
+                na.sourceAddress = o.targetAddress;
+                na.targetAddress = o.sourceAddress;        // 目标写请求里的源（发起者）
                 na.nackCode      = o.code;
                 sendBytes (c.fd, build (PayloadType::DiagnosticNegativeAck, encodePayload (na)));
                 log ("0x8001 拒绝：0x8003 " + std::string (nameOf (static_cast<DiagNack> (o.code))) +
@@ -314,7 +317,8 @@ bool DoIpTcpServer::handleConn (Conn &c)
             // ---- 受理：先回 0x8002，再去算业务 ----
             ++diagAcks_;
             DiagnosticPositiveAck pa;
-            pa.sourceAddress = cfg_.entityAddress;
+            // 同一条规则：应答源 = 请求目标。这条 ACK 是"代那台 ECU 回的"。
+            pa.sourceAddress = o.targetAddress;
             pa.targetAddress = o.sourceAddress;
             pa.ackCode       = 0x00;                      // 唯一值：ACK
             sendBytes (c.fd, build (PayloadType::DiagnosticPositiveAck, encodePayload (pa)));
@@ -338,7 +342,7 @@ bool DoIpTcpServer::handleConn (Conn &c)
             {
                 ++diagNacks_;
                 DiagnosticNegativeAck na;
-                na.sourceAddress = cfg_.entityAddress;
+                na.sourceAddress = o.targetAddress;
                 na.targetAddress = o.sourceAddress;
                 na.nackCode      = static_cast<std::uint8_t> (DiagNack::TransportProtocolError);
                 sendBytes (c.fd, build (PayloadType::DiagnosticNegativeAck, encodePayload (na)));
@@ -347,7 +351,7 @@ bool DoIpTcpServer::handleConn (Conn &c)
             }
 
             DiagnosticMessage back;
-            back.sourceAddress = cfg_.entityAddress;
+            back.sourceAddress = o.targetAddress;      // 响应来自请求的目标（那台 ECU）
             back.targetAddress = o.sourceAddress;
             back.uds           = resp;
             sendBytes (c.fd, build (PayloadType::DiagnosticMessage, encodePayload (back)));

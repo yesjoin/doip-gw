@@ -1,0 +1,166 @@
+// ============================================================================
+// route_selftest.cpp —— M6 自测（纯逻辑，不需要 vcan0）
+//
+// 两段：
+//   A 路由表：什么能进表、什么必须拒绝、查得到/查不到
+//   B 通道语义：目标地址什么时候算"可达"，以及几个判据的先后关系
+//
+// B 段为什么放在这个文件：M6 把"TA 是不是我"从"只有实体自己"改成了"查路由表"。
+// 这条规则属于**通道判定**，不是网关内部实现——所以要用通道的接口来验，
+// 而不是只测网关（网关那层碰 socket，测起来慢）。
+// ============================================================================
+#include "DoIpDiagnostic.h"
+#include "RouteTable.h"
+
+#include <cstdio>
+#include <string>
+#include <vector>
+
+using namespace doip;
+
+static int g_pass = 0;
+static int g_fail = 0;
+
+static void check (bool cond, const std::string &what)
+{
+    if (cond) { std::printf ("[PASS] %s\n", what.c_str ()); ++g_pass; }
+    else      { std::printf ("[FAIL] %s\n", what.c_str ()); ++g_fail; }
+}
+
+static RouteEntry mk (std::uint16_t ta, std::uint32_t tx, std::uint32_t rx, const std::string &n)
+{
+    RouteEntry e;
+    e.logicalAddress = ta;
+    e.txId = tx;
+    e.rxId = rx;
+    e.name = n;
+    return e;
+}
+
+// 组一条 0x8001 的载荷：SA(2) + TA(2) + UDS
+static std::vector<std::uint8_t> payload (std::uint16_t sa, std::uint16_t ta,
+                                          const std::vector<std::uint8_t> &uds)
+{
+    std::vector<std::uint8_t> p = {
+        static_cast<std::uint8_t> (sa >> 8), static_cast<std::uint8_t> (sa & 0xFF),
+        static_cast<std::uint8_t> (ta >> 8), static_cast<std::uint8_t> (ta & 0xFF)};
+    p.insert (p.end (), uds.begin (), uds.end ());
+    return p;
+}
+
+int main ()
+{
+    // =======================================================================
+    std::printf ("=== A 路由表：能进表的和不能进表的 ===\n");
+
+    RouteTable t;
+    std::string err;
+
+    check (t.size () == 0, "空表 size = 0");
+    check (t.lookup (0x0001) == nullptr, "空表查任何地址都是 nullptr");
+
+    check (t.add (mk (0x0002, 0x7E0, 0x7E8, "ECU_A"), err), "合法路由能加进去（TA=2 / 7E0 / 7E8）");
+    check (t.size () == 1, "加一条后 size = 1");
+
+    const RouteEntry *e = t.lookup (0x0002);
+    check (e != nullptr, "查得到刚加的那条");
+    check (e && e->txId == 0x7E0 && e->rxId == 0x7E8, "查出来的 TX/RX 是对的");
+    check (e && e->name == "ECU_A", "名字也带出来了（日志要用）");
+
+    check (t.add (mk (0x0003, 0x7A0, 0x7A8, "ECU_B"), err), "第二条也能加（TA=3 / 7A0 / 7A8）");
+    check (t.size () == 2, "两条路由");
+    check (t.known (0x0003), "known(3) = true");
+    check (!t.known (0x0004), "known(4) = false（没注册过）");
+    check (t.lookup (0x0004) == nullptr, "查 0x0004 得到 nullptr —— 这正是要回 0x8003 0x03 的信号");
+
+    // ---- 拒绝：每一条都是"配置写错"，必须在加表时失败 ----
+    check (!t.add (mk (0x0002, 0x700, 0x708, "x"), err), "重复的目标地址 → 拒绝");
+    check (!t.add (mk (0x0000, 0x700, 0x708, "x"), err), "目标地址 0x0000 → 拒绝（标准保留值）");
+    check (!t.add (mk (0x0005, 0x000, 0x708, "x"), err), "请求 ID = 0 → 拒绝");
+    check (!t.add (mk (0x0005, 0x700, 0x000, "x"), err), "响应 ID = 0 → 拒绝");
+    check (!t.add (mk (0x0005, 0x700, 0x700, "x"), err), "请求/响应 ID 相同 → 拒绝（回环会认错自己的帧）");
+    check (!t.add (mk (0x0005, 0x7E0, 0x7E8, "x"), err), "同一对 CAN ID 被两条路由占 → 拒绝");
+    check (t.size () == 2, "被拒之后表里还是 2 条（没有半成品）");
+
+    // 29 位 ID 也走 table（按数值比），这里只确认不会被"截断"成 11 位
+    RouteTable t2;
+    check (t2.add (mk (0x0010, 0x18DA10F1, 0x18DAF110, "ECU29"), err), "29 位 ID 也能进表");
+    check (t2.lookup (0x0010) && t2.lookup (0x0010)->txId == 0x18DA10F1, "29 位 ID 原样保存");
+
+    // =======================================================================
+    std::printf ("\n=== B 通道语义：谁会被告知\"目标地址未知\" ===\n");
+
+    const std::uint16_t SA = 0x0E00, ENTITY = 0x0001;
+    const std::vector<std::uint8_t> uds = {0x22, 0xF1, 0x90};
+
+    // B1：没配 targetKnown —— 退回 M3 的老语义：只认实体自己的地址
+    {
+        DiagnosticChannel ch{DiagnosticPolicy{ENTITY, 512, nullptr}};
+        auto o1 = ch.handle (payload (SA, ENTITY, uds), true, SA);
+        check (o1.action == DiagAction::AckAndForward, "老语义：TA=实体地址 → 受理");
+
+        auto o2 = ch.handle (payload (SA, 0x0002, uds), true, SA);
+        check (o2.action == DiagAction::Nack &&
+               o2.code == static_cast<std::uint8_t> (DiagNack::UnknownTargetAddress),
+               "老语义：TA=别的地址 → 0x8003 0x03");
+    }
+
+    // B2：配了 targetKnown（模拟网关查路由表）
+    {
+        RouteTable t3;
+        t3.add (mk (0x0002, 0x7E0, 0x7E8, "ECU_A"), err);
+        t3.add (mk (0x0003, 0x7A0, 0x7A8, "ECU_B"), err);
+
+        const auto known = [&t3] (std::uint16_t ta) { return t3.known (ta); };
+        DiagnosticChannel ch{DiagnosticPolicy{ENTITY, 512, known}};
+
+        auto a = ch.handle (payload (SA, 0x0002, uds), true, SA);
+        check (a.action == DiagAction::AckAndForward, "TA=0x0002（表里有）→ 受理，交给下游");
+        check (a.targetAddress == 0x0002 && a.uds == uds, "受理时把 TA 和 UDS 原样带下去（网关靠 TA 选通道）");
+
+        auto b = ch.handle (payload (SA, 0x0003, uds), true, SA);
+        check (b.action == DiagAction::AckAndForward, "TA=0x0003（表里有）→ 受理");
+
+        auto c = ch.handle (payload (SA, 0x0004, uds), true, SA);
+        check (c.action == DiagAction::Nack &&
+               c.code == static_cast<std::uint8_t> (DiagNack::UnknownTargetAddress),
+               "TA=0x0004（表里没有）→ 0x8003 0x03");
+
+        // 实体自己的地址此时**不在表里**：网关不提供 UDS 服务，照 0x03 拒
+        auto d = ch.handle (payload (SA, ENTITY, uds), true, SA);
+        check (d.action == DiagAction::Nack &&
+               d.code == static_cast<std::uint8_t> (DiagNack::UnknownTargetAddress),
+               "实体自身地址不在表里 → 也是 0x03（网关没有自己的 UDS 服务，不假装有）");
+    }
+
+    // B3：判据顺序 —— 顺序错了码就错了，客户端会照着错码去排查
+    {
+        RouteTable t4;
+        t4.add (mk (0x0002, 0x7E0, 0x7E8, "ECU_A"), err);
+        const auto known = [&t4] (std::uint16_t ta) { return t4.known (ta); };
+        DiagnosticChannel ch{DiagnosticPolicy{ENTITY, 512, known}};
+
+        auto u = ch.handle (payload (SA, 0x0004, uds), false, SA);   // 没激活 + 未知地址
+        check (u.code == static_cast<std::uint8_t> (DiagNack::InvalidSourceAddress),
+               "没激活 + 未知地址 → 先报 0x02（没激活是更前置的问题）");
+
+        auto s = ch.handle (payload (0x0E01, 0x0004, uds), true, SA); // 冒用 SA + 未知地址
+        check (s.code == static_cast<std::uint8_t> (DiagNack::InvalidSourceAddress),
+               "SA 对不上 + 未知地址 → 也先报 0x02（身份先于地址）");
+
+        std::vector<std::uint8_t> big (600, 0xAA);
+        auto l = ch.handle (payload (SA, 0x0004, big), true, SA);    // 未知地址 + 超长
+        check (l.code == static_cast<std::uint8_t> (DiagNack::UnknownTargetAddress),
+               "未知地址 + 超长 → 先报 0x03（地址这关过不了，长度还轮不到）");
+
+        auto m = ch.handle (payload (SA, 0x0002, big), true, SA);    // 已知地址 + 超长
+        check (m.code == static_cast<std::uint8_t> (DiagNack::MessageTooLarge),
+               "已知地址 + 超长 → 才轮到 0x04");
+    }
+
+    std::printf ("\n--------------------------------\n");
+    std::printf ("通过 %d 项，失败 %d 项\n", g_pass, g_fail);
+    if (g_fail == 0)
+        std::printf ("M6 全绿 —— 地址不认识就拒绝，绝不猜一台 ECU。\n");
+    return g_fail == 0 ? 0 : 1;
+}

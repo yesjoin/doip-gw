@@ -83,7 +83,7 @@ if grep -q '\[PASS\] NACK 码 0x02' /tmp/m5_noact.log; then ok "未激活被明�
 echo
 echo "=== 6/6 两个第三方客户端并发，不许串包（验收第 4 条）==="
 $PY "$HERE/m5_check.py" concurrent --host 127.0.0.1 --port "$PORT" --ta 0x0001 --rounds 2 | tee /tmp/m5_conc.log
-if grep -q '\[PASS\] B 的每条响应都是 7E 00' /tmp/m5_conc.log; then ok "并发不串包"; else bad "并发串包"; fi
+if grep -q '\[PASS\] B 的每条响应都以 7E 00' /tmp/m5_conc.log; then ok "并发不串包"; else bad "并发串包"; fi
 
 # ---- 汇总 ----
 echo

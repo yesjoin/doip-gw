@@ -52,6 +52,13 @@ struct DiagnosticPolicy
 {
     std::uint16_t entityAddress = 0x0001;
     std::size_t   maxUds        = 512;    // 超过 → 0x8003 0x04
+
+    // M6：什么算"本实体能到达的目标地址"。
+    //   为空时按老规则：只认 entityAddress 自己（M3 的语义）。
+    //   网关会把它接到路由表上：TA 在表里 → 能到；不在 → 0x8003 0x03。
+    //   放在策略层而不是"等 CAN 失败再报 0x08"，因为 0x03 是**地址判定**，
+    //   不是传输故障——地址错要在发出去之前就说清楚。
+    std::function<bool (std::uint16_t)> targetKnown;
 };
 
 enum class DiagAction : std::uint8_t

@@ -80,11 +80,15 @@ DiagOutcome DiagnosticChannel::handle (const std::vector<std::uint8_t> &payload,
         return o;
     }
 
-    // ④ 目标必须是我。M4 会在这里换成"查路由表"，M3 只有自己一个节点。
-    if (o.targetAddress != p_.entityAddress)
+    // ④ 目标必须"我能到达" —— M3 时只有自己一个节点；M6 起改判"在不在路由表里"。
+    //    注意这里**不区分**"是我自己"和"是我背后的 ECU"：两种都算可达。
+    const bool reachable = p_.targetKnown
+                               ? p_.targetKnown (o.targetAddress)
+                               : (o.targetAddress == p_.entityAddress);
+    if (!reachable)
     {
         o.code   = static_cast<std::uint8_t> (DiagNack::UnknownTargetAddress);
-        o.reason = "目标地址不是我，也没有路由可达";
+        o.reason = "目标地址不在实体自身，也不在路由表里";
         return o;
     }
 

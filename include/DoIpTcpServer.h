@@ -35,6 +35,10 @@ struct TcpServerConfig
     std::uint32_t maxPayload       = kDefaultMaxPayload;
     std::size_t   maxUds           = 512;     // 单条诊断的 UDS 上限（超过 → 0x8003 0x04）
 
+    // M6：谁能当诊断目标。为空 = 只认 entityAddress 自己（M3 语义）。
+    // 网关会接成"查路由表"，于是 TA 打到背后的 ECU 也算合法目标。
+    std::function<bool (std::uint16_t)> targetKnown;
+
     // 心跳：激活后静默超过 idleBeforeAliveCheck → 发 0x0007；
     //       发出去后 aliveCheckTimeout 内没收到 0x0008 → 断开。
     std::chrono::milliseconds idleBeforeAliveCheck{2000};
