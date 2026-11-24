@@ -39,8 +39,10 @@ step "2/10 配置（干净目录，等价于 CI 全新克隆）"
 rm -rf "$BUILD"
 EXTRA=""
 [ "$WERROR" -eq 1 ] && EXTRA="-DDOIP_WERROR=ON"
-echo "      cmake -S . -B $BUILD -DCMAKE_BUILD_TYPE=Debug $EXTRA"
-if cmake -S . -B "$BUILD" -DCMAKE_BUILD_TYPE=Debug $EXTRA > "$LOG/cfg.log" 2>&1; then
+# -O2 是故意的：有些警告只在优化后才出现（glibc 的 warn_unused_result 就是一例，
+# Debug 的 -O0 下它不报，Release 一编就红）。CI 不模拟这一层，等于把 bug 留给用户。
+echo "      cmake -S . -B $BUILD -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS=-O2 $EXTRA"
+if cmake -S . -B "$BUILD" -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS=-O2 $EXTRA > "$LOG/cfg.log" 2>&1; then
     ok "cmake 配置成功"
 else
     bad "cmake 配置失败"

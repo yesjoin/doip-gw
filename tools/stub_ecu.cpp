@@ -75,7 +75,12 @@ void sendFrame (int fd, std::uint32_t id, const std::uint8_t d[8])
     f.can_id  = id;
     f.can_dlc = 8;
     std::memcpy (f.data, d, 8);
-    ::write (fd, &f, sizeof (f));
+    // 写失败（总线掉了 / fd 关了）这里没法重试，返回负数就算了：
+    // 但返回值必须"看"一眼，否则 glibc 的 warn_unused_result 会在 -O2 + -Werror 下直接编译失败
+    const ssize_t n = ::write (fd, &f, sizeof (f));
+    if (n < 0) {
+        std::fprintf (stderr, "[stub-ecu] CAN 写失败（id=0x%03X）\n", static_cast<unsigned> (id));
+    }
 }
 
 // 发一条 UDS：单帧一发；多帧先发 FF，等 tester 的流控，再按 STmin 发 CF

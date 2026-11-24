@@ -47,7 +47,8 @@ jobs:
           uname -srm
 
       - name: 配置
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DDOIP_WERROR=${{ matrix.werror }}
+        # -O2 与 ci_local.sh 一致：有些警告只在优化后才出现（如 glibc 的 warn_unused_result）
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS=-O2 -DDOIP_WERROR=${{ matrix.werror }}
 
       - name: 构建
         run: cmake --build build -j"$(nproc)"
