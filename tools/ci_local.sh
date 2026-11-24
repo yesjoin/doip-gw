@@ -20,7 +20,7 @@ step() { printf '\n=== %s ===\n' "$1"; }
 LOG=$(mktemp -d)
 trap 'rm -rf "$LOG"' EXIT
 
-step "1/14 编译器"
+step "1/15 编译器"
 if [ "$CC_NAME" = clang ]; then
     export CC=clang CXX=clang++
     WERROR=0
@@ -35,7 +35,7 @@ if ! command -v "$CXX" > /dev/null 2>&1; then
 fi
 $CXX --version | head -1 | sed 's/^/      /'
 
-step "2/14 配置（干净目录，等价于 CI 全新克隆）"
+step "2/15 配置（干净目录，等价于 CI 全新克隆）"
 rm -rf "$BUILD"
 EXTRA=""
 [ "$WERROR" -eq 1 ] && EXTRA="-DDOIP_WERROR=ON"
@@ -49,7 +49,7 @@ else
     tail -n 15 "$LOG/cfg.log" | sed 's/^/      /'
 fi
 
-step "3/14 构建 -Wall -Wextra -Wpedantic $([ "$WERROR" -eq 1 ] && echo '+ -Werror')"
+step "3/15 构建 -Wall -Wextra -Wpedantic $([ "$WERROR" -eq 1 ] && echo '+ -Werror')"
 if cmake --build "$BUILD" -j"$(nproc)" > "$LOG/build.log" 2>&1; then
     ok "构建成功"
 else
@@ -59,7 +59,7 @@ fi
 W=$(grep -c "warning:" "$LOG/build.log" 2>/dev/null) || W=0
 [ "$W" -eq 0 ] && ok "零编译警告" || echo "[WARN] 有 $W 条编译警告"
 
-step "4/14 自测（ctest）"
+step "4/15 自测（ctest）"
 if (cd "$BUILD" && ctest --output-on-failure > "$LOG/ctest.log" 2>&1); then
     ok "ctest 全绿"
 else
@@ -69,13 +69,13 @@ fi
 echo "      用例明细："
 grep -E "^ *[0-9]+/[0-9]+ Test" "$LOG/ctest.log" | sed 's/^/      /' || true
 
-step "5/14 工具冒烟：十六进制 → 人话"
+step "5/15 工具冒烟：十六进制 → 人话"
 OUT=$("$BUILD/doip-dump" "02 FD 80 01 00 00 00 07 0E 00 00 01 22 F1 90" 2>&1)
 echo "$OUT" | grep -q "0x8001"               && ok "doip-dump 认出 0x8001"          || bad "doip-dump 没认出 0x8001"
 echo "$OUT" | grep -q "ReadDataByIdentifier" && ok "doip-dump 认出 0x22 读 DID 服务" || bad "doip-dump 没认出 0x22"
 echo "$OUT" | grep -q "0x0E00"               && ok "doip-dump 认出源地址 0x0E00"     || bad "doip-dump 没认出源地址"
 
-step "6/14 端到端：实体 + 客户端走真 UDP（loopback，端口 13455）"
+step "6/15 端到端：实体 + 客户端走真 UDP（loopback，端口 13455）"
 "$BUILD/doip-discover" --serve --port 13455 --seconds 3 > "$LOG/serve.log" 2>&1 &
 SRV=$!
 sleep 0.4
@@ -91,7 +91,7 @@ grep -q "回了 1 个应答" "$LOG/serve.log"          && ok "实体侧日志确
 echo "      --- 客户端看到 ---"
 head -4 "$LOG/client.log" | sed 's/^/      /'
 
-step "7/14 端到端：实体 + 客户端走真 TCP（loopback，端口 13456）"
+step "7/15 端到端：实体 + 客户端走真 TCP（loopback，端口 13456）"
 # 心跳周期调到 5000ms：这条用例要的是"能激活、心跳能一问一答"，
 # 不让服务器主动发心跳来抢戏（那条逻辑由 routing-selftest 用 150ms 单独测）。
 "$BUILD/doip-serve" --port 13456 --seconds 4 --idle-ms 5000 > "$LOG/tcpserve.log" 2>&1 &
@@ -112,7 +112,7 @@ grep -q "成功激活 1 次"    "$LOG/tcpserve.log"  && ok "实体侧确认激�
 echo "      --- 客户端看到 ---"
 head -8 "$LOG/tcpclient.log" | sed 's/^/      /'
 
-step "8/14 端到端：真 CAN（vcan0 + 项目一的 ECU）"
+step "8/15 端到端：真 CAN（vcan0 + 项目一的 ECU）"
 # 这一步需要真总线 + 项目一的 uds-demo。CI 的 GitHub runner 上没有，
 # 所以只在装了 CAN 的机器上跑；缺东西就 SKIP，不算红。
 if [ -d /sys/class/net/vcan0 ] && [ -x "$HOME/uds-ecu/build/uds-demo" ]; then
@@ -148,7 +148,7 @@ else
     echo "[SKIP] 没有 vcan0 或没有 ~/uds-ecu/build/uds-demo，跳过真 CAN 这一步"
 fi
 
-step "9/14 第三方客户端对打（python doipclient，5 条验收硬指标）"
+step "9/15 第三方客户端对打（python doipclient，5 条验收硬指标）"
 # 为什么单独拎一步：前面所有测试都是"自己写的东西测自己写的东西"，
 # 这一步换成别人按标准写的客户端，能过才说明符合标准。
 # doipclient 是 pip 包，GitHub runner 上没装 → SKIP，不算红。
@@ -164,7 +164,7 @@ else
     echo "[SKIP] 没装第三方客户端（pip3 install --user doipclient）"
 fi
 
-step "10/14 多 ECU 路由（vcan0 + 两台 ECU + 路由表）"
+step "10/15 多 ECU 路由（vcan0 + 两台 ECU + 路由表）"
 # 这一步要两台 ECU：项目一的 uds-demo（7E0/7E8）+ 本仓库的 stub-ecu（7A0/7A8）。
 # 缺任何一样就 SKIP。
 if [ -d /sys/class/net/vcan0 ] && [ -x "$HOME/uds-ecu/build/uds-demo" ] && [ -x "$BUILD/stub-ecu" ] \
@@ -180,7 +180,7 @@ else
     echo "[SKIP] 缺 vcan0 / uds-demo / stub-ecu / doipclient，跳过路由验收"
 fi
 
-step "11/14 扩展帧（29 位 ID，一条总线上标准帧 + 扩展帧并存）"
+step "11/15 扩展帧（29 位 ID，一条总线上标准帧 + 扩展帧并存）"
 if [ -d /sys/class/net/vcan0 ] && [ -x "$HOME/uds-ecu/build/uds-demo" ] && [ -x "$BUILD/stub-ecu" ] \
    && command -v candump >/dev/null 2>&1 && python3 -c 'import doipclient' >/dev/null 2>&1; then
     if bash "$(dirname "$0")/m7_e2e.sh" 13463 > "$LOG/m7.log" 2>&1; then
@@ -194,7 +194,7 @@ else
     echo "[SKIP] 缺 vcan0 / uds-demo / stub-ecu / candump / doipclient，跳过扩展帧验收"
 fi
 
-step "12/14 功能寻址（一条广播 → 多台 ECU 应答，SA 各不相同）"
+step "12/15 功能寻址（一条广播 → 多台 ECU 应答，SA 各不相同）"
 if [ -d /sys/class/net/vcan0 ] && [ -x "$BUILD/stub-ecu" ] \
    && command -v candump >/dev/null 2>&1 && python3 -c 'import doipclient' >/dev/null 2>&1; then
     if bash "$(dirname "$0")/m8_e2e.sh" 13464 > "$LOG/m8.log" 2>&1; then
@@ -208,7 +208,7 @@ else
     echo "[SKIP] 缺 vcan0 / stub-ecu / candump / doipclient，跳过功能寻址验收"
 fi
 
-step "13/14 CAN FD（同一套 ISO-TP，经典帧 8 字节 vs FD 帧 64 字节）"
+step "13/15 CAN FD（同一套 ISO-TP，经典帧 8 字节 vs FD 帧 64 字节）"
 if [ -d /sys/class/net/vcan0 ] && [ -x "$BUILD/stub-ecu" ] \
    && command -v candump >/dev/null 2>&1 && python3 -c 'import doipclient' >/dev/null 2>&1 \
    && [ "$(cat /sys/class/net/vcan0/mtu 2>/dev/null || echo 0)" -ge 72 ]; then
@@ -223,7 +223,7 @@ else
     echo "[SKIP] 缺 vcan0 / MTU<72 / stub-ecu / candump / doipclient，跳过 CAN FD 验收"
 fi
 
-step "14/14 多 tester 独立通道（一条通道一条队列 + 一条线程）"
+step "14/15 多 tester 独立通道（一条通道一条队列 + 一条线程）"
 if [ -d /sys/class/net/vcan0 ] && [ -x "$BUILD/stub-ecu" ] && [ -x "$BUILD/doip-gateway" ] \
    && command -v candump >/dev/null 2>&1 && python3 -c 'import doipclient' >/dev/null 2>&1; then
     if bash "$(dirname "$0")/m10_e2e.sh" 13466 > "$LOG/m10.log" 2>&1; then
@@ -235,6 +235,20 @@ if [ -d /sys/class/net/vcan0 ] && [ -x "$BUILD/stub-ecu" ] && [ -x "$BUILD/doip-
     grep -E "^通过 " "$LOG/m10.log" | sed 's/^/      /' || true
 else
     echo "[SKIP] 缺 vcan0 / stub-ecu / doip-gateway / candump / doipclient，跳过多 tester 验收"
+fi
+
+step "15/15 多响应配对（一条广播，三台 ECU 各答一句，按 SA 归档）"
+if [ -d /sys/class/net/vcan0 ] && [ -x "$BUILD/stub-ecu" ] && [ -x "$BUILD/doip-client" ] \
+   && command -v candump >/dev/null 2>&1; then
+    if bash "$(dirname "$0")/m11_e2e.sh" 13467 13468 > "$LOG/m11.log" 2>&1; then
+        ok "多响应配对：三条答案按 SA 归档，静默窗口收工，短窗口不串味"
+    else
+        bad "多响应配对端到端失败"
+        tail -n 25 "$LOG/m11.log" | sed 's/^/      /'
+    fi
+    grep -E "^通过 " "$LOG/m11.log" | sed 's/^/      /' || true
+else
+    echo "[SKIP] 缺 vcan0 / stub-ecu / doip-client / candump，跳过多响应配对验收"
 fi
 
 echo

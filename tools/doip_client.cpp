@@ -6,6 +6,7 @@
 // 流程：TCP 连上 → 发 0x0005 路由激活 → 读 0x0006 → （可选）发 0x0007 读 0x0008
 // 打印的每一行都和 doip-serve 那侧对得上，方便"两边对照看"。
 // ============================================================================
+#include "DiagResponseCollector.h"   // M11：多响应配对（纯逻辑，无 socket）
 #include "DoIpCodec.h"
 #include "DoIpDiagnostic.h"   // DiagNack 名字表
 #include "DoIpRouting.h"      // 为了 nameOf(ActivationResponseCode)
@@ -25,6 +26,14 @@
 #include <vector>
 
 using namespace doip;
+
+// 假时钟：只用来给收集器打时间戳（"这一条比上一条晚多久"），不参与任何超时判定
+static long nowMs ()
+{
+    using namespace std::chrono;
+    return static_cast<long> (
+        duration_cast<milliseconds> (steady_clock::now ().time_since_epoch ()).count ());
+}
 
 static bool sendVec (int fd, const std::vector<std::uint8_t> &b)
 {
@@ -182,6 +191,8 @@ int main (int argc, char **argv)
     bool hasDsa = false;                    // 用来演示"冒用别人地址"
     std::string diagHex;                    // --diag "22 F1 86"
     bool hasDiag = false;
+    bool all = false;                       // M11：--all 收齐所有响应（功能寻址用）
+    long windowMs = 900;                    // 静默窗口：多久没有新响应当"收工"（毫秒）
 
     for (int i = 1; i < argc; ++i)
     {
@@ -194,11 +205,13 @@ int main (int argc, char **argv)
         else if (a == "--dsa" && i + 1 < argc)   { dsa = static_cast<std::uint16_t> (std::strtoul (argv[++i], nullptr, 16)); hasDsa = true; }
         else if (a == "--alive")                 alive = true;
         else if (a == "--diag" && i + 1 < argc)  { diagHex = argv[++i]; hasDiag = true; }
+        else if (a == "--all")                   all = true;
+        else if (a == "--window" && i + 1 < argc) windowMs = std::atol (argv[++i]);
         else
         {
             std::fprintf (stderr,
                           "用法：%s [--host 127.0.0.1] [--port 13400] [--sa 0E00] [--ta 0001] "
-                          "[--dsa 0E01] [--type 00] [--diag \"22 F1 86\"] [--alive]\n", argv[0]);
+                          "[--dsa 0E01] [--type 00] [--diag \"22 F1 86\"] [--all] [--window 900] [--alive]\n", argv[0]);
             return 2;
         }
     }
@@ -322,6 +335,7 @@ int main (int argc, char **argv)
             std::printf ("← 0x8003 NACK：SA=0x%04X TA=0x%04X code=0x%02X (%s)\n",
                          na.sourceAddress, na.targetAddress,
                          static_cast<unsigned> (na.nackCode), nm.c_str ());
+            if (all) std::printf ("RESPONSE_COUNT=0\n");   // 连门都没进，更没有答案
             ::close (fd);
             return 1;
         }
@@ -342,6 +356,97 @@ int main (int argc, char **argv)
         }
         std::printf ("← 0x8002 ACK：SA=0x%04X TA=0x%04X code=0x%02X\n",
                      pa.sourceAddress, pa.targetAddress, static_cast<unsigned> (pa.ackCode));
+
+        // ---- M11：--all，收齐所有响应，按 SA 归档 ----
+        //
+        // 功能寻址的答案条数不由网关决定，由"谁在听"决定。所以这里既不能"收一条就走"，
+        // 也不能"按第几条猜是谁"——只认 SA。收工信号只有一种：静默满窗口（DoIP 没有批次结束字段）。
+        if (all)
+        {
+            DiagResponseCollector collector;
+            std::printf ("→ 收集响应：静默窗口 %ldms（每来一条就重新计时）\n", windowMs);
+
+            while (true)
+            {
+                Message one;
+                if (!recvMsgBuf (fd, one, inbuf, static_cast<int> (windowMs), why))
+                {
+                    std::printf ("   （静默 %ldms 无新响应，收工：%s）\n", windowMs, why.c_str ());
+                    break;
+                }
+                // 0x8003 可能后到：ACK 先回、NACK 后回（网关先受理再判断有没有人答）
+                if (one.header.payloadType == 0x8003)
+                {
+                    DiagnosticNegativeAck na;
+                    if (decodePayload (one.payload, na, why))
+                    {
+                        std::printf ("← 0x8003 NACK：SA=0x%04X TA=0x%04X code=0x%02X (%s)\n",
+                                     na.sourceAddress, na.targetAddress,
+                                     static_cast<unsigned> (na.nackCode),
+                                     nameOf (static_cast<DiagNack> (na.nackCode)));
+                    }
+                    break;   // 一条答案都没有，再等也没有
+                }
+                if (one.header.payloadType != 0x8001)
+                {
+                    std::printf ("← 收到 0x%04X（不是响应，跳过）\n",
+                                 static_cast<unsigned> (one.header.payloadType));
+                    continue;
+                }
+                DiagnosticMessage dr;
+                if (!decodePayload (one.payload, dr, why))
+                {
+                    std::printf ("← 一条 0x8001 解不开：%s（跳过）\n", why.c_str ());
+                    continue;
+                }
+
+                const auto oc = collector.add (dr.sourceAddress, dr.uds, nowMs ());
+                std::printf ("← #%zu 0x8001：SA=0x%04X UDS=", collector.arrivals (), dr.sourceAddress);
+                printHex (dr.uds);
+                if (oc == DiagResponseCollector::Outcome::Duplicate)
+                    std::printf ("   ← 这台已经答过（重复）");
+                std::printf ("\n");
+
+            }
+
+            std::printf ("\n—— 多响应汇总：不同 SA %zu 台，到过 %zu 条，重复 %zu 次，改口 %zu 次，窗口 %ldms ——\n",
+                         collector.count (), collector.arrivals (),
+                         collector.duplicates (), collector.changes (), windowMs);
+            if (collector.count () == 0)
+            {
+                std::printf ("  一条都没有：要么没人听这个地址，要么窗口比最慢的那台还短。\n");
+            }
+            else
+            {
+                for (std::size_t i = 0; i < collector.count (); ++i)
+                {
+                    const CollectedResponse &r = collector.at (i);
+                    std::printf ("  #%zu  SA=0x%04X  %s  字节 %zu（重复 %zu，改口 %zu）\n",
+                                 r.seq, r.sa,
+                                 udsServiceNameStr (r.uds.empty () ? 0 : r.uds[0]).c_str (),
+                                 r.uds.size (), r.duplicates, r.changes);
+                }
+            }
+
+            // 机器可读的那几行：脚本只认这些，人看上面的表
+            std::printf ("RESPONSE_COUNT=%zu\n", collector.count ());
+            std::printf ("RESPONSE_ARRIVALS=%zu\n", collector.arrivals ());
+            std::printf ("RESPONSE_SAS=");
+            for (std::size_t i = 0; i < collector.count (); ++i)
+                std::printf ("%s0x%04X", (i == 0 ? "" : ","), collector.at (i).sa);
+            std::printf ("\n");
+            for (std::size_t i = 0; i < collector.count (); ++i)
+            {
+                std::printf ("RESP%zu_SA=0x%04X\n", i, collector.at (i).sa);
+                std::printf ("RESP%zu_HEX=", i);
+                printHex (collector.at (i).uds);
+                std::printf ("\n");
+            }
+            std::printf ("COLLECTOR_DUPLICATES=%zu\n", collector.duplicates ());
+            std::printf ("COLLECTOR_CHANGES=%zu\n", collector.changes ());
+        }
+        else
+        {
 
         Message resp;
         if (!recvMsgBuf (fd, resp, inbuf, 3000, why))
@@ -369,6 +474,9 @@ int main (int argc, char **argv)
                      dr.sourceAddress, dr.targetAddress);
         printHex (dr.uds);
         std::printf ("（%s）\n", udsServiceNameStr (dr.uds.empty () ? 0 : dr.uds[0]).c_str ());
+
+        }   // else（--all 的对照分支：只收第一条）
+
     }
 
     // 3) 心跳（可选）
