@@ -191,11 +191,106 @@ int main ()
         check (done && got == msg, "消息 " + std::to_string (n) + " 字节拆了再装，字节完全一致");
     }
 
+    // =======================================================================
+    std::printf ("\n=== E CAN FD：同一套协议，换个信封大小 ===\n");
+
+    // E1 单帧边界整片移动：经典 7 字节封顶，FD 62 字节封顶
+    {
+        std::vector<std::vector<std::uint8_t>> frames;
+        std::vector<std::uint8_t> m7 = bytes (7);
+
+        check (segmentMessage (m7, frames, err, 0x00, 64) && frames.size () == 1,
+               "FD：7 字节仍是 1 帧");
+        check (frames[0][0] == 0x07, "FD：7 字节用普通单帧（0x07）");
+
+        m7 = bytes (8);
+        check (segmentMessage (m7, frames, err, 0x00, 64) && frames.size () == 1,
+               "FD：8 字节也是 1 帧（经典帧这里已经要 2 帧）");
+        check (frames[0][0] == 0x00 && frames[0][1] == 8,
+               "FD：8 字节走转义单帧（0x00 + 0x08）");
+        check (frames[0].size () == 64, "FD：一帧写满 64 字节");
+
+        std::vector<std::uint8_t> m62 = bytes (62);
+        check (segmentMessage (m62, frames, err, 0x00, 64) && frames.size () == 1 &&
+               frames[0][0] == 0x00 && frames[0][1] == 62,
+               "FD：62 字节 = 转义单帧，正好一张帧装下（上限）");
+
+        std::vector<std::uint8_t> m63 = bytes (63);
+        check (segmentMessage (m63, frames, err, 0x00, 64) && frames.size () == 2 &&
+               frames[0][0] == 0x10 && frames[0][1] == 63,
+               "FD：63 字节溢出一张单帧 → 改成首帧（0x10 0x3F）");
+        check (frames[0][2] == 0x10 && frames[0].size () == 64,
+               "FD：首帧能带 62 字节（frameBytes-2），正好填满 64");
+
+        std::vector<std::uint8_t> m200 = bytes (200);
+        check (segmentMessage (m200, frames, err, 0x00, 64) && frames.size () == 4,
+               "FD：200 字节 = 首帧 + 3 张连续帧 = 4 帧（经典帧要 29 帧）");
+        check (frames[1][0] == 0x21 && frames[1][1] == static_cast<std::uint8_t> (0x10 + 62),
+               "FD：第一张连续帧 SN=1，接着首帧第 62 个字节往后续");
+        check (frames[1].size () == 64 && frames[3].size () == 64,
+               "FD：连续帧能带 63 字节（frameBytes-1），最后一张补齐 64");
+        check (consecutiveFrameCount (200, 64) == 3, "FD：200 字节要 3 张连续帧");
+        check (consecutiveFrameCount (200, 8) == 28, "经典帧：200 字节要 28 张连续帧");
+    }
+
+    // E2 拆了再装：FD 与经典帧各走一遍，结果必须一致
+    for (std::size_t n : {62u, 63u, 200u, 1000u})
+    {
+        std::vector<std::uint8_t> msg = bytes (n);
+        std::vector<std::vector<std::uint8_t>> frames;
+        check (segmentMessage (msg, frames, err, 0x00, 64), "FD 消息 " + std::to_string (n) + " 字节可拆");
+
+        IsoTpAssembler back (4095, 64);
+        std::vector<std::uint8_t> got;
+        bool done = false;
+        for (auto &fr : frames)
+        {
+            const auto r = back.onFrame (fr.data (), got, err, fr.size ());
+            if (r == IsoTpAssembler::Result::Complete) { done = true; break; }
+            if (r == IsoTpAssembler::Result::Error) break;
+        }
+        check (done && got == msg,
+               "FD 消息 " + std::to_string (n) + " 字节拆了再装，字节完全一致");
+    }
+
+    // E3 装配器必须按帧长校验：信封小一号，装不下就得报错而不是默默截断
+    {
+        IsoTpAssembler a64 (4095, 64);
+        std::vector<std::uint8_t> got;
+        std::uint8_t sf5[64] = {0};
+        sf5[0] = 0x00; sf5[1] = 5;                 // 说"我只有 5 字节"，那就该用 0x05
+        check (a64.onFrame (sf5, got, err, 64) == IsoTpAssembler::Result::Error,
+               "FD 转义单帧声称 5 字节 → 报错（<=7 必须用 0x0N）");
+
+        std::uint8_t sf20[8] = {0};
+        sf20[0] = 0x00; sf20[1] = 20;              // 转义帧在经典信封里根本装不下 20 字节
+        check (a64.onFrame (sf20, got, err, 8) == IsoTpAssembler::Result::Error,
+               "经典信封里出现转义单帧声称 20 字节 → 报错（本帧上限 6）");
+
+        IsoTpAssembler a8 (4095, 8);
+        std::uint8_t ff9[8] = {0x10, 0x09, 1, 2, 3, 4, 5, 6};   // 声称 9 字节，经典首帧只装 6
+        check (a8.onFrame (ff9, got, err, 8) == IsoTpAssembler::Result::NeedMore,
+               "经典帧：首帧装 6 字节后继续等连续帧");
+
+        IsoTpAssembler a64b (4095, 64);
+        std::uint8_t ff2[64] = {0x10, 0x02, 9, 9};             // 声称总共 2 字节，那本该是单帧
+        check (a64b.onFrame (ff2, got, err, 64) == IsoTpAssembler::Result::Error,
+               "首帧声称总长 2 字节 → 报错（<=7 必须用单帧）");
+    }
+
+    // E4 流控帧也要长成 frameBytes 那么长
+    {
+        std::uint8_t fc64[64] = {0};
+        buildFlowControl (0, 0, 0xAA, fc64, 64);
+        check (fc64[0] == 0x30 && fc64[63] == 0xAA,
+               "FD 流控：头 0x30，尾部补齐到第 64 字节");
+    }
+
     std::printf ("\n--------------------------------\n");
     std::printf ("通过 %d 项，失败 %d 项\n", g_pass, g_fail);
     if (g_fail == 0)
     {
-        std::printf ("M4 纯逻辑全绿 —— 7 字节是单帧边界，40 字节是首帧 + 5 张连续帧。\n");
+        std::printf ("M4 + M9 纯逻辑全绿 —— 经典帧 7 字节封顶 / FD 帧 62 字节封顶，同一套协议两个信封。\n");
     }
     return g_fail == 0 ? 0 : 1;
 }

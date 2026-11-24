@@ -46,9 +46,9 @@ bool parseRoute (const std::string &spec, RouteEntry &e, std::string &err)
     std::vector<std::string> parts;
     splitSpec (spec, parts);
 
-    if (parts.size () < 3 || parts.size () > 4)
+    if (parts.size () < 3 || parts.size () > 5)
     {
-        err = "路由格式应为 TA:TX:RX[:名字]（十六进制），比如 0002:7E0:7E8:ECU_B";
+        err = "路由格式应为 TA:TX:RX[:名字][:fd]（十六进制），比如 0002:7E0:7E8:ECU_B";
         return false;
     }
     char *end = nullptr;
@@ -58,7 +58,17 @@ bool parseRoute (const std::string &spec, RouteEntry &e, std::string &err)
     if (end == parts[1].c_str ()) { err = "请求 ID 不是合法十六进制：" + parts[1]; return false; }
     e.rxId = static_cast<std::uint32_t> (std::strtoul (parts[2].c_str (), &end, 16));
     if (end == parts[2].c_str ()) { err = "响应 ID 不是合法十六进制：" + parts[2]; return false; }
-    e.name = parts.size () == 4 ? parts[3] : "";
+    e.name = parts.size () >= 4 ? parts[3] : "";
+    // M9：第 5 段写 fd 就把这条通道按 CAN FD 开（帧长 64）；不写就是经典帧（帧长 8）
+    if (parts.size () == 5)
+    {
+        if (parts[4] == "fd" || parts[4] == "FD" || parts[4] == "1") e.fd = true;
+        else
+        {
+            err = "第 5 段只认 fd（表示这条通道用 CAN FD），收到的是：" + parts[4];
+            return false;
+        }
+    }
     return true;
 }
 
@@ -186,8 +196,9 @@ int main (int argc, char **argv)
     for (const auto &e : table.entries ())
     {
         // 宽度要在日志里看得出来：7E0 打成 0x7E0，18DAF100 打成 0x18DAF100
-        std::printf ("  TA=0x%04X → %s / %s  %s\n", static_cast<unsigned> (e.logicalAddress),
+        std::printf ("  TA=0x%04X → %s / %s%s  %s\n", static_cast<unsigned> (e.logicalAddress),
                      formatCanId (e.txId).c_str (), formatCanId (e.rxId).c_str (),
+                     e.fd ? "（FD，帧长 64）" : "",
                      e.name.empty () ? "" : e.name.c_str ());
     }
     if (table.sizeFunctional () > 0)
@@ -269,10 +280,11 @@ int main (int argc, char **argv)
     }
     for (const auto &cs : gw.channelStats ())
     {
-        std::printf ("  TA=0x%04X（%s/%s）：转发 %zu 条，失败 %zu 条，发帧 %llu，收帧 %llu，"
+        std::printf ("  TA=0x%04X（%s/%s%s）：转发 %zu 条，失败 %zu 条，发帧 %llu，收帧 %llu，"
                      "超时 %llu，序号错 %llu，迟到帧丢弃 %llu，广播应答 %llu\n",
                      static_cast<unsigned> (cs.ta),
                      formatCanId (cs.txId).c_str (), formatCanId (cs.rxId).c_str (),
+                     cs.fd ? "，FD" : "",
                      cs.handled, cs.failed,
                      static_cast<unsigned long long> (cs.stats.framesSent),
                      static_cast<unsigned long long> (cs.stats.framesRecv),

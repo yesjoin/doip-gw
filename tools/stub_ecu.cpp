@@ -24,6 +24,11 @@
 //     ① 广播来的请求只能是单帧（网关没法给"所有 ECU"发流控）；
 //     ② 应答也必须能塞进单帧（≤7 字节），塞不进去就不答——
 //        这不是偷懒，是协议限制：多帧响应要等一个唯一的流控方向。
+//
+// M9 新增 --fd：这一台按 **CAN FD** 说话（帧长 64，单帧最多 62 字节）。
+//   同一个程序、同一个 ISO-TP 逻辑，只是把"每帧能装多少"换了个数——
+//   这正是 M9 要证明的事：FD 不是另一套协议，是同一套协议换了个信封大小。
+//   副作用很直观：22 F1 A2（200 字节）在经典帧下要 29 帧，在 FD 下只要 4 帧。
 // ============================================================================
 #include "CanId.h"
 #include "IsoTpStack.h"
@@ -48,18 +53,18 @@ using namespace doip;
 namespace
 {
 
-int openCan (const std::string &iface, std::string &err)
+int openCan (const std::string &iface, bool fd, std::string &err)
 {
-    const int fd = ::socket (PF_CAN, SOCK_RAW, CAN_RAW);
-    if (fd < 0) { err = "socket(PF_CAN) 失败"; return -1; }
+    const int fd_ = ::socket (PF_CAN, SOCK_RAW, CAN_RAW);
+    if (fd_ < 0) { err = "socket(PF_CAN) 失败"; return -1; }
 
     ifreq ifr;
     std::memset (&ifr, 0, sizeof (ifr));
     std::strncpy (ifr.ifr_name, iface.c_str (), IFNAMSIZ - 1);
-    if (::ioctl (fd, SIOCGIFINDEX, &ifr) < 0)
+    if (::ioctl (fd_, SIOCGIFINDEX, &ifr) < 0)
     {
         err = "找不到网卡 " + iface;
-        ::close (fd);
+        ::close (fd_);
         return -1;
     }
 
@@ -67,23 +72,51 @@ int openCan (const std::string &iface, std::string &err)
     std::memset (&addr, 0, sizeof (addr));
     addr.can_family  = AF_CAN;
     addr.can_ifindex = ifr.ifr_ifindex;
-    if (::bind (fd, reinterpret_cast<sockaddr *> (&addr), sizeof (addr)) < 0)
+    if (::bind (fd_, reinterpret_cast<sockaddr *> (&addr), sizeof (addr)) < 0)
     {
         err = "bind 失败";
-        ::close (fd);
+        ::close (fd_);
         return -1;
     }
-    return fd;
+
+    // ★ M9：FD 必须显式打开这个 socket 选项，否则 FD 帧会被内核当成噪声丢掉
+    if (fd)
+    {
+        const int on = 1;
+        if (::setsockopt (fd_, SOL_CAN_RAW, CAN_RAW_FD_FRAMES, &on, sizeof (on)) < 0)
+        {
+            err = "这个网卡不支持 CAN FD（vcan 的 MTU 要 >= 72）";
+            ::close (fd_);
+            return -1;
+        }
+    }
+    return fd_;
 }
 
-void sendFrame (int fd, std::uint32_t id, const std::uint8_t d[8])
+void sendFrame (int fd, std::uint32_t id, const std::uint8_t d[64], std::size_t len, bool useFd)
 {
+    // ★ M9：FD 帧和经典帧是两个结构体。FD 下 len 可以是 8..64 任意值（本项目固定 64）。
+    if (useFd)
+    {
+        canfd_frame f;
+        std::memset (&f, 0, sizeof (f));
+        f.can_id = idForSend (id);
+        f.len    = static_cast<std::uint8_t> (len > kFdFrameBytes ? kFdFrameBytes : len);
+        std::memcpy (f.data, d, f.len);
+        const ssize_t n = ::write (fd, &f, sizeof (f));
+        if (n < 0)
+        {
+            std::fprintf (stderr, "[stub-ecu] CAN FD 写失败（%s）\n", formatCanId (id).c_str ());
+        }
+        return;
+    }
+
     can_frame f;
     std::memset (&f, 0, sizeof (f));
     // M7：29 位 ID 要置 CAN_EFF_FLAG，标准帧不能带（置了内核会按 29 位处理）
     f.can_id  = idForSend (id);
-    f.can_dlc = 8;
-    std::memcpy (f.data, d, 8);
+    f.can_dlc = static_cast<std::uint8_t> (len > 8 ? 8 : len);
+    std::memcpy (f.data, d, f.can_dlc);
     // 写失败（总线掉了 / fd 关了）这里没法重试，返回负数就算了：
     // 但返回值必须"看"一眼，否则 glibc 的 warn_unused_result 会在 -O2 + -Werror 下直接编译失败
     const ssize_t n = ::write (fd, &f, sizeof (f));
@@ -94,12 +127,15 @@ void sendFrame (int fd, std::uint32_t id, const std::uint8_t d[8])
 
 // 发一条 UDS：单帧一发；多帧先发 FF，等 tester 的流控，再按 STmin 发 CF
 bool sendUds (int fd, std::uint32_t txId, std::uint32_t rxId,
-              const std::vector<std::uint8_t> &uds, std::string &err)
+              const std::vector<std::uint8_t> &uds, std::size_t frameBytes,
+              std::string &err)
 {
-    std::vector<std::vector<std::uint8_t>> frames;
-    if (!segmentMessage (uds, frames, err, 0x00)) return false;
+    const bool useFd = frameBytes > kClassicFrameBytes;
 
-    sendFrame (fd, txId, frames[0].data ());
+    std::vector<std::vector<std::uint8_t>> frames;
+    if (!segmentMessage (uds, frames, err, 0x00, frameBytes)) return false;
+
+    sendFrame (fd, txId, frames[0].data (), frames[0].size (), useFd);
     if (frames.size () == 1) return true;
 
     // 等流控（tester 会回 0x30 xx xx）
@@ -113,9 +149,13 @@ bool sendUds (int fd, std::uint32_t txId, std::uint32_t rxId,
         p.fd = fd; p.events = POLLIN; p.revents = 0;
         if (::poll (&p, 1, 20) <= 0) continue;
 
-        can_frame f;
+        // 用 canfd_frame 读：FD socket 上经典帧只回 16 字节，FD 帧回 72 字节，
+        // 两种结构体前 8 字节布局一致，长度读同一个位置就行
+        canfd_frame f;
         std::memset (&f, 0, sizeof (f));
-        if (::read (fd, &f, sizeof (f)) < static_cast<ssize_t> (sizeof (f))) continue;
+        const ssize_t n = ::read (fd, &f, sizeof (f));
+        if (n != static_cast<ssize_t> (sizeof (can_frame)) &&
+            n != static_cast<ssize_t> (sizeof (canfd_frame))) continue;
         if (idFromRecv (f.can_id) != rxId) continue;      // 不是给我的，丢掉（先剥标志位再比）
         std::uint8_t d[8];
         std::memcpy (d, f.data, 8);
@@ -129,7 +169,7 @@ bool sendUds (int fd, std::uint32_t txId, std::uint32_t rxId,
     for (std::size_t i = 1; i < frames.size (); ++i)
     {
         if (stmin > 0) ::usleep (stmin * 1000);
-        sendFrame (fd, txId, frames[i].data ());
+        sendFrame (fd, txId, frames[i].data (), frames[i].size (), useFd);
     }
     return true;
 }
@@ -154,6 +194,16 @@ std::vector<std::uint8_t> answer (const std::vector<std::uint8_t> &uds,
             for (char c : vin) r.push_back (static_cast<std::uint8_t> (c));
         else if (did == 0xF191)
             for (char c : hw) r.push_back (static_cast<std::uint8_t> (c));
+        else if (did == 0xF1A0 || did == 0xF1A1 || did == 0xF1A2)
+        {
+            // M9 的"长响应"：字节值 = 下标 & 0xFF（远程一眼就能校验，手算也对得上）
+            //   0xF1A0 → 59 + 3 = 62 字节：**正好是一张 FD 单帧装得下的上限**
+            //   0xF1A1 → 100 + 3 = 103 字节：FD 两帧 / 经典帧 15 帧
+            //   0xF1A2 → 197 + 3 = 200 字节：FD 四帧 / 经典帧 29 帧
+            const std::size_t n = (did == 0xF1A0) ? 59 : (did == 0xF1A1) ? 100 : 197;
+            for (std::size_t i = 0; i < n; ++i)
+                r.push_back (static_cast<std::uint8_t> (i & 0xFF));
+        }
         else if (did == 0xF186)
             r.push_back (0x02);                       // 当前会话：编程会话（和项目一取不同值）
         else
@@ -185,6 +235,7 @@ int main (int argc, char **argv)
     std::uint32_t tx = 0x7A8;      // 我发的（ECU → tester）
     std::uint32_t rx = 0x7A0;      // 我收的（tester → ECU）
     std::uint32_t funcRx = 0;      // M8：额外的广播监听 ID（0 = 不听广播）
+    bool useFd = false;            // M9：这一台按 CAN FD 说话（帧长 64）
     std::string vin = "LSVZZ0000B7654321";
     std::string hw  = "HW02";
     int seconds = 20;
@@ -198,11 +249,12 @@ int main (int argc, char **argv)
         else if (a == "--func-rx" && i + 1 < argc) funcRx = std::strtoul (argv[++i], nullptr, 16);
         else if (a == "--vin" && i + 1 < argc)    vin = argv[++i];
         else if (a == "--hw" && i + 1 < argc)     hw = argv[++i];
+        else if (a == "--fd")                     useFd = true;
         else if (a == "--seconds" && i + 1 < argc) seconds = std::atoi (argv[++i]);
         else
         {
             std::fprintf (stderr,
-                          "用法：%s [--iface vcan0] [--rx 7A0] [--tx 7A8] [--func-rx 7DF] "
+                          "用法：%s [--iface vcan0] [--rx 7A0] [--tx 7A8] [--func-rx 7DF] [--fd] "
                           "[--vin LSVZZ0000B7654321] [--hw HW02] [--seconds 20]\n", argv[0]);
             return 2;
         }
@@ -226,15 +278,18 @@ int main (int argc, char **argv)
     }
 
     std::string err;
-    const int fd = openCan (iface, err);
+    const int fd = openCan (iface, useFd, err);
     if (fd < 0)
     {
         std::fprintf (stderr, "起不来：%s\n", err.c_str ());
         return 1;
     }
 
-    std::printf ("极简 ECU：%s 上收 %s / 发 %s，VIN=%s，HW=%s，跑 %d 秒\n",
+    const std::size_t frameBytes = useFd ? kFdFrameBytes : kClassicFrameBytes;
+
+    std::printf ("极简 ECU：%s 上收 %s / 发 %s，%s，VIN=%s，HW=%s，跑 %d 秒\n",
                  iface.c_str (), formatCanId (rx).c_str (), formatCanId (tx).c_str (),
+                 useFd ? "CAN FD（帧长 64，单帧最多 62 字节）" : "经典 CAN（帧长 8，单帧 7 字节）",
                  vin.c_str (), hw.c_str (), seconds);
     if (funcRx != 0)
     {
@@ -242,7 +297,7 @@ int main (int argc, char **argv)
                      formatCanId (funcRx).c_str ());
     }
 
-    IsoTpAssembler asm_ (4095);
+    IsoTpAssembler asm_ (4095, frameBytes);
     const auto deadline = std::chrono::steady_clock::now () + std::chrono::seconds (seconds);
     std::size_t answered = 0;
 
@@ -252,18 +307,23 @@ int main (int argc, char **argv)
         p.fd = fd; p.events = POLLIN; p.revents = 0;
         if (::poll (&p, 1, 50) <= 0) continue;
 
-        can_frame f;
+        // 用 canfd_frame 读：FD socket 上经典帧只回 16 字节、FD 帧回 72 字节，
+        // 两种结构体前 8 字节布局一致，长度读同一个位置就行
+        canfd_frame f;
         std::memset (&f, 0, sizeof (f));
-        if (::read (fd, &f, sizeof (f)) < static_cast<ssize_t> (sizeof (f))) continue;
+        const ssize_t nread = ::read (fd, &f, sizeof (f));
+        if (nread != static_cast<ssize_t> (sizeof (can_frame)) &&
+            nread != static_cast<ssize_t> (sizeof (canfd_frame))) continue;
+
         const std::uint32_t gotId = idFromRecv (f.can_id);      // 先剥标志位再比
         const bool onFunc = (funcRx != 0 && gotId == funcRx);   // M8：这一帧是广播来的吗
         if (gotId != rx && !onFunc) continue;                   // 不是给我的
 
-        if (f.can_dlc == 0 || f.can_dlc > 8) continue;
+        const std::size_t dlen = f.len;
+        if (dlen == 0 || dlen > frameBytes) continue;
 
-        std::uint8_t d[8];
-        std::memcpy (d, f.data, f.can_dlc);
-        for (std::uint8_t i = f.can_dlc; i < 8; ++i) d[i] = 0;
+        std::uint8_t d[kFdFrameBytes] = {0};
+        std::memcpy (d, f.data, dlen);
 
         // 广播来的请求必须是单帧：网关没法给"所有 ECU"发流控。
         // 收到 FF 说明对端用法错了（或者别的工具在刷）——印一句，不答。
@@ -276,7 +336,7 @@ int main (int argc, char **argv)
 
         std::vector<std::uint8_t> req;
         std::string e2;
-        const auto r = asm_.onFrame (d, req, e2, f.can_dlc);
+        const auto r = asm_.onFrame (d, req, e2, dlen);
 
         if (r == IsoTpAssembler::Result::Error)
         {
@@ -289,9 +349,9 @@ int main (int argc, char **argv)
             // 收到首帧就要立刻回流控，否则 tester 会一直停在那里
             if (kindOf (d) == FrameKind::FirstFrame)
             {
-                std::uint8_t fc[8];
-                buildFlowControl (0, 10, 0x00, fc);
-                sendFrame (fd, tx, fc);
+                std::uint8_t fc[kFdFrameBytes] = {0};
+                buildFlowControl (0, 10, 0x00, fc, frameBytes);
+                sendFrame (fd, tx, fc, frameBytes, useFd);
             }
             continue;
         }
@@ -299,19 +359,20 @@ int main (int argc, char **argv)
         // r == Complete：答它
         const auto resp = answer (req, vin, hw);
 
-        // 功能寻址的应答也必须塞进单帧（≤7 字节）。塞不进就不答——
-        // 比如读 VIN 是 20 字节，功能寻址读 VIN 在真实车上同样"没有答案"。
-        if (onFunc && resp.size () > 7)
+        // 功能寻址的应答也必须塞进单帧。经典帧 7 字节；FD 帧能到 62 字节。
+        // 比如读 VIN 是 20 字节：经典帧下"没有答案"，FD 下可以一张单帧答完。
+        const std::size_t sfMax = useFd ? (frameBytes - 2) : 7;
+        if (onFunc && resp.size () > sfMax)
         {
-            std::printf ("  ← 广播 %s，响应 %zu 字节塞不进单帧，按协议不答\n",
-                         hex (req).c_str (), resp.size ());
+            std::printf ("  ← 广播 %s，响应 %zu 字节塞不进单帧（上限 %zu），按协议不答\n",
+                         hex (req).c_str (), resp.size (), sfMax);
             asm_.reset ();
             continue;
         }
 
         std::printf ("  ← %s%s  →  %s\n", onFunc ? "[广播] " : "", hex (req).c_str (),
                      hex (resp).c_str ());
-        if (!sendUds (fd, tx, rx, resp, e2))
+        if (!sendUds (fd, tx, rx, resp, frameBytes, e2))
         {
             std::printf ("  [回不出去：%s]\n", e2.c_str ());
         }

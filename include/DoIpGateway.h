@@ -61,6 +61,7 @@ public:
         std::uint16_t       ta      = 0;
         std::uint32_t       txId    = 0;
         std::uint32_t       rxId    = 0;
+        bool                fd      = false;
         bool                open    = false;
         std::size_t         handled = 0;
         std::size_t         failed  = 0;

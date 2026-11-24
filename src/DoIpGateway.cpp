@@ -33,6 +33,8 @@ bool DiagnosticGateway::start (std::string &err)
         IsoTpConfig cfg;
         cfg.txId = e.txId;
         cfg.rxId = e.rxId;
+        // M9：这一条通道是按 FD 开还是按经典帧开，由路由表条目决定
+        cfg.frameBytes = e.fd ? kFdFrameBytes : kClassicFrameBytes;
 
         auto ch = std::unique_ptr<Channel> (new Channel (iface_, cfg, tim_));
         std::string e2;
@@ -42,7 +44,7 @@ bool DiagnosticGateway::start (std::string &err)
             err = "路由 " + (e.name.empty () ? std::string ("?") : e.name) +
                   "（TA=" + hexTa (e.logicalAddress) + "，" +
                   formatCanId (e.txId) + "/" + formatCanId (e.rxId) +
-                  "）开不起来：" + e2;
+                  (e.fd ? "，FD" : "，经典帧") + "）开不起来：" + e2;
             return false;
         }
         chans_[e.logicalAddress] = std::move (ch);
@@ -227,6 +229,7 @@ std::vector<DiagnosticGateway::ChannelStats> DiagnosticGateway::channelStats () 
         cs.ta   = e.logicalAddress;
         cs.txId = e.txId;
         cs.rxId = e.rxId;
+        cs.fd   = e.fd;
         auto it = chans_.find (e.logicalAddress);
         if (it != chans_.end () && it->second)
         {

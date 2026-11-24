@@ -78,9 +78,9 @@ public:
     const Stats &stats () const { return st_; }
 
 private:
-    bool sendFrame (const std::uint8_t data[8], std::string &err);
-    bool sendFrameAs (std::uint32_t id, const std::uint8_t data[8], std::string &err);
-    bool recvFrame (std::uint8_t data[8], std::uint8_t &dlc, int timeoutMs, std::string &err);
+    bool sendFrame (const std::uint8_t data[64], std::string &err);
+    bool sendFrameAs (std::uint32_t id, const std::uint8_t data[64], std::string &err);
+    bool recvFrame (std::uint8_t data[64], std::size_t &len, int timeoutMs, std::string &err);
     bool waitFlowControl (FlowControl &fc, std::string &err);
     // 把缓冲区里已经躺着的旧帧先清掉（见 .cpp 里的说明：共享总线上这是必需的）
     std::size_t drainStale ();

@@ -44,6 +44,10 @@ struct RouteEntry
     std::uint32_t txId           = 0;   // 网关 → ECU：请求帧 ID
     std::uint32_t rxId           = 0;   // ECU → 网关：响应帧 ID
     std::string   name;                 // 打印/日志用，比如 "ECU_A"
+    // M9：这条通道是不是 CAN FD。为什么把它放在路由里、而不是全局开关：
+    // 同一张网关表可以后面挂"经典 CAN 的 ECU"和"FD 的 ECU"（不同网段/不同收发器），
+    // 全局开关会逼着所有通道一起改，那和真实网关的形态不符。
+    bool          fd             = false;
 };
 
 // 功能寻址：一个地址 → **一个广播 ID**（CAN 上通常是 0x7DF，29 位是 0x18DB33F1）。

@@ -1,6 +1,4 @@
 // ============================================================================
-// IsoTpClient.cpp —— M4：真 SocketCAN 上的 ISO-TP 客户端
-//
 // 一次 request 的完整节奏（按时间顺序，任何一步少"等"都会出问题）：
 //
 //   SF  →  直接发一帧                           → 等响应
@@ -81,6 +79,23 @@ bool IsoTpClient::open (std::string &err)
         close ();
         return false;
     }
+
+    // ★ M9：要用 CAN FD，必须先给 socket 打开这个开关。
+    //   不开的后果很隐蔽：FD 帧会被内核当成噪声直接丢掉（收不到），
+    //   而写 FD 帧会回 EINVAL —— 现象又是"全都超时"。
+    //   ⚠ 别用 #if defined (CAN_RAW_FD_FRAMES)：它在 linux/can/raw.h 里是**枚举成员**，
+    //     defined() 只认 #define，这样写整段会被静默编译掉，setsockopt 从来没执行过——
+    //     这正是 M9 第一次跑 e2e 时的真 bug，症状与"忘了开开关"一模一样。
+    if (cfg_.frameBytes > kClassicFrameBytes)
+    {
+        const int on = 1;
+        if (::setsockopt (fd_, SOL_CAN_RAW, CAN_RAW_FD_FRAMES, &on, sizeof (on)) < 0)
+        {
+            err = "这个网卡不支持 CAN FD（setsockopt CAN_RAW_FD_FRAMES 失败）";
+            close ();
+            return false;
+        }
+    }
     return true;
 #else
     err = "本平台没有 SocketCAN（M4 只在 Linux 上跑）";
@@ -104,16 +119,35 @@ std::uint32_t IsoTpClient::stminToMs (std::uint8_t stmin)
     return 1;                                         // 0x80..0xF0 保留，按 1ms
 }
 
-bool IsoTpClient::sendFrame (const std::uint8_t data[8], std::string &err)
+bool IsoTpClient::sendFrame (const std::uint8_t data[64], std::string &err)
 {
     return sendFrameAs (cfg_.txId, data, err);
 }
 
 // M8 顺手抽出来的：同一套"置位 + 写 socket"，但 ID 由调用方给。
 // 功能寻址要往 0x7DF 发，而 0x7DF 不是任何一条通道的 txId——只是"同一把 socket 换个目的 ID"。
-bool IsoTpClient::sendFrameAs (std::uint32_t id, const std::uint8_t data[8], std::string &err)
+bool IsoTpClient::sendFrameAs (std::uint32_t id, const std::uint8_t data[64], std::string &err)
 {
 #if HAVE_SOCKETCAN
+    // ★ M9：FD 帧和经典帧是**两个不同的结构体**，长度也不一样（72 vs 16 字节）。
+    //   写错结构体的报错是 EINVAL，现象还是"全超时"——所以这里按配置分两条路，不搞"兼容写"。
+    if (cfg_.frameBytes > kClassicFrameBytes)
+    {
+        canfd_frame f;
+        std::memset (&f, 0, sizeof (f));
+        f.can_id = idForSend (id);
+        f.len    = static_cast<std::uint8_t> (cfg_.frameBytes);
+        std::memcpy (f.data, data, cfg_.frameBytes);
+        if (::write (fd_, &f, sizeof (f)) != static_cast<ssize_t> (sizeof (f)))
+        {
+            err = "写 CAN FD 帧失败（" + formatCanId (id) + "，FD 帧长 " +
+                  std::to_string (cfg_.frameBytes) + "）";
+            return false;
+        }
+        ++st_.framesSent;
+        return true;
+    }
+
     can_frame f;
     std::memset (&f, 0, sizeof (f));
     // ★ M7：29 位 ID 必须置 CAN_EFF_FLAG，否则内核回 EINVAL，帧根本发不出去。
@@ -135,7 +169,7 @@ bool IsoTpClient::sendFrameAs (std::uint32_t id, const std::uint8_t data[8], std
 #endif
 }
 
-bool IsoTpClient::recvFrame (std::uint8_t data[8], std::uint8_t &dlc, int timeoutMs, std::string &err)
+bool IsoTpClient::recvFrame (std::uint8_t data[64], std::size_t &len, int timeoutMs, std::string &err)
 {
 #if HAVE_SOCKETCAN
     const auto deadline = std::chrono::steady_clock::now () + std::chrono::milliseconds (timeoutMs);
@@ -152,10 +186,15 @@ bool IsoTpClient::recvFrame (std::uint8_t data[8], std::uint8_t &dlc, int timeou
         p.revents = 0;
         if (::poll (&p, 1, left <= 0 ? 1 : left) <= 0) { err = "接收超时"; return false; }
 
-        can_frame f;
+        // ★ M9：用 canfd_frame 读，能同时接住两种帧。
+        //   FD socket 上经典帧只会读回 16 字节，FD 帧读回 72 字节；
+        //   而且两种结构体的前 8 字节布局一致（can_id / 长度 / flags / ...），
+        //   所以"长度"读同一个位置就行（can_dlc 与 len 都落在第 5 个字节）。
+        canfd_frame f;
         std::memset (&f, 0, sizeof (f));
         const ssize_t n = ::read (fd_, &f, sizeof (f));
-        if (n < static_cast<ssize_t> (sizeof (f))) continue;
+        if (n != static_cast<ssize_t> (sizeof (can_frame)) &&
+            n != static_cast<ssize_t> (sizeof (canfd_frame))) continue;
 
         // 只看 "ECU → tester" 这个 ID 的帧；总线是共享介质，别把别人的帧当自己的。
         // 注意用 idFromRecv 剥掉标志位：内核回的 can_id 对扩展帧带着 CAN_EFF_FLAG，
@@ -163,19 +202,19 @@ bool IsoTpClient::recvFrame (std::uint8_t data[8], std::uint8_t &dlc, int timeou
         const std::uint32_t id = idFromRecv (f.can_id);
         if (id != cfg_.rxId) continue;
 
-        // ★ DLC 不一定是 8。项目一的 ECU 单帧就不补零（7E8#027E00 只有 3 字节），
+        // ★ DLC 不一定是满帧，FD 也不是。项目一的 ECU 单帧就不补零（7E8#027E00 只有 3 字节），
         //   早期版本这里写 `if (can_dlc < 8) continue;`，结果所有短响应被当成噪声扔掉，
         //   现象是"3E 00 永远超时，而 22 F1 90 正常"（因为多帧响应的帧恰好都是 8 字节）。
-        if (f.can_dlc == 0 || f.can_dlc > 8) continue;
+        len = f.len;
+        if (len == 0 || len > cfg_.frameBytes || len > kFdFrameBytes) continue;
 
-        std::memcpy (data, f.data, f.can_dlc);
-        for (std::uint8_t i = f.can_dlc; i < 8; ++i) data[i] = 0;
-        dlc = f.can_dlc;
+        std::memcpy (data, f.data, len);
+        for (std::size_t i = len; i < kFdFrameBytes; ++i) data[i] = 0;
         ++st_.framesRecv;
         return true;
     }
 #else
-    (void) data; (void) timeoutMs; err = "没有 SocketCAN"; return false;
+    (void) data; (void) len; (void) timeoutMs; err = "没有 SocketCAN"; return false;
 #endif
 }
 
@@ -200,8 +239,8 @@ std::size_t IsoTpClient::drainStale ()
     std::size_t n = 0;
     while (true)
     {
-        std::uint8_t d[8];
-        std::uint8_t dlc = 0;
+        std::uint8_t d[kFdFrameBytes];
+        std::size_t  dlc = 0;
         std::string  e;
         if (!recvFrame (d, dlc, 0, e)) break;
         ++n;
@@ -221,8 +260,8 @@ bool IsoTpClient::waitFlowControl (FlowControl &fc, std::string &err)
         const int left = static_cast<int> (
             std::chrono::duration_cast<std::chrono::milliseconds> (deadline - now).count ());
 
-        std::uint8_t d[8];
-        std::uint8_t dlc = 0;
+        std::uint8_t d[kFdFrameBytes];
+        std::size_t  dlc = 0;
         if (!recvFrame (d, dlc, left <= 0 ? 1 : left, err)) { ++st_.timeouts; return false; }
         if (kindOf (d) != FrameKind::FlowControl)
         {
@@ -267,9 +306,10 @@ bool IsoTpClient::sendFunctional (std::uint32_t funcId,
         return false;
     }
 
-    std::uint8_t d[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    std::uint8_t d[kFdFrameBytes] = {0};
     d[0] = static_cast<std::uint8_t> (uds.size ());          // SF 的 PCI
     std::memcpy (d + 1, uds.data (), uds.size ());
+    for (std::size_t i = uds.size () + 1; i < cfg_.frameBytes; ++i) d[i] = cfg_.padByte;
 
     ++st_.funcRequests;
     return sendFrameAs (funcId, d, err);
@@ -279,8 +319,8 @@ bool IsoTpClient::recvFunctional (std::vector<std::uint8_t> &resp, int timeoutMs
 {
     resp.clear ();
 
-    std::uint8_t d[8];
-    std::uint8_t dlc = 0;
+    std::uint8_t d[kFdFrameBytes];
+    std::size_t  dlc = 0;
     if (!recvFrame (d, dlc, timeoutMs, err)) return false;
 
     const auto k = kindOf (d);
@@ -296,7 +336,7 @@ bool IsoTpClient::recvFunctional (std::vector<std::uint8_t> &resp, int timeoutMs
         return false;
     }
 
-    IsoTpAssembler asm_ (cfg_.maxMsg);
+    IsoTpAssembler asm_ (cfg_.maxMsg, cfg_.frameBytes);
     const auto r = asm_.onFrame (d, resp, err, dlc);
     if (r != IsoTpAssembler::Result::Complete)
     {
@@ -318,7 +358,7 @@ bool IsoTpClient::request (const std::vector<std::uint8_t> &uds,
     drainStale ();
 
     std::vector<std::vector<std::uint8_t>> frames;
-    if (!segmentMessage (uds, frames, err, cfg_.padByte)) return false;
+    if (!segmentMessage (uds, frames, err, cfg_.padByte, cfg_.frameBytes)) return false;
 
     // ---- 第一帧 ----
     if (!sendFrame (frames[0].data (), err)) return false;
@@ -351,12 +391,12 @@ bool IsoTpClient::request (const std::vector<std::uint8_t> &uds,
     }
 
     // ---- 收响应 ----
-    IsoTpAssembler asm_ (cfg_.maxMsg);
+    IsoTpAssembler asm_ (cfg_.maxMsg, cfg_.frameBytes);
     const auto deadline = std::chrono::steady_clock::now () + std::chrono::milliseconds (tim_.p2Ms * 2);
     while (std::chrono::steady_clock::now () < deadline)
     {
-        std::uint8_t d[8];
-        std::uint8_t dlc = 0;
+        std::uint8_t d[kFdFrameBytes];
+        std::size_t  dlc = 0;
         if (!recvFrame (d, dlc, static_cast<int> (tim_.p2Ms), err)) { ++st_.timeouts; return false; }
 
         if (kindOf (d) == FrameKind::FlowControl)
@@ -380,8 +420,8 @@ bool IsoTpClient::request (const std::vector<std::uint8_t> &uds,
         // 响应是 FF：必须回流控帧，否则 ECU 会一直停在那里
         if (kindOf (d) == FrameKind::FirstFrame)
         {
-            std::uint8_t fcData[8];
-            buildFlowControl (0, 0, cfg_.padByte, fcData);
+            std::uint8_t fcData[kFdFrameBytes];
+            buildFlowControl (0, 0, cfg_.padByte, fcData, cfg_.frameBytes);
             if (!sendFrame (fcData, err)) return false;
             ++st_.flowSent;
         }
