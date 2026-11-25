@@ -96,6 +96,10 @@ target_include_directories(entity-selftest PRIVATE include)
 add_executable(flash-selftest tests/flash_selftest.cpp)
 target_include_directories(flash-selftest PRIVATE include)
 
+# M16：会话层（0x10 / 0x27 / 0x3E / S3）—— 时间当参数传，自测不用 sleep
+add_executable(session-selftest tests/session_selftest.cpp)
+target_include_directories(session-selftest PRIVATE include)
+
 # ---- 工具 ----
 add_executable(doip-dump tools/doip_dump.cpp)
 target_link_libraries(doip-dump PRIVATE doip-codec)
@@ -135,4 +139,5 @@ add_test(NAME doip-stream    COMMAND stream-selftest)
 add_test(NAME doip-registry  COMMAND registry-selftest)
 add_test(NAME doip-entity    COMMAND entity-selftest)
 add_test(NAME doip-flash     COMMAND flash-selftest)
-set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic doip-isotp doip-route doip-pool doip-collector doip-stream doip-registry doip-entity doip-flash PROPERTIES LABELS unit)
+add_test(NAME doip-session   COMMAND session-selftest)
+set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic doip-isotp doip-route doip-pool doip-collector doip-stream doip-registry doip-entity doip-flash doip-session PROPERTIES LABELS unit)

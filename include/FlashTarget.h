@@ -27,6 +27,8 @@
 // 不重复写、只把 0x76 再回一遍。跳号（比如 1 之后来 3）才是 0x73。
 // 这是"客户端要能重试"和"镜像不能被写两遍"之间唯一可行的折中。
 // ============================================================================
+#include "UdsNrc.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -36,15 +38,7 @@
 namespace doip
 {
 
-// 0x7F 后面的否定码（只列这一节真正用到的）
-constexpr std::uint8_t kNrcGeneralReject          = 0x10;
-constexpr std::uint8_t kNrcIncorrectLength        = 0x13;  // 长度/格式不对
-constexpr std::uint8_t kNrcConditionsNotCorrect   = 0x22;  // 还没擦、状态不对
-constexpr std::uint8_t kNrcRequestSequenceError   = 0x24;  // 顺序错（没协商就传、没传完就收尾）
-constexpr std::uint8_t kNrcRequestOutOfRange      = 0x31;  // 地址/长度/参数越界
-constexpr std::uint8_t kNrcTransferDataSuspended  = 0x71;  // 超出声明的长度
-constexpr std::uint8_t kNrcGeneralProgrammingFail  = 0x72;
-constexpr std::uint8_t kNrcWrongBlockSequence     = 0x73;  // BSC 跳号
+// 0x7F 后面的否定码在 UdsNrc.h 里（M16 的会话层也要用同一批，放一个出处）
 
 // 一条请求的结论（ECU 侧）
 struct FlashReply

@@ -32,6 +32,7 @@
 // ============================================================================
 #include "CanId.h"
 #include "FlashTarget.h"
+#include "SessionGuard.h"
 #include "IsoTpStack.h"
 
 #include <linux/can.h>
@@ -215,6 +216,78 @@ bool flashService (FlashTarget &t, const std::vector<std::uint8_t> &req,
     return true;
 }
 
+// M16：会话层（0x10 / 0x27 / 0x3E）。只做物理寻址；广播上的会话请求没有意义。
+//   返回 false = "不是会话服务"，交给刷写或 M6 起的 answer()。
+bool sessionService (SessionGuard &g, const std::vector<std::uint8_t> &req,
+                     std::uint32_t nowMs, std::vector<std::uint8_t> &resp, std::string &why)
+{
+    if (req.empty ()) return false;
+
+    if (req[0] == 0x10)
+    {
+        if (req.size () < 2)
+        {
+            resp = {0x7F, 0x10, kNrcIncorrectLength};
+            why  = "0x10 连子功能字节都没有";
+            return true;
+        }
+        auto r = g.handleSessionControl (req[1], nowMs);
+        resp = r.uds; why = r.reason;
+        return true;
+    }
+    if (req[0] == 0x27)
+    {
+        if (req.size () < 2)
+        {
+            resp = {0x7F, 0x27, kNrcIncorrectLength};
+            why  = "0x27 连子功能字节都没有";
+            return true;
+        }
+        if (req[1] == 0x01)
+        {
+            auto r = g.requestSeed (nowMs);
+            resp = r.uds; why = r.reason;
+            return true;
+        }
+        if (req[1] == 0x02)
+        {
+            auto r = g.sendKey (std::vector<std::uint8_t> (req.begin () + 2, req.end ()), nowMs);
+            resp = r.uds; why = r.reason;
+            return true;
+        }
+        resp = {0x7F, 0x27, kNrcSubFunctionNotSupported};
+        why  = "0x27 的子功能只认 01 要种子 / 02 交密钥";
+        return true;
+    }
+    if (req[0] == 0x3E)
+    {
+        auto r = g.testerPresent (req.size () > 1 ? req[1] : 0x00, nowMs);
+        resp = r.uds; why = r.reason;
+        return true;
+    }
+    return false;
+}
+
+// M16：刷写门禁。只有"编程会话 + 已解锁"才放行；不放行时按标准给 0x7F / 0x33。
+bool flashGateDenied (const SessionGuard &g, const std::vector<std::uint8_t> &req,
+                      std::vector<std::uint8_t> &resp, std::string &why)
+{
+    if (req.empty ()) return false;
+    bool isFlashSid = (req[0] == 0x34 || req[0] == 0x36 || req[0] == 0x37);
+    if (!isFlashSid && req[0] == 0x31)
+    {
+        // 只挡 FF00 擦除 / FF01 校验，别的例程照旧走老 answer()（回 7F 31 31）
+        isFlashSid = req.size () >= 4 && req[1] == 0x01 &&
+                     ((req[2] == 0xFF && req[3] == 0x00) || (req[2] == 0xFF && req[3] == 0x01));
+    }
+    if (!isFlashSid) return false;
+    if (g.flashAllowed ()) return false;
+
+    auto d = g.denyFlash (req[0]);
+    resp = d.uds; why = d.reason;
+    return true;
+}
+
 std::vector<std::uint8_t> answer (const std::vector<std::uint8_t> &uds,
                                   const std::string &vin, const std::string &hw)
 {
@@ -284,6 +357,7 @@ int main (int argc, char **argv)
     // M15：刷写模式。打开之后这台 ECU 才认 0x31/0x34/0x36/0x37；
     //   不打开时它的行为与 M9 完全一致（老脚本不会因为新代码变红）。
     bool flashOn = false;
+    bool secureOn = false;              // M16：门禁（0x10 02 + 0x27 解锁后才允许刷写）
     std::uint32_t flashBlock = 34;      // 通告给客户端的一条 0x36 总长（含 0x36 + BSC）
     std::uint32_t flashMax   = 65536;   // 能收的镜像上限
 
@@ -300,6 +374,7 @@ int main (int argc, char **argv)
         else if (a == "--delay-ms" && i + 1 < argc) delayMs = std::atoi (argv[++i]);
         else if (a == "--seconds" && i + 1 < argc) seconds = std::atoi (argv[++i]);
         else if (a == "--flash")                  flashOn = true;
+        else if (a == "--secure")                 secureOn = true;
         else if (a == "--flash-block" && i + 1 < argc) flashBlock = static_cast<std::uint32_t> (std::atoi (argv[++i]));
         else if (a == "--flash-max" && i + 1 < argc)   flashMax   = static_cast<std::uint32_t> (std::atoi (argv[++i]));
         else
@@ -307,8 +382,9 @@ int main (int argc, char **argv)
             std::fprintf (stderr,
                           "用法：%s [--iface vcan0] [--rx 7A0] [--tx 7A8] [--func-rx 7DF] [--fd] "
                           "[--delay-ms 0] [--vin LSVZZ0000B7654321] [--hw HW02] [--seconds 20]\n"
-                          "          [--flash] [--flash-block 34] [--flash-max 65536]\n"
-                          "     --flash：打开 0x31 01 FF00/FF01、0x34、0x36、0x37（刷写链路，只做物理寻址）\n", argv[0]);
+                          "          [--flash] [--flash-block 34] [--flash-max 65536] [--secure]\n"
+                          "     --flash：打开 0x31 01 FF00/FF01、0x34、0x36、0x37（刷写链路，只做物理寻址）\n"
+                          "     --secure：给刷写加门禁（先 0x10 02、再 0x27 解锁；S3 超时回落默认会话）\n", argv[0]);
             return 2;
         }
     }
@@ -367,7 +443,24 @@ int main (int argc, char **argv)
                      static_cast<unsigned> (flashMax));
     }
 
+    // M16：门禁。开着 --secure 时，0x10 / 0x27 / 0x3E 由 SessionGuard 回答，
+    // 刷写四个服务只有"编程会话 + 已解锁"才放行（0x7F 会话不对 / 0x33 没解锁）。
+    std::unique_ptr<SessionGuard> guard;
+    if (secureOn)
+    {
+        guard.reset (new SessionGuard (5000, 3, 10000));
+        std::printf ("           门禁：先 0x10 02（编程会话）+ 0x27 解锁，才放行 0x31/0x34/0x36/0x37；"
+                     "S3 5000 ms 没动静回落默认会话，错 3 次锁 10000 ms\n");
+    }
+
     IsoTpAssembler asm_ (4095, frameBytes);
+    // 会话/S3 要的是"从启动到现在多少毫秒"，取一次起点做差就行
+    const auto epoch = std::chrono::steady_clock::now ();
+    const auto msNow = [&epoch] () {
+        return static_cast<std::uint32_t> (
+            std::chrono::duration_cast<std::chrono::milliseconds> (
+                std::chrono::steady_clock::now () - epoch).count ());
+    };
     const auto deadline = std::chrono::steady_clock::now () + std::chrono::seconds (seconds);
     std::size_t answered = 0;
 
@@ -430,14 +523,42 @@ int main (int argc, char **argv)
         // M10：慢 ECU 就在这里慢——它慢的只是自己那条通道，别的通道照常跑
         if (delayMs > 0) ::usleep (static_cast<useconds_t> (delayMs) * 1000);
 
+        const std::uint32_t nowMs = msNow ();
         std::vector<std::uint8_t> resp;
-        std::string flashWhy;
-        bool isFlash = false;
-        if (flash && !onFunc && flashService (*flash, req, resp, flashWhy))
+        std::string why;
+        bool handled = false;
+
+        if (guard)
         {
-            isFlash = true;
+            if (guard->tick (nowMs))
+            {
+                std::printf ("  [会话] S3 超时（%u ms 没动静）→ 回到默认会话，解锁一起清掉\n",
+                             static_cast<unsigned> (guard->s3Ms ()));
+            }
+            guard->noteActivity (nowMs);   // 任何请求都算活着，不只是 0x3E
+            if (!onFunc && sessionService (*guard, req, nowMs, resp, why))
+            {
+                handled = true;
+            }
+            if (!handled && flash && !onFunc &&
+                flashGateDenied (*guard, req, resp, why))
+            {
+                handled = true;    // 被门挡住：回了 0x7F / 0x33，下面不再走刷写
+            }
         }
-        if (!isFlash) resp = answer (req, vin, hw);
+        if (!handled && flash && !onFunc && flashService (*flash, req, resp, why))
+        {
+            handled = true;
+        }
+        if (!handled) resp = answer (req, vin, hw);
+
+        // 0x3E 80（suppressPosRsp）就是"我只要保活、别回包"：不回，但账照记
+        if (handled && resp.empty ())
+        {
+            std::printf ("  ← %s  →  （suppressPosRsp：不回包，只重置 S3）\n", hex (req).c_str ());
+            asm_.reset ();
+            continue;
+        }
 
         // 功能寻址的应答也必须塞进单帧。经典帧 7 字节；FD 帧能到 62 字节。
         // 比如读 VIN 是 20 字节：经典帧下"没有答案"，FD 下可以一张单帧答完。
@@ -452,7 +573,7 @@ int main (int argc, char **argv)
 
         std::printf ("  ← %s%s  →  %s\n", onFunc ? "[广播] " : "", hex (req).c_str (),
                      hex (resp).c_str ());
-        if (isFlash) std::printf ("     [刷写] %s\n", flashWhy.c_str ());
+        if (handled) std::printf ("     [会话/刷写] %s\n", why.c_str ());
         if (!sendUds (fd, tx, rx, resp, frameBytes, e2))
         {
             std::printf ("  [回不出去：%s]\n", e2.c_str ());
@@ -470,6 +591,18 @@ int main (int argc, char **argv)
         std::printf ("刷写：收下 %u 块，镜像 %zu 字节，CRC-32=0x%08X\n",
                      static_cast<unsigned> (flash->receipts ()), flash->image ().size (),
                      static_cast<unsigned> (flash->crc32 ()));
+    }
+    if (guard)
+    {
+        std::printf ("会话：切换 %u 次，种子 %u 次，解锁成功 %u 次 / 拒 %u 次，锁定 %u 次，"
+                     "S3 超时 %u 次，保活 %u 次\n",
+                     static_cast<unsigned> (guard->sessionChanges ()),
+                     static_cast<unsigned> (guard->seedRequests ()),
+                     static_cast<unsigned> (guard->keysAccepted ()),
+                     static_cast<unsigned> (guard->keysRejected ()),
+                     static_cast<unsigned> (guard->lockouts ()),
+                     static_cast<unsigned> (guard->s3Timeouts ()),
+                     static_cast<unsigned> (guard->testerPresents ()));
     }
     ::close (fd);
     return 0;
