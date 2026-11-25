@@ -31,6 +31,7 @@
 //   副作用很直观：22 F1 A2（200 字节）在经典帧下要 29 帧，在 FD 下只要 4 帧。
 // ============================================================================
 #include "CanId.h"
+#include "FirmwareManifest.h"
 #include "FlashTarget.h"
 #include "SessionGuard.h"
 #include "IsoTpStack.h"
@@ -177,6 +178,10 @@ bool sendUds (int fd, std::uint32_t txId, std::uint32_t rxId,
     return true;
 }
 
+// M18：验签的两本账（这一步只有 stub 用，放文件级就够；不进 FlashTarget，因为它不管验签）
+static std::uint32_t gVerifyPass = 0;
+static std::uint32_t gVerifyFail = 0;
+
 // M15：刷写服务（0x31 / 0x34 / 0x36 / 0x37）—— 只做物理寻址，不参与广播。
 //   返回 false = "这不是刷写服务"，交给 M6 起就有的 answer() 去处理。
 //   刷写是**有状态的会话**，所以它必须待在主循环里（一个 FlashTarget 跟着这台 ECU 活）。
@@ -187,12 +192,48 @@ bool flashService (FlashTarget &t, const std::vector<std::uint8_t> &req,
     FlashReply r;
     switch (req[0])
     {
-        case 0x31:   // RoutineControl：只认 0x01 启动 + FF00 擦除 / FF01 校验
+        case 0x31:   // RoutineControl：只认 0x01 启动 + FF00 擦除 / FF01 校验 / FF02 验签
         {
             if (req.size () < 4 || req[1] != 0x01) return false;
             const std::uint16_t rid = static_cast<std::uint16_t> ((req[2] << 8) | req[3]);
             if (rid == 0xFF00)      r = t.handleErase ();
             else if (rid == 0xFF01) r = t.checkIntegrity (std::vector<std::uint8_t> (req.begin () + 4, req.end ()));
+            else if (rid == 0xFF02)
+            {
+                // M18：验签。分两类错误：
+                //   格式不对（长度/magic/版本/不认识这把钥匙）→ 我这边按 NRC 回（请求本身不合法）；
+                //   内容不对（标签/长度/哈希）→ 正响应带状态 01（请求合法，是包不对）。
+                // 这两个分类别混：NRC 0x31 会让诊断仪以为"服务用错了"，而状态 01 才是"重刷一份包"。
+                const auto c = fw::verify (t.image (), std::vector<std::uint8_t> (req.begin () + 4, req.end ()));
+                if (t.image ().empty ())
+                {
+                    r.positive = false;
+                    r.uds      = {0x7F, 0x31, kNrcConditionsNotCorrect};
+                    r.reason   = "验签：还没有镜像可验（先 0x34/0x36）";
+                }
+                else
+                {
+                    std::uint8_t nrcCode = 0;
+                    if (c.verdict == fw::Verdict::BadLength) nrcCode = kNrcIncorrectLength;
+                    else if (c.verdict == fw::Verdict::BadMagic || c.verdict == fw::Verdict::UnknownKey)
+                        nrcCode = kNrcRequestOutOfRange;
+
+                    if (nrcCode != 0)
+                    {
+                        r.positive = false;
+                        r.uds      = {0x7F, 0x31, nrcCode};
+                        r.reason   = "验签：" + c.reason;
+                        ++gVerifyFail;   // 格式错也算"这次没验过"
+                    }
+                    else
+                    {
+                        r.positive = true;
+                        r.uds      = {0x71, 0x01, 0xFF, 0x02, static_cast<std::uint8_t> (c.ok () ? 0x00 : 0x01)};
+                        r.reason   = "验签：" + c.reason;
+                        if (c.ok ()) ++gVerifyPass; else ++gVerifyFail;
+                    }
+                }
+            }
             else                    return false;
             break;
         }
@@ -293,7 +334,8 @@ bool flashGateDenied (const SessionGuard &g, const std::vector<std::uint8_t> &re
     {
         // 只挡 FF00 擦除 / FF01 校验，别的例程照旧走老 answer()（回 7F 31 31）
         isFlashSid = req.size () >= 4 && req[1] == 0x01 &&
-                     ((req[2] == 0xFF && req[3] == 0x00) || (req[2] == 0xFF && req[3] == 0x01));
+                     ((req[2] == 0xFF && req[3] == 0x00) || (req[2] == 0xFF && req[3] == 0x01) ||
+                      (req[2] == 0xFF && req[3] == 0x02));
     }
     if (!isFlashSid) return false;
     if (g.flashAllowed ()) return false;
@@ -451,11 +493,13 @@ int main (int argc, char **argv)
     if (flashOn)
     {
         flash.reset (new FlashTarget (flashBlock, flashMax));
-        std::printf ("           刷写：0x31 01 FF00/FF01 + 0x34/0x36/0x37；"
+        std::printf ("           刷写：0x31 01 FF00/FF01/FF02 + 0x34/0x36/0x37；"
                      "通告块长 %u 字节（含 0x36+BSC，数据 %u），镜像上限 %u 字节\n",
                      static_cast<unsigned> (flashBlock),
                      static_cast<unsigned> (flashBlock > 2 ? flashBlock - 2 : 1),
                      static_cast<unsigned> (flashMax));
+        std::printf ("           验签：0x31 01 FF02 收 76 字节清单（DGIM + 版本 + 长度 + SHA-256 + keyId + 标签），"
+                     "认识的钥匙是 0x0001/0x0002\n");
     }
 
     // M16：门禁。开着 --secure 时，0x10 / 0x27 / 0x3E 由 SessionGuard 回答，
@@ -631,6 +675,8 @@ int main (int argc, char **argv)
         std::printf ("刷写：收下 %u 块，镜像 %zu 字节，CRC-32=0x%08X\n",
                      static_cast<unsigned> (flash->receipts ()), flash->image ().size (),
                      static_cast<unsigned> (flash->crc32 ()));
+        std::printf ("验签：通过 %u 次 / 不过 %u 次（格式错也算不过）\n",
+                     static_cast<unsigned> (gVerifyPass), static_cast<unsigned> (gVerifyFail));
     }
     if (guard)
     {
