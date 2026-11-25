@@ -31,7 +31,9 @@
 //   副作用很直观：22 F1 A2（200 字节）在经典帧下要 29 帧，在 FD 下只要 4 帧。
 // ============================================================================
 #include "CanId.h"
+#include "DidTable.h"
 #include "FirmwareManifest.h"
+#include "FlashPreconditions.h"
 #include "FlashTarget.h"
 #include "SessionGuard.h"
 #include "IsoTpStack.h"
@@ -182,10 +184,15 @@ bool sendUds (int fd, std::uint32_t txId, std::uint32_t rxId,
 static std::uint32_t gVerifyPass = 0;
 static std::uint32_t gVerifyFail = 0;
 
+// M19：前置检查的两本账（可刷 / 不可刷）。和验签一样属于"stub 的观察"，不进纯逻辑层。
+static std::uint32_t gPrecheckPass = 0;
+static std::uint32_t gPrecheckFail = 0;
+
 // M15：刷写服务（0x31 / 0x34 / 0x36 / 0x37）—— 只做物理寻址，不参与广播。
 //   返回 false = "这不是刷写服务"，交给 M6 起就有的 answer() 去处理。
 //   刷写是**有状态的会话**，所以它必须待在主循环里（一个 FlashTarget 跟着这台 ECU 活）。
 bool flashService (FlashTarget &t, const std::vector<std::uint8_t> &req,
+                   std::uint32_t batteryMv, std::uint32_t minBatteryMv,
                    std::vector<std::uint8_t> &resp, std::string &why)
 {
     if (req.empty ()) return false;
@@ -239,6 +246,15 @@ bool flashService (FlashTarget &t, const std::vector<std::uint8_t> &req,
         }
         case 0x34:
             if (req.size () < 3) return false;
+            // M19：电压不够就别开始 —— "检查过"和"检查结果被遵守"是两件事，
+            // 所以 0x34 自己也要看一眼（0x22 是"现在不能"，不是"你请求错了"）。
+            if (batteryMv < minBatteryMv)
+            {
+                resp = {0x7F, 0x34, kNrcConditionsNotCorrect};
+                why  = "0x34 被拒：电压 " + std::to_string (batteryMv) + " mV 低于门槛 " +
+                       std::to_string (minBatteryMv) + " mV，先充电再刷";
+                return true;
+            }
             r = t.requestDownload (req[1], req[2],
                                    std::vector<std::uint8_t> (req.begin () + 3, req.end ()));
             break;
@@ -324,12 +340,50 @@ bool sessionService (SessionGuard &g, const std::vector<std::uint8_t> &req,
     return false;
 }
 
+// M19：前置条件检查（0x31 01 0203）。四条全过 → 71 01 02 03 00；任何一条不过 → … 01。
+//   注意它回的是"正响应 + 状态"，不是 NRC：请求合法，答案是"不能刷"。
+bool precheckService (const SessionGuard &g, const FlashTarget &f, std::uint32_t batteryMv,
+                      const std::vector<std::uint8_t> &req,
+                      std::vector<std::uint8_t> &resp, std::string &why)
+{
+    if (req.size () < 4 || req[0] != 0x31 || req[1] != 0x01 || req[2] != 0x02 || req[3] != 0x03)
+        return false;
+
+    Preconditions p;
+    p.batteryMv          = batteryMv;
+    p.programmingSession = (g.level () == SessionGuard::kSessionProgramming);
+    p.unlocked           = g.unlocked ();
+    p.downloadActive     = f.active ();
+
+    const auto r = checkProgrammingPreconditions (p);
+    if (r.ok) ++gPrecheckPass; else ++gPrecheckFail;
+    resp = {0x71, 0x01, 0x02, 0x03, static_cast<std::uint8_t> (r.ok ? 0x00 : 0x01)};
+    why  = std::string ("前置条件：") + (r.ok ? "全部满足 → 00" : "不满足 → 01") + "（" + r.summary () + "）";
+    return true;
+}
+
+// M19：0x2E WriteDataByIdentifier。门禁由 flashGateDenied 一并挡住（同一道门）。
+bool didWriteService (DidTable &d, const std::vector<std::uint8_t> &req,
+                      std::vector<std::uint8_t> &resp, std::string &why)
+{
+    if (req.empty () || req[0] != 0x2E) return false;
+    if (req.size () < 3)
+    {
+        resp = {0x7F, 0x2E, kNrcIncorrectLength};
+        why  = "0x2E 连 DID 都没给全";
+        return true;
+    }
+    const std::uint16_t did = static_cast<std::uint16_t> ((req[1] << 8) | req[2]);
+    return d.write (did, std::vector<std::uint8_t> (req.begin () + 3, req.end ()), resp, why);
+}
+
 // M16：刷写门禁。只有"编程会话 + 已解锁"才放行；不放行时按标准给 0x7F / 0x33。
 bool flashGateDenied (const SessionGuard &g, const std::vector<std::uint8_t> &req,
                       std::vector<std::uint8_t> &resp, std::string &why)
 {
     if (req.empty ()) return false;
-    bool isFlashSid = (req[0] == 0x34 || req[0] == 0x36 || req[0] == 0x37);
+    // M19：0x2E 写指纹也归这道门管——它和刷写是同一类"会改这台 ECU"的动作
+    bool isFlashSid = (req[0] == 0x34 || req[0] == 0x36 || req[0] == 0x37 || req[0] == 0x2E);
     if (!isFlashSid && req[0] == 0x31)
     {
         // 只挡 FF00 擦除 / FF01 校验，别的例程照旧走老 answer()（回 7F 31 31）
@@ -346,9 +400,11 @@ bool flashGateDenied (const SessionGuard &g, const std::vector<std::uint8_t> &re
 }
 
 std::vector<std::uint8_t> answer (const std::vector<std::uint8_t> &uds,
-                                  const std::string &vin, const std::string &hw)
+                                  const std::string &vin, const std::string &hw,
+                                  const DidTable *dids)
 {
     std::vector<std::uint8_t> r;
+    std::string readWhy;
     if (uds.empty ()) return r;
 
     if (uds[0] == 0x3E)
@@ -377,6 +433,8 @@ std::vector<std::uint8_t> answer (const std::vector<std::uint8_t> &uds,
         }
         else if (did == 0xF186)
             r.push_back (0x02);                       // 当前会话：编程会话（和项目一取不同值）
+        else if (dids != nullptr && dids->read (did, r, readWhy))   // M19：F187/F188/F18C/F1A5/F184
+            return r;
         else
             return {0x7F, 0x22, 0x31};                // requestOutOfRange
         return r;
@@ -417,6 +475,11 @@ int main (int argc, char **argv)
     bool secureOn = false;              // M16：门禁（0x10 02 + 0x27 解锁后才允许刷写）
     std::uint32_t flashBlock = 34;      // 通告给客户端的一条 0x36 总长（含 0x36 + BSC）
     std::uint32_t flashMax   = 65536;   // 能收的镜像上限
+    // M19：能读的"身份"与电压。电压默认 12.4V（一个健康的 12V 电池静置值）。
+    std::string  partNo   = "PART-ABC1234";
+    std::string  swVer    = "SW-1.0.3";
+    std::string  serial   = "ECU-A-0007";
+    std::uint32_t batteryMv = 12400;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -434,14 +497,20 @@ int main (int argc, char **argv)
         else if (a == "--secure")                 secureOn = true;
         else if (a == "--flash-block" && i + 1 < argc) flashBlock = static_cast<std::uint32_t> (std::atoi (argv[++i]));
         else if (a == "--flash-max" && i + 1 < argc)   flashMax   = static_cast<std::uint32_t> (std::atoi (argv[++i]));
+        else if (a == "--part-no" && i + 1 < argc)     partNo     = argv[++i];
+        else if (a == "--sw-version" && i + 1 < argc)  swVer      = argv[++i];
+        else if (a == "--serial" && i + 1 < argc)      serial     = argv[++i];
+        else if (a == "--battery-mv" && i + 1 < argc)  batteryMv  = static_cast<std::uint32_t> (std::atoi (argv[++i]));
         else
         {
             std::fprintf (stderr,
                           "用法：%s [--iface vcan0] [--rx 7A0] [--tx 7A8] [--func-rx 7DF] [--fd] "
                           "[--delay-ms 0] [--vin LSVZZ0000B7654321] [--hw HW02] [--seconds 20]\n"
                           "          [--flash] [--flash-block 34] [--flash-max 65536] [--secure]\n"
+                          "          [--part-no PART-ABC1234] [--sw-version SW-1.0.3] [--serial ECU-A-0007] [--battery-mv 12400]\n"
                           "     --flash：打开 0x31 01 FF00/FF01、0x34、0x36、0x37（刷写链路，只做物理寻址）\n"
-                          "     --secure：给刷写加门禁（先 0x10 02、再 0x27 解锁；S3 超时回落默认会话）\n", argv[0]);
+                          "     --secure：给刷写加门禁（先 0x10 02、再 0x27 解锁；S3 超时回落默认会话）\n"
+                          "     --battery-mv：这台 ECU 报的电压（0x22 F1A5），低于 11500 时 0x34 会被挡\n", argv[0]);
             return 2;
         }
     }
@@ -462,6 +531,9 @@ int main (int argc, char **argv)
         std::fprintf (stderr, "VIN 必须是 17 个字符（现在是 %zu）\n", vin.size ());
         return 2;
     }
+
+    static constexpr std::uint32_t kMinBatteryMv = 11500;   // 12V 系统：低于 11.5V 不刷
+    DidTable dids (partNo, swVer, serial, 0x00000000u, batteryMv);
 
     std::string err;
     const int fd = openCan (iface, useFd, err);
@@ -512,6 +584,12 @@ int main (int argc, char **argv)
                      "S3 5000 ms 没动静回落默认会话，错 3 次锁 10000 ms\n");
         std::printf ("           复位：0x11 01 硬复位（清镜像）/ 02 点火循环 / 03 软复位（留镜像）；"
                      "默认会话也能复位，刷写中途回 0x22\n");
+        std::printf ("           身份：0x22 读 F187 零件号 / F188 软件版本 / F18C 序列号 / F1A5 电压（%u mV）/ F184 指纹；"
+                     "指纹可用 0x2E 写（要编程会话 + 解锁）\n",
+                     static_cast<unsigned> (batteryMv));
+        std::printf ("           前置：0x31 01 0203 检查能不能刷（电压 ≥ %u mV、编程会话、已解锁、不在下载中）；"
+                     "电压不够时 0x34 直接回 0x22\n",
+                     static_cast<unsigned> (kMinBatteryMv));
     }
 
     IsoTpAssembler asm_ (4095, frameBytes);
@@ -603,16 +681,26 @@ int main (int argc, char **argv)
                 handled = true;
             }
             if (!handled && flash && !onFunc &&
+                precheckService (*guard, *flash, batteryMv, req, resp, why))
+            {
+                handled = true;    // 0x31 01 0203：正响应 + 状态 00/01
+            }
+            if (!handled && flash && !onFunc &&
                 flashGateDenied (*guard, req, resp, why))
             {
                 handled = true;    // 被门挡住：回了 0x7F / 0x33，下面不再走刷写
             }
         }
-        if (!handled && flash && !onFunc && flashService (*flash, req, resp, why))
+        if (!handled && flash && !onFunc &&
+            flashService (*flash, req, batteryMv, kMinBatteryMv, resp, why))
         {
             handled = true;
         }
-        if (!handled) resp = answer (req, vin, hw);
+        if (!handled && didWriteService (dids, req, resp, why))   // M19：0x2E
+        {
+            handled = true;
+        }
+        if (!handled) resp = answer (req, vin, hw, &dids);
 
         // 0x3E 80（suppressPosRsp）就是"我只要保活、别回包"：不回，但账照记
         if (handled && resp.empty ())
@@ -677,6 +765,10 @@ int main (int argc, char **argv)
                      static_cast<unsigned> (flash->crc32 ()));
         std::printf ("验签：通过 %u 次 / 不过 %u 次（格式错也算不过）\n",
                      static_cast<unsigned> (gVerifyPass), static_cast<unsigned> (gVerifyFail));
+        std::printf ("前置：检查 %u 次 → 可刷 %u 次 / 不可刷 %u 次；指纹 0x%08X\n",
+                     static_cast<unsigned> (gPrecheckPass + gPrecheckFail),
+                     static_cast<unsigned> (gPrecheckPass), static_cast<unsigned> (gPrecheckFail),
+                     static_cast<unsigned> (dids.fingerprint ()));
     }
     if (guard)
     {

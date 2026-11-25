@@ -108,6 +108,10 @@ target_include_directories(reset-selftest PRIVATE include)
 add_executable(integrity-selftest tests/integrity_selftest.cpp)
 target_include_directories(integrity-selftest PRIVATE include)
 
+# M19：DID 表（0x22 读 / 0x2E 写）+ 刷写前置条件（电压/会话/解锁/下载中）
+add_executable(preconditions-selftest tests/preconditions_selftest.cpp)
+target_include_directories(preconditions-selftest PRIVATE include)
+
 # ---- 工具 ----
 add_executable(doip-dump tools/doip_dump.cpp)
 target_link_libraries(doip-dump PRIVATE doip-codec)
@@ -150,4 +154,5 @@ add_test(NAME doip-flash     COMMAND flash-selftest)
 add_test(NAME doip-session   COMMAND session-selftest)
 add_test(NAME doip-reset     COMMAND reset-selftest)
 add_test(NAME doip-integrity COMMAND integrity-selftest)
-set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic doip-isotp doip-route doip-pool doip-collector doip-stream doip-registry doip-entity doip-flash doip-session doip-reset doip-integrity PROPERTIES LABELS unit)
+add_test(NAME doip-precheck COMMAND preconditions-selftest)
+set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic doip-isotp doip-route doip-pool doip-collector doip-stream doip-registry doip-entity doip-flash doip-session doip-reset doip-integrity doip-precheck PROPERTIES LABELS unit)
