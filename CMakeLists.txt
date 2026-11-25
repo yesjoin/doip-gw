@@ -92,6 +92,10 @@ add_executable(entity-selftest tests/entity_selftest.cpp)
 target_link_libraries(entity-selftest PRIVATE doip-codec)
 target_include_directories(entity-selftest PRIVATE include)
 
+# M15：刷写状态机（纯逻辑：BSC 回绕、重发幂等、长度与顺序判据、CRC-32）
+add_executable(flash-selftest tests/flash_selftest.cpp)
+target_include_directories(flash-selftest PRIVATE include)
+
 # ---- 工具 ----
 add_executable(doip-dump tools/doip_dump.cpp)
 target_link_libraries(doip-dump PRIVATE doip-codec)
@@ -113,6 +117,7 @@ target_link_libraries(doip-gateway PRIVATE doip-tcp doip-isotp doip-discovery do
 # ---- M6：第二台 ECU（真 SocketCAN 节点，用来验证路由打到不同地址）----
 add_executable(stub-ecu tools/stub_ecu.cpp)
 target_link_libraries(stub-ecu PRIVATE doip-isotp Threads::Threads)
+target_include_directories(stub-ecu PRIVATE include)   # M15：FlashTarget.h
 
 # ---------------------------------------------------------------------------
 # 测试注册：ctest 一条命令跑全部
@@ -129,4 +134,5 @@ add_test(NAME doip-collector COMMAND collector-selftest)
 add_test(NAME doip-stream    COMMAND stream-selftest)
 add_test(NAME doip-registry  COMMAND registry-selftest)
 add_test(NAME doip-entity    COMMAND entity-selftest)
-set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic doip-isotp doip-route doip-pool doip-collector doip-stream doip-registry doip-entity PROPERTIES LABELS unit)
+add_test(NAME doip-flash     COMMAND flash-selftest)
+set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic doip-isotp doip-route doip-pool doip-collector doip-stream doip-registry doip-entity doip-flash PROPERTIES LABELS unit)

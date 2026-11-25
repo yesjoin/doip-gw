@@ -31,6 +31,7 @@
 //   副作用很直观：22 F1 A2（200 字节）在经典帧下要 29 帧，在 FD 下只要 4 帧。
 // ============================================================================
 #include "CanId.h"
+#include "FlashTarget.h"
 #include "IsoTpStack.h"
 
 #include <linux/can.h>
@@ -43,6 +44,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <memory>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -174,6 +176,45 @@ bool sendUds (int fd, std::uint32_t txId, std::uint32_t rxId,
     return true;
 }
 
+// M15：刷写服务（0x31 / 0x34 / 0x36 / 0x37）—— 只做物理寻址，不参与广播。
+//   返回 false = "这不是刷写服务"，交给 M6 起就有的 answer() 去处理。
+//   刷写是**有状态的会话**，所以它必须待在主循环里（一个 FlashTarget 跟着这台 ECU 活）。
+bool flashService (FlashTarget &t, const std::vector<std::uint8_t> &req,
+                   std::vector<std::uint8_t> &resp, std::string &why)
+{
+    if (req.empty ()) return false;
+    FlashReply r;
+    switch (req[0])
+    {
+        case 0x31:   // RoutineControl：只认 0x01 启动 + FF00 擦除 / FF01 校验
+        {
+            if (req.size () < 4 || req[1] != 0x01) return false;
+            const std::uint16_t rid = static_cast<std::uint16_t> ((req[2] << 8) | req[3]);
+            if (rid == 0xFF00)      r = t.handleErase ();
+            else if (rid == 0xFF01) r = t.checkIntegrity (std::vector<std::uint8_t> (req.begin () + 4, req.end ()));
+            else                    return false;
+            break;
+        }
+        case 0x34:
+            if (req.size () < 3) return false;
+            r = t.requestDownload (req[1], req[2],
+                                   std::vector<std::uint8_t> (req.begin () + 3, req.end ()));
+            break;
+        case 0x36:
+            if (req.size () < 2) return false;
+            r = t.transferData (req[1], std::vector<std::uint8_t> (req.begin () + 2, req.end ()));
+            break;
+        case 0x37:
+            r = t.requestTransferExit ();
+            break;
+        default:
+            return false;
+    }
+    resp = r.uds;
+    why  = r.reason;
+    return true;
+}
+
 std::vector<std::uint8_t> answer (const std::vector<std::uint8_t> &uds,
                                   const std::string &vin, const std::string &hw)
 {
@@ -240,6 +281,11 @@ int main (int argc, char **argv)
     std::string vin = "LSVZZ0000B7654321";
     std::string hw  = "HW02";
     int seconds = 20;
+    // M15：刷写模式。打开之后这台 ECU 才认 0x31/0x34/0x36/0x37；
+    //   不打开时它的行为与 M9 完全一致（老脚本不会因为新代码变红）。
+    bool flashOn = false;
+    std::uint32_t flashBlock = 34;      // 通告给客户端的一条 0x36 总长（含 0x36 + BSC）
+    std::uint32_t flashMax   = 65536;   // 能收的镜像上限
 
     for (int i = 1; i < argc; ++i)
     {
@@ -253,11 +299,16 @@ int main (int argc, char **argv)
         else if (a == "--fd")                     useFd = true;
         else if (a == "--delay-ms" && i + 1 < argc) delayMs = std::atoi (argv[++i]);
         else if (a == "--seconds" && i + 1 < argc) seconds = std::atoi (argv[++i]);
+        else if (a == "--flash")                  flashOn = true;
+        else if (a == "--flash-block" && i + 1 < argc) flashBlock = static_cast<std::uint32_t> (std::atoi (argv[++i]));
+        else if (a == "--flash-max" && i + 1 < argc)   flashMax   = static_cast<std::uint32_t> (std::atoi (argv[++i]));
         else
         {
             std::fprintf (stderr,
                           "用法：%s [--iface vcan0] [--rx 7A0] [--tx 7A8] [--func-rx 7DF] [--fd] "
-                          "[--delay-ms 0] [--vin LSVZZ0000B7654321] [--hw HW02] [--seconds 20]\n", argv[0]);
+                          "[--delay-ms 0] [--vin LSVZZ0000B7654321] [--hw HW02] [--seconds 20]\n"
+                          "          [--flash] [--flash-block 34] [--flash-max 65536]\n"
+                          "     --flash：打开 0x31 01 FF00/FF01、0x34、0x36、0x37（刷写链路，只做物理寻址）\n", argv[0]);
             return 2;
         }
     }
@@ -302,6 +353,18 @@ int main (int argc, char **argv)
     {
         std::printf ("           另外还听广播 %s（功能寻址，只能单帧收 / 单帧答）\n",
                      formatCanId (funcRx).c_str ());
+    }
+
+    // M15：刷写模式。状态跟着这台 ECU 活；广播来的请求不走刷写（刷写只做物理寻址）。
+    std::unique_ptr<FlashTarget> flash;
+    if (flashOn)
+    {
+        flash.reset (new FlashTarget (flashBlock, flashMax));
+        std::printf ("           刷写：0x31 01 FF00/FF01 + 0x34/0x36/0x37；"
+                     "通告块长 %u 字节（含 0x36+BSC，数据 %u），镜像上限 %u 字节\n",
+                     static_cast<unsigned> (flashBlock),
+                     static_cast<unsigned> (flashBlock > 2 ? flashBlock - 2 : 1),
+                     static_cast<unsigned> (flashMax));
     }
 
     IsoTpAssembler asm_ (4095, frameBytes);
@@ -366,7 +429,15 @@ int main (int argc, char **argv)
         // r == Complete：答它
         // M10：慢 ECU 就在这里慢——它慢的只是自己那条通道，别的通道照常跑
         if (delayMs > 0) ::usleep (static_cast<useconds_t> (delayMs) * 1000);
-        const auto resp = answer (req, vin, hw);
+
+        std::vector<std::uint8_t> resp;
+        std::string flashWhy;
+        bool isFlash = false;
+        if (flash && !onFunc && flashService (*flash, req, resp, flashWhy))
+        {
+            isFlash = true;
+        }
+        if (!isFlash) resp = answer (req, vin, hw);
 
         // 功能寻址的应答也必须塞进单帧。经典帧 7 字节；FD 帧能到 62 字节。
         // 比如读 VIN 是 20 字节：经典帧下"没有答案"，FD 下可以一张单帧答完。
@@ -381,6 +452,7 @@ int main (int argc, char **argv)
 
         std::printf ("  ← %s%s  →  %s\n", onFunc ? "[广播] " : "", hex (req).c_str (),
                      hex (resp).c_str ());
+        if (isFlash) std::printf ("     [刷写] %s\n", flashWhy.c_str ());
         if (!sendUds (fd, tx, rx, resp, frameBytes, e2))
         {
             std::printf ("  [回不出去：%s]\n", e2.c_str ());
@@ -393,6 +465,12 @@ int main (int argc, char **argv)
     }
 
     std::printf ("一共答了 %zu 条\n", answered);
+    if (flash)
+    {
+        std::printf ("刷写：收下 %u 块，镜像 %zu 字节，CRC-32=0x%08X\n",
+                     static_cast<unsigned> (flash->receipts ()), flash->image ().size (),
+                     static_cast<unsigned> (flash->crc32 ()));
+    }
     ::close (fd);
     return 0;
 }
