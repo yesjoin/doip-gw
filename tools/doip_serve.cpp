@@ -62,5 +62,9 @@ int main (int argc, char **argv)
     // M13：地址仲裁的账。0x03 = 同址冲突，0x01 = 激活名额满。
     std::printf ("地址冲突 %zu 次（0x03），激活名额已满 %zu 次（0x01）。\n",
                  srv.addressConflicts (), srv.activationCapacityRejects ());
+    // M14：这个工具只开 TCP，没有 UDP —— 所以 0x4001/0x4003 在这儿只能"记账"。
+    // 想让它们真的被答出来，用 doip-gateway（它同时开 UDP 13400）。
+    std::printf ("TCP 上收到 UDP 专属请求 %zu 次（0x4001/0x4003，本工具没有 UDP，不回答）。\n",
+                 srv.udpOnlyRejects ());
     return 0;
 }

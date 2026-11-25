@@ -107,6 +107,7 @@ int main (int argc, char **argv)
     std::vector<std::string> routeSpecs;
     std::vector<std::string> funcSpecs;
     bool stream = true;          // M12：默认流式；--no-stream 用来做 A/B 对照
+    std::uint8_t powerMode = kPowerReady;   // M14：0x4003 的答案
 
     for (int i = 1; i < argc; ++i)
     {
@@ -119,12 +120,25 @@ int main (int argc, char **argv)
         else if (a == "--route" && i + 1 < argc)    routeSpecs.push_back (argv[++i]);
         else if (a == "--func" && i + 1 < argc)     funcSpecs.push_back (argv[++i]);
         else if (a == "--no-stream")                stream = false;   // M12：退回 M11 的"攒齐再发"
+        else if (a == "--power-mode" && i + 1 < argc)
+        {
+            // M14：0 = 还没上电 / 1 = 准备好 / 2 = 能答但给不出这个信息。
+            //   留这个开关是为了能演"车没上电"—— 诊断仪问出 0x00 时该去叫技师，
+            //   这条链路本身是通的，别去怀疑网络。
+            const int m = std::atoi (argv[++i]);
+            if (m < 0 || m > 2)
+            {
+                std::fprintf (stderr, "--power-mode 只认 0 / 1 / 2，收到 %d\n", m);
+                return 2;
+            }
+            powerMode = static_cast<std::uint8_t> (m);
+        }
         else
         {
             std::fprintf (stderr,
                           "用法：%s [--iface vcan0] [--port 13400] [--seconds 20] [--stmin 10]\n"
                           "          [--vin LSVAA0000A1234567] [--route TA:TX:RX[:名字]]...\n"
-                          "          [--func 功能地址:广播ID[:名字]]... [--no-stream]\n"
+                          "          [--func 功能地址:广播ID[:名字]]... [--no-stream] [--power-mode 0|1|2]\n"
                           "      例：%s --route 0002:7E0:7E8:ECU_A --route 0003:7A0:7A8:ECU_B\n"
                           "          --func 0xE400:0x7DF:ALL\n",
                           argv[0], argv[0]);
@@ -229,10 +243,32 @@ int main (int argc, char **argv)
     {
         udpOn = true;
         udp.logger = [] (const std::string &line) { std::printf ("  [UDP] %s\n", line.c_str ()); };
+
+        // ★ M14：把 M13 的账搬到了 UDP 上。
+        //   取数方式是"现数"：cur_open_sockets 必须是这一刻的真实值。
+        //   而 srv.openSockets() 读的是原子量，UDP 线程调它不会撞上 I/O 线程改 conns_。
+        const TcpServerConfig capCfg = cfg;    // 按值带走，避免以后 cfg 改坏时指到野引用
+        udp.powerMode = PowerModeInfo{powerMode};
+        udp.entityStatus = [&srv, capCfg] () -> EntityStatusInfo
+        {
+            // 节点类型写"网关"：本实体确实把诊断往 CAN 子网转，不是只答自己。
+            const EntityStatusInfo s = entityStatusFromCounts (
+                capCfg.maxConnections, srv.openSockets (), capCfg.maxPayload, kNodeTypeGateway);
+            return s;
+        };
+
         udpThread = std::thread ([&udp, seconds] { udp.runFor (std::chrono::seconds (seconds)); });
-        std::printf ("UDP %u 车辆发现已开：VIN=%s，实体地址=0x%04X\n\n",
+        std::printf ("UDP %u 车辆发现已开：VIN=%s，实体地址=0x%04X\n",
                      static_cast<unsigned> (udp.port ()), ent.vin.c_str (),
                      static_cast<unsigned> (ent.logicalAddress));
+        // M14：把"我能被问出来什么"摆在明面上，否则 0x4001 的答案只能靠抓包猜。
+        std::printf ("实体状态（0x4001/0x4003，同在 UDP %u）：node type=网关，最大 socket %zu，"
+                     "最大载荷 %u 字节，电源模式=%s\n",
+                     static_cast<unsigned> (udp.port ()), cfg.maxConnections,
+                     static_cast<unsigned> (cfg.maxPayload),
+                     powerMode == kPowerReady ? "ready" :
+                     powerMode == kPowerNotReady ? "not ready（演车没上电）" : "not supported");
+        std::printf ("\n");
     }
     else
     {
@@ -281,7 +317,11 @@ int main (int argc, char **argv)
 
     std::printf ("\n--- 以太网侧 ---\n");
     if (udpOn)
-        std::printf ("发现：收到 %zu 条 UDP，回了 %zu 条\n", udp.datagrams (), udp.answered ());
+        std::printf ("发现：收到 %zu 条 UDP，回了 %zu 条（其中实体状态/电源模式 %zu 条）\n",
+                     udp.datagrams (), udp.answered (), udp.entityQueries ());
+    // M14：TCP 上误发 0x4001/0x4003 的次数。非 0 说明对面客户端写错了族 —— 不是网关的错。
+    std::printf ("TCP 上收到 UDP 专属请求 %zu 次（0x4001/0x4003，只记账不回答）\n",
+                 srv.udpOnlyRejects ());
     std::printf ("接入 %zu，激活 %zu，诊断请求 %zu（ACK %zu / NACK %zu）\n",
                  srv.connectionsAccepted (), srv.activationsOk (), srv.diagnosticRequests (),
                  srv.diagnosticAcks (), srv.diagnosticNacks ());

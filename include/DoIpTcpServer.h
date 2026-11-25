@@ -23,13 +23,21 @@
 //   连接级的 RoutingActivation 只管"这条 socket 里 SA 不许换人"，
 //   它管不了"两台 tester 用同一个 SA 各开一条连接"——那需要一张实体级的账
 //   （TesterRegistry：SA ↔ 连接号）。0x03 / 0x01 两个码第一次真的被用起来。
+//
+// ★ M14：这张账要能"对外被问出来"（UDP 0x4001 → 0x4002）。
+//   要点只有一个：**跨线程读状态必须走原子量。**
+//   conns_ 只有 I/O 线程在动，UDP 线程去遍历它 = 数据竞争（而且不会每次都崩，
+//   是那种"跑十遍崩一次"的 bug）。所以这里维护一个 atomic 计数，
+//   UDP 线程只读它 —— 快照可能差一条，但不可能是坏内存。
 // ============================================================================
 #include "DoIpCodec.h"
 #include "DoIpDiagnostic.h"
+#include "DoIpEntityStatus.h"   // M14：实体状态快照的类型
 #include "DoIpRouting.h"
 #include "StreamLedger.h"   // M12：边收边发的记账（纯逻辑）
 #include "TesterRegistry.h" // M13：实体级的 tester 地址仲裁（纯逻辑）
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -107,6 +115,12 @@ public:
     std::size_t addressConflicts () const { return registry_.conflicts (); }        // 0x03
     std::size_t activationCapacityRejects () const { return registry_.capacityRejects (); } // 0x01
     std::size_t activeTesters () const { return registry_.active (); }
+    // M14：现在开着几条 TCP_DATA socket（**连接数，不是激活数**）。
+    //   原子量：UDP 线程（回答 0x4001）要读它，I/O 线程要写它。
+    std::size_t openSockets () const { return openSockets_.load (); }
+    // M14：TCP 上收到"只该走 UDP"的请求的次数（0x4001 / 0x4003）。
+    //   不回答、不断开，只记账 —— 惯着它只会让不合规的客户端以为这样也行。
+    std::size_t udpOnlyRejects () const { return udpOnlyRejects_; }
 
     std::function<void (const std::string &)> logger;
 
@@ -174,6 +188,12 @@ private:
     //     放错地方的表现是"两个连接用同一个地址都激活成功"——这正是 M13 要堵的洞。
     TesterRegistry  registry_{4};     // open() 里按 cfg_.maxActivated 改上限
     std::uint64_t   nextConnId_ = 1;  // 连接号从 1 开始（0 当"没有"用，和 jobId 同一个约定）
+
+    // M14：给 UDP 线程读的"现在开着几条 socket"。
+    //   ★ 为什么不用 activeConnections()：那个函数遍历 conns_，只有 I/O 线程能调。
+    //     同一个数换个线程读，就得换个读法。
+    std::atomic<std::size_t> openSockets_{0};
+    std::size_t              udpOnlyRejects_ = 0;
 
     // M12：流式交付
     struct PendingStream

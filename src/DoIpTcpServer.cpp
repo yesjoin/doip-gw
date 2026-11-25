@@ -137,6 +137,8 @@ void DoIpTcpServer::close ()
         c.fd = -1;
     }
     conns_.clear ();
+    // M14：socket 全关了，对外公布的"当前开着几条"也要跟着归零。
+    openSockets_.store (0);
 
     if (listenFd_ >= 0)
     {
@@ -210,6 +212,9 @@ void DoIpTcpServer::acceptPending ()
         c.lastActivity = std::chrono::steady_clock::now ();
         conns_.push_back (c);
         ++accepted_;
+        // M14：开了就加一。这个数会在 0x4002 里对外公布 ——
+        //   "说的是实话"比"数得准"更重要，所以它必须和 accept/close 成对出现。
+        ++openSockets_;
         log ("接受连接（第 " + std::to_string (accepted_) + " 个）");
     }
 #endif
@@ -495,6 +500,15 @@ bool DoIpTcpServer::handleConn (Conn &c)
             log ("下游答了 " + std::to_string (resp.size ()) + " 字节 → 用 0x8001 送回 " +
                  hex4 (o.sourceAddress));
         }
+        else if (t == PayloadType::EntityStatusReq || t == PayloadType::PowerModeReq)
+        {
+            // ★ M14：0x4001 / 0x4003 标准里只许走 UDP —— 它们是"连上来之前先问清楚"，
+            //   不该依赖一条已经建好的连接。这里不回答、也不断（对面可能只是试探），
+            //   只记一笔：惯着不合规的客户端，它就不会改。
+            ++udpOnlyRejects_;
+            log (std::string ("TCP 上收到 ") + nameOf (t) +
+                 "（UDP 专属）→ 不回答；实体状态请发到 UDP 13400");
+        }
         else
         {
             log (std::string ("TCP 上收到 ") + nameOf (t) + "，M2 不处理");
@@ -644,6 +658,9 @@ void DoIpTcpServer::dropConn (Conn &c, const std::string &why)
     {
         ::close (c.fd);
         c.fd = -1;
+        // M14：关了就减一。漏这句的后果不是崩，而是 0x4002 一直报"已占 3 条"，
+        //   下一位诊断仪据此以为实体很忙 —— 和 M13 的地址泄漏一样：不报错，只是账不对。
+        --openSockets_;
     }
     // M10：断开时在途请求要作废。
     //   不作废的话，这条结果会留在交卷台上，等下一个诊断仪来"接住"它——

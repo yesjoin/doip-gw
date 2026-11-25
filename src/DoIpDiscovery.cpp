@@ -21,6 +21,7 @@
 #endif
 
 #include <cstring>
+#include <utility>   // std::move
 
 namespace doip
 {
@@ -246,10 +247,31 @@ void UdpDiscoveryServer::runFor (std::chrono::milliseconds dur)
             continue;
         }
 
-        DiscoveryReply rep = respondTo (req, cfg_);
+        // ★ M14：同一个 UDP socket 上住着两类请求，按载荷类型分派。
+        //   顺序是"先状态、后发现"：两者的类型集合不相交，先看更具体的那一类，
+        //   日志里就能写清楚"这条是问能力的，不是问 VIN 的"。
+        DiscoveryReply rep;
+        const PayloadType t = toType (req.header.payloadType);
+
+        if (entityStatus &&
+            (t == PayloadType::EntityStatusReq || t == PayloadType::PowerModeReq))
+        {
+            ++entityQueries_;
+            // 现取快照：cur_open_sockets 是活的，缓存就会过时
+            const EntityStatusInfo info = entityStatus ();
+            EntityReply er = respondToEntityQuery (req, info, powerMode);
+            rep.replied = er.replied;
+            rep.bytes   = std::move (er.bytes);
+            rep.reason  = er.reason;
+        }
+        else
+        {
+            rep = respondTo (req, cfg_);
+        }
+
         if (logger)
         {
-            logger (std::string ("收到 ") + nameOf (toType (req.header.payloadType)) +
+            logger (std::string ("收到 ") + nameOf (t) +
                     "（" + std::to_string (req.payload.size ()) + " 字节载荷）→ " + rep.reason);
         }
 

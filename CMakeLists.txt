@@ -86,6 +86,12 @@ target_include_directories(stream-selftest PRIVATE include)
 add_executable(registry-selftest tests/registry_selftest.cpp)
 target_include_directories(registry-selftest PRIVATE include)
 
+# M14：实体状态 / 电源模式（纯逻辑：只做 7 字节编解码和两条请求的判据）
+# 故意不链 doip-discovery：这一层就不该知道 socket 存在，自测也就不需要端口
+add_executable(entity-selftest tests/entity_selftest.cpp)
+target_link_libraries(entity-selftest PRIVATE doip-codec)
+target_include_directories(entity-selftest PRIVATE include)
+
 # ---- 工具 ----
 add_executable(doip-dump tools/doip_dump.cpp)
 target_link_libraries(doip-dump PRIVATE doip-codec)
@@ -122,4 +128,5 @@ add_test(NAME doip-pool      COMMAND pool-selftest)
 add_test(NAME doip-collector COMMAND collector-selftest)
 add_test(NAME doip-stream    COMMAND stream-selftest)
 add_test(NAME doip-registry  COMMAND registry-selftest)
-set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic doip-isotp doip-route doip-pool doip-collector doip-stream doip-registry PROPERTIES LABELS unit)
+add_test(NAME doip-entity    COMMAND entity-selftest)
+set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic doip-isotp doip-route doip-pool doip-collector doip-stream doip-registry doip-entity PROPERTIES LABELS unit)

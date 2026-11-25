@@ -81,6 +81,38 @@ static void printReply (const std::vector<std::uint8_t> &bytes, const std::strin
         for (auto b : v.gid) std::printf ("%02X", b);
         std::printf ("\n");
     }
+    else if (t == PayloadType::EntityStatusRes)
+    {
+        // M14：0x4002 的四个数 —— 每个都能在网关日志里对上账
+        EntityStatusInfo s;
+        std::string err;
+        if (!decodePayload (m.payload, s, err))
+        {
+            std::printf ("  来自 %-22s 0x4002 载荷解不开：%s\n", from.c_str (), err.c_str ());
+            return;
+        }
+        std::printf ("  来自 %-22s 0x4002 实体状态：%s\n", from.c_str (),
+                     s.nodeType == kNodeTypeGateway ? "网关（会往子网转）" : "节点（只答自己）");
+        std::printf ("  %-29s socket %u/%u 在用（连接数，不是激活数），最大载荷 %u 字节%s\n",
+                     "", static_cast<unsigned> (s.curOpenSockets),
+                     static_cast<unsigned> (s.maxOpenSockets),
+                     static_cast<unsigned> (s.maxDataSize),
+                     s.maxDataSize == 0 ? "（对面没告知）" : "");
+    }
+    else if (t == PayloadType::PowerModeRes)
+    {
+        PowerModeInfo p;
+        std::string err;
+        if (!decodePayload (m.payload, p, err))
+        {
+            std::printf ("  来自 %-22s 0x4004 载荷解不开：%s\n", from.c_str (), err.c_str ());
+            return;
+        }
+        std::printf ("  来自 %-22s 0x4004 电源模式：%s\n", from.c_str (),
+                     p.mode == kPowerReady ? "ready（能做诊断）" :
+                     p.mode == kPowerNotReady ? "not ready（车没上电/ECU 没醒，要人去叫）" :
+                                                "not supported（能答，但给不出这个信息）");
+    }
     else
     {
         std::printf ("  来自 %-22s %s\n", from.c_str (), nameOf (t));
@@ -95,6 +127,8 @@ int main (int argc, char **argv)
 {
     bool        serve     = false;
     bool        broadcast = false;
+    bool        askStatus = false;      // M14：问 0x4001
+    bool        askPower  = false;      // M14：问 0x4003
     std::uint16_t port    = 13400;
     std::string host      = "127.0.0.1";
     int         waitMs    = 1000;
@@ -113,6 +147,8 @@ int main (int argc, char **argv)
         else if (a == "--seconds" && i + 1 < argc) seconds = std::atoi (argv[++i]);
         else if (a == "--eid" && i + 1 < argc)     eidHex = argv[++i];
         else if (a == "--vin" && i + 1 < argc)     vin = argv[++i];
+        else if (a == "--status")  askStatus = true;   // M14
+        else if (a == "--power")   askPower  = true;   // M14
         else
         {
             std::fprintf (stderr, "不认识的参数：%s\n", a.c_str ());
@@ -144,6 +180,12 @@ int main (int argc, char **argv)
         for (auto b : cfg.gid) std::printf ("%02X", b);
         std::printf ("\n等 %d 秒，期间收到的请求都会打出来...\n\n", seconds);
 
+        // M14：这台"实体"也要回答 0x4001 / 0x4003。
+        //   不接的话，同一台机器上 --serve 和 doip-gateway 的行为就不一致，
+        //   拿它当参照去测网关就会得出"网关没实现"的错误结论。
+        srv.entityStatus = [] () { return entityStatusFromCounts (8, 0, kDefaultMaxPayload); };
+        srv.powerMode    = PowerModeInfo{kPowerReady};
+
         srv.logger = [] (const std::string &line) { std::printf ("  %s\n", line.c_str ()); };
         srv.runFor (std::chrono::seconds (seconds));
 
@@ -164,10 +206,18 @@ int main (int argc, char **argv)
     tv.tv_usec = (waitMs % 1000) * 1000;
     ::setsockopt (fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof (tv));
 
-    // 组请求：三种之一
+    // 组请求：三种发现请求 + 两种实体自述请求（M14），一次只发一种
     std::vector<std::uint8_t> payload;
     PayloadType type = PayloadType::VehicleIdRequest;
-    if (!eidHex.empty ())
+    if (askStatus)
+    {
+        type = PayloadType::EntityStatusReq;    // 0x4001，载荷必须 0 字节
+    }
+    else if (askPower)
+    {
+        type = PayloadType::PowerModeReq;       // 0x4003，载荷必须 0 字节
+    }
+    else if (!eidHex.empty ())
     {
         if (!hexToBytes (eidHex, payload) || payload.size () != 6)
         {
@@ -198,13 +248,13 @@ int main (int argc, char **argv)
         int on = 1;
         ::setsockopt (fd, SOL_SOCKET, SO_BROADCAST, &on, sizeof (on));
         to.sin_addr.s_addr = htonl (INADDR_BROADCAST);
-        std::printf ("向 255.255.255.255:%u 广播「有人吗」（%s）\n",
+        std::printf ("向 255.255.255.255:%u 广播「%s」\n",
                      static_cast<unsigned> (port), nameOf (type));
     }
     else
     {
         to.sin_addr.s_addr = ::inet_addr (host.c_str ());
-        std::printf ("向 %s:%u 单播「有人吗」（%s）\n", host.c_str (),
+        std::printf ("向 %s:%u 单播「%s」\n", host.c_str (),
                      static_cast<unsigned> (port), nameOf (type));
     }
 
@@ -240,10 +290,11 @@ int main (int argc, char **argv)
     if (count == 0)
     {
         std::printf ("没有任何应答。可能的原因：\n"
-                     "  ① 对面没起（先开一个 doip-discover --serve）\n"
+                     "  ① 对面没起（先开一个 doip-discover --serve 或 doip-gateway）\n"
                      "  ② 端口不对（两边 --port 要一致）\n"
                      "  ③ 用了 --broadcast，但虚拟机的 NAT 不转广播 —— 这种情况先用 127.0.0.1 单播验逻辑\n"
-                     "  ④ 带了 --eid / --vin，条件不匹配（实体选择沉默，这是对的）\n");
+                     "  ④ 带了 --eid / --vin，条件不匹配（实体选择沉默，这是对的）\n"
+                     "  ⑤ --status / --power 只有实现了 M14 的实体才答；只做发现的实体沉默也是对的\n");
         return 1;
     }
     std::printf ("共收到 %d 个应答。\n", count);

@@ -20,6 +20,7 @@
 //      所以收发必须用**同一个** socket。
 // ============================================================================
 #include "DoIpCodec.h"
+#include "DoIpEntityStatus.h"   // M14：同一个 UDP 端口上还住着 0x4001 / 0x4003
 
 #include <chrono>
 #include <cstdint>
@@ -87,9 +88,22 @@ public:
 
     std::size_t datagrams () const { return datagrams_; }   // 收到几个
     std::size_t answered () const { return answered_; }    // 回了几个
+    // M14：其中有多少条是实体状态/电源模式（和发现请求分开记账，
+    //   否则"回了 5 个"说不清是 5 次发现还是 5 次状态查询）
+    std::size_t entityQueries () const { return entityQueries_; }
 
     // 日志钩子：工具用它把每条请求打印出来（默认为空）
     std::function<void (const std::string &)> logger;
+
+    // ★ M14：实体状态的取数口。**为空 = 本实体不实现 0x4001/0x4003**（M1 的
+    //   doip-discover --serve 就留空，它只做发现）。
+    //   做成回调而不是塞一个结构体，是因为 cur_open_sockets 是**活的**：
+    //   每问一次要现数，缓存下来就必然过时。
+    //   ★ 这个回调会被 **UDP 线程**调用，而连接是 TCP 线程在管的 ——
+    //     所以网关那边只能用原子量去读，不许直接遍历别人的容器。
+    std::function<EntityStatusInfo ()> entityStatus;
+    // 0x4003 的答案。默认 ready；工具里 --power-mode 0 可以演"车还没上电"。
+    PowerModeInfo powerMode;
 
 private:
     EntityConfig cfg_;
@@ -98,6 +112,7 @@ private:
     bool stop_ = false;
     std::size_t datagrams_ = 0;
     std::size_t answered_  = 0;
+    std::size_t entityQueries_ = 0;   // M14
 };
 
 } // namespace doip
