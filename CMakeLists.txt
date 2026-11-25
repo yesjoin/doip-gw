@@ -100,6 +100,10 @@ target_include_directories(flash-selftest PRIVATE include)
 add_executable(session-selftest tests/session_selftest.cpp)
 target_include_directories(session-selftest PRIVATE include)
 
+# M17：0x11 复位 × 会话状态机 × 镜像语义（硬复位清镜像、软复位留镜像）
+add_executable(reset-selftest tests/reset_selftest.cpp)
+target_include_directories(reset-selftest PRIVATE include)
+
 # ---- 工具 ----
 add_executable(doip-dump tools/doip_dump.cpp)
 target_link_libraries(doip-dump PRIVATE doip-codec)
@@ -140,4 +144,5 @@ add_test(NAME doip-registry  COMMAND registry-selftest)
 add_test(NAME doip-entity    COMMAND entity-selftest)
 add_test(NAME doip-flash     COMMAND flash-selftest)
 add_test(NAME doip-session   COMMAND session-selftest)
-set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic doip-isotp doip-route doip-pool doip-collector doip-stream doip-registry doip-entity doip-flash doip-session PROPERTIES LABELS unit)
+add_test(NAME doip-reset     COMMAND reset-selftest)
+set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic doip-isotp doip-route doip-pool doip-collector doip-stream doip-registry doip-entity doip-flash doip-session doip-reset PROPERTIES LABELS unit)

@@ -240,9 +240,21 @@ public:
     }
 
     // ---- 观测量（日志与断言用）----
+    // M17：断电重启的软件模拟。镜像是 RAM 里的（M15 的边界），电一断就没了；
+    //   同时回到"未擦除"状态 —— 真实 ECU 重启后也必须重新擦除才能再下载。
+    //   注意 receipts_ 不重置：它是这台 ECU 这一辈子收过多少块，不是本次刷新。
+    void powerCycle ()
+    {
+        image_.clear ();
+        expectedSize_ = 0;
+        address_      = 0;
+        lastBsc_      = 0;
+        active_       = false;
+        erased_       = false;
+    }
+
     const std::vector<std::uint8_t> &image () const { return image_; }
-    std::uint32_t expectedSize () const { return expectedSize_; }
-    std::uint32_t maxBlockLength () const { return maxBlockLength_; }
+    std::uint32_t expectedSize () const { return expectedSize_; }    std::uint32_t maxBlockLength () const { return maxBlockLength_; }
     std::uint32_t payloadPerBlock () const { return maxBlockLength_ - 2; }   // 减掉 0x36 + BSC
     std::uint8_t  lastBsc () const { return lastBsc_; }
     bool          active () const { return active_; }

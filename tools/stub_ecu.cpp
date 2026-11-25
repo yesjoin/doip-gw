@@ -216,10 +216,11 @@ bool flashService (FlashTarget &t, const std::vector<std::uint8_t> &req,
     return true;
 }
 
-// M16：会话层（0x10 / 0x27 / 0x3E）。只做物理寻址；广播上的会话请求没有意义。
+// M16：会话层（0x10 / 0x27 / 0x3E）。M17 加 0x11，只做物理寻址；广播上的会话请求没有意义。
 //   返回 false = "不是会话服务"，交给刷写或 M6 起的 answer()。
 bool sessionService (SessionGuard &g, const std::vector<std::uint8_t> &req,
-                     std::uint32_t nowMs, std::vector<std::uint8_t> &resp, std::string &why)
+                     std::uint32_t nowMs, bool flashBusy,
+                     std::vector<std::uint8_t> &resp, std::string &why)
 {
     if (req.empty ()) return false;
 
@@ -262,6 +263,20 @@ bool sessionService (SessionGuard &g, const std::vector<std::uint8_t> &req,
     if (req[0] == 0x3E)
     {
         auto r = g.testerPresent (req.size () > 1 ? req[1] : 0x00, nowMs);
+        resp = r.uds; why = r.reason;
+        return true;
+    }
+    // M17：0x11 ECUReset。默认会话里也允许（它就是"恢复原样"的动作），
+    //   但"刷到一半"要挡回 0x22 —— 半截镜像当完整镜像用是变砖路径。
+    if (req[0] == 0x11)
+    {
+        if (req.size () < 2)
+        {
+            resp = {0x7F, 0x11, kNrcIncorrectLength};
+            why  = "0x11 连子功能字节都没有";
+            return true;
+        }
+        auto r = g.handleEcuReset (req[1], nowMs, flashBusy);
         resp = r.uds; why = r.reason;
         return true;
     }
@@ -451,6 +466,8 @@ int main (int argc, char **argv)
         guard.reset (new SessionGuard (5000, 3, 10000));
         std::printf ("           门禁：先 0x10 02（编程会话）+ 0x27 解锁，才放行 0x31/0x34/0x36/0x37；"
                      "S3 5000 ms 没动静回落默认会话，错 3 次锁 10000 ms\n");
+        std::printf ("           复位：0x11 01 硬复位（清镜像）/ 02 点火循环 / 03 软复位（留镜像）；"
+                     "默认会话也能复位，刷写中途回 0x22\n");
     }
 
     IsoTpAssembler asm_ (4095, frameBytes);
@@ -536,7 +553,8 @@ int main (int argc, char **argv)
                              static_cast<unsigned> (guard->s3Ms ()));
             }
             guard->noteActivity (nowMs);   // 任何请求都算活着，不只是 0x3E
-            if (!onFunc && sessionService (*guard, req, nowMs, resp, why))
+            if (!onFunc && sessionService (*guard, req, nowMs, flash && flash->active (),
+                                           resp, why))
             {
                 handled = true;
             }
@@ -582,6 +600,28 @@ int main (int argc, char **argv)
         {
             ++answered;
         }
+
+        // M17：51 xx 已经发出去了，现在才允许"复位"。
+        // 顺序在代码里是物理的：先 send，后动状态 —— 反了就永远等不到应答。
+        if (guard)
+        {
+            const std::uint8_t kind = guard->takePendingReset ();
+            if (kind)
+            {
+                const char *name = (kind == 0x01) ? "硬复位（断电重启）"
+                                 : (kind == 0x02) ? "点火循环（keyOffOn）"
+                                                  : "软复位";
+                if (kind == 0x01 && flash)
+                {
+                    flash->powerCycle ();
+                    std::printf ("     [复位] %s：镜像已清（RAM 掉电），要重新 0x31 FF00 才能再下载\n", name);
+                }
+                else
+                {
+                    std::printf ("     [复位] %s：会话/解锁/锁计数全清，镜像保留\n", name);
+                }
+            }
+        }
         asm_.reset ();
     }
 
@@ -603,6 +643,10 @@ int main (int argc, char **argv)
                      static_cast<unsigned> (guard->lockouts ()),
                      static_cast<unsigned> (guard->s3Timeouts ()),
                      static_cast<unsigned> (guard->testerPresents ()));
+        std::printf ("复位：硬 %u 次 / 点火循环 %u 次 / 软 %u 次\n",
+                     static_cast<unsigned> (guard->resetHard ()),
+                     static_cast<unsigned> (guard->resetKeyOffOn ()),
+                     static_cast<unsigned> (guard->resetSoft ()));
     }
     ::close (fd);
     return 0;

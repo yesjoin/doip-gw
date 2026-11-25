@@ -16,6 +16,11 @@
 //   ② 3 次错密钥 → 0x36 并锁 10 秒，锁定期内再来是 0x37（不是继续 0x35，也不是 0x36）；
 //   ③ S3 超时回落默认会话，且**回落也要把锁解开** —— 否则"放着不管"反而成了绕过门禁的办法。
 //
+// M17 加的第四个点（0x11 ECUReset）：
+//   ④ 复位是"先把 51 xx 发出去，再动状态"。反过来写，客户端永远收不到应答 ——
+//      它只会看到超时，然后怀疑网关。这里只负责回包与清状态，
+//      真正的"断电"由调用方 takePendingReset() 之后做（这样顺序在代码里是物理的）。
+//
 // 密钥算法（故意做得能手算）：
 //   key = (seed + 0x12345678) ^ 0xA5A5A5A5   （32 位，按位加会溢出就自然截断）
 //   真实车厂的算法是保密的（常常放在刷写包里），本项目只需要"能算、能算错、能锁"。
@@ -193,6 +198,52 @@ class SessionGuard
             return neg (0x3E, kNrcSubFunctionNotSupported, "0x3E 的子功能只认 00 / 80");
         }
 
+        // ---- 0x11 ECUReset：刷完镜像的最后一步 / 也是"弄乱了以后一键复原" ----
+        //   三个子功能：01 硬复位（断电重启）、02 点火循环（keyOffOn）、03 软复位。
+        //   这里对三者的状态处理一样（都清），差别交给调用方：
+        //   01 连镜像一起清（断电 RAM 就没了），02/03 保留镜像（软复位不动 RAM）。
+        //
+        //   顺序：先把 51 xx 交给调用方发出去，再动状态。反过来写客户端收不到应答。
+        SessionReply handleEcuReset (std::uint8_t sub, std::uint32_t nowMs, bool flashInProgress)
+        {
+            touch (nowMs);
+            if (sub != 0x01 && sub != 0x02 && sub != 0x03)
+            {
+                return neg (0x11, kNrcSubFunctionNotSupported,
+                            "0x11 的子功能只认 01 硬复位 / 02 点火循环 / 03 软复位");
+            }
+            if (flashInProgress)
+            {
+                // 0x34 之后、0x37 之前：镜像只有半截。这时候重启 = "把半截镜像当完整的用"，
+                // 真机上这是变砖的经典路径，所以先按条件不满足挡回去。
+                return neg (0x11, kNrcConditionsNotCorrect,
+                            "刷写还没收尾（0x34 之后、0x37 之前），现在复位会丢掉半截镜像");
+            }
+
+            level_          = kSessionDefault;
+            unlocked_       = false;
+            haveSeed_       = false;
+            seed_           = 0;
+            attempts_       = 0;
+            lockUntilMs_    = 0;      // 断电了锁自然没了（真实里锁计数常存 NVM，见文档边界）
+            lastActivityMs_ = nowMs;  // S3 从复位这一刻重新算
+            pendingReset_   = sub;
+            ++resets_;
+            if (sub == 0x01)      ++resetHard_;
+            else if (sub == 0x02) ++resetKeyOffOn_;
+            else                  ++resetSoft_;
+            return ok ({0x51, sub},
+                       "复位 0x" + hex2 (sub) + "：先回 51 xx，再由调用方执行（会话/解锁/锁计数全清）");
+        }
+
+        // 调用方在"51 xx 已经发出去之后"来取：非 0 = 刚才确实接受了复位，值就是子功能。
+        std::uint8_t takePendingReset ()
+        {
+            const std::uint8_t s = pendingReset_;
+            pendingReset_ = 0;
+            return s;
+        }
+
         // ---- S3 计时：ECU 主循环定期调；超时回落默认会话并把锁解开 ----
         // 返回 true = 这一拍发生了超时回落（调用方打一行日志）
         bool tick (std::uint32_t nowMs)
@@ -244,6 +295,10 @@ class SessionGuard
         std::uint32_t lockouts ()        const { return lockouts_; }
         std::uint32_t s3Timeouts ()      const { return s3Timeouts_; }
         std::uint32_t testerPresents ()  const { return testerPresents_; }
+        std::uint32_t resets ()          const { return resets_; }
+        std::uint32_t resetHard ()       const { return resetHard_; }
+        std::uint32_t resetKeyOffOn ()   const { return resetKeyOffOn_; }
+        std::uint32_t resetSoft ()       const { return resetSoft_; }
 
         bool lockActive (std::uint32_t nowMs) const
         {
@@ -336,6 +391,11 @@ class SessionGuard
         std::uint32_t lockouts_        = 0;
         std::uint32_t s3Timeouts_      = 0;
         std::uint32_t testerPresents_  = 0;
+        std::uint32_t resets_          = 0;
+        std::uint32_t resetHard_       = 0;
+        std::uint32_t resetKeyOffOn_   = 0;
+        std::uint32_t resetSoft_       = 0;
+        std::uint8_t  pendingReset_    = 0;
 };
 
 } // namespace doip
