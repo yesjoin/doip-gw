@@ -33,6 +33,7 @@
 #include "CanId.h"
 #include "DidTable.h"
 #include "FirmwareManifest.h"
+#include "FlashPolicy.h"
 #include "FlashPreconditions.h"
 #include "FlashTarget.h"
 #include "SessionGuard.h"
@@ -188,11 +189,25 @@ static std::uint32_t gVerifyFail = 0;
 static std::uint32_t gPrecheckPass = 0;
 static std::uint32_t gPrecheckFail = 0;
 
+// M20：兼容性检查的两本账（结论对 / 不对）。凭证的"用掉"由 Gate 自己记。
+static std::uint32_t gCompatPass = 0;
+static std::uint32_t gCompatFail = 0;
+
 // M15：刷写服务（0x31 / 0x34 / 0x36 / 0x37）—— 只做物理寻址，不参与广播。
 //   返回 false = "这不是刷写服务"，交给 M6 起就有的 answer() 去处理。
 //   刷写是**有状态的会话**，所以它必须待在主循环里（一个 FlashTarget 跟着这台 ECU 活）。
-bool flashService (FlashTarget &t, const std::vector<std::uint8_t> &req,
-                   std::uint32_t batteryMv, std::uint32_t minBatteryMv,
+// M20：刷写要用到的"环境"打包成一个结构，而不是继续往参数表里塞。
+//   参数超过三个就该问一句"这些是不是同一件事" —— 电压、门槛、要不要凭证、凭证在哪，
+//   确实是同一件事：这台车此刻允许刷写的条件。
+struct FlashContext
+{
+    std::uint32_t     batteryMv    = 12400;
+    std::uint32_t     minBatteryMv = 11500;
+    bool              requireCompat= false;       // 0x34 是否必须持有 0204 的凭证
+    policy::Gate     *gate         = nullptr;     // 凭证（nullptr = 这条路径不管凭证）
+};
+
+bool flashService (FlashTarget &t, const FlashContext &ctx, const std::vector<std::uint8_t> &req,
                    std::vector<std::uint8_t> &resp, std::string &why)
 {
     if (req.empty ()) return false;
@@ -203,7 +218,12 @@ bool flashService (FlashTarget &t, const std::vector<std::uint8_t> &req,
         {
             if (req.size () < 4 || req[1] != 0x01) return false;
             const std::uint16_t rid = static_cast<std::uint16_t> ((req[2] << 8) | req[3]);
-            if (rid == 0xFF00)      r = t.handleErase ();
+            if (rid == 0xFF00)
+            {
+                r = t.handleErase ();
+                // M20：擦除意味着"这一轮重来"——上一个包检查过的身份不能继续用
+                if (r.positive && ctx.gate != nullptr) ctx.gate->clear ();
+            }
             else if (rid == 0xFF01) r = t.checkIntegrity (std::vector<std::uint8_t> (req.begin () + 4, req.end ()));
             else if (rid == 0xFF02)
             {
@@ -248,12 +268,27 @@ bool flashService (FlashTarget &t, const std::vector<std::uint8_t> &req,
             if (req.size () < 3) return false;
             // M19：电压不够就别开始 —— "检查过"和"检查结果被遵守"是两件事，
             // 所以 0x34 自己也要看一眼（0x22 是"现在不能"，不是"你请求错了"）。
-            if (batteryMv < minBatteryMv)
+            if (ctx.batteryMv < ctx.minBatteryMv)
             {
                 resp = {0x7F, 0x34, kNrcConditionsNotCorrect};
-                why  = "0x34 被拒：电压 " + std::to_string (batteryMv) + " mV 低于门槛 " +
-                       std::to_string (minBatteryMv) + " mV，先充电再刷";
+                why  = "0x34 被拒：电压 " + std::to_string (ctx.batteryMv) + " mV 低于门槛 " +
+                       std::to_string (ctx.minBatteryMv) + " mV，先充电再刷";
                 return true;
+            }
+            // M20：凭证检查。开了 --require-compat 就必须先 0204 通过，而且**一次一用**：
+            //   这里 consumeOk() 成功即作废，刷完这一轮要重新检查。
+            if (ctx.requireCompat)
+            {
+                if (ctx.gate == nullptr || !ctx.gate->consumeOk ())
+                {
+                    resp = {0x7F, 0x34, kNrcConditionsNotCorrect};
+                    why  = "0x34 被拒：没有有效的兼容性凭证（" +
+                           (ctx.gate != nullptr ? ctx.gate->note () : std::string ("未配置凭证")) +
+                           "）—— 先 0x31 01 0204";
+                    return true;
+                }
+                why = "0x34 放行：兼容性凭证已用掉（" +
+                      (ctx.gate != nullptr ? ctx.gate->note () : std::string ()) + "）";
             }
             r = t.requestDownload (req[1], req[2],
                                    std::vector<std::uint8_t> (req.begin () + 3, req.end ()));
@@ -264,6 +299,8 @@ bool flashService (FlashTarget &t, const std::vector<std::uint8_t> &req,
             break;
         case 0x37:
             r = t.requestTransferExit ();
+            // M20：这一轮下载收尾，凭证也要跟着作废（下一轮重新检查）
+            if (r.positive && ctx.gate != nullptr) ctx.gate->clear ();
             break;
         default:
             return false;
@@ -338,6 +375,48 @@ bool sessionService (SessionGuard &g, const std::vector<std::uint8_t> &req,
         return true;
     }
     return false;
+}
+
+// M20：兼容性检查（0x31 01 0204）。记录 = <12 字节零件号><1–16 字节版本>。
+//   零件号是定长（和 F187 一样 12 字节），版本是**变长** —— "SW-1.10.0" 就比 "SW-1.9.0" 多一个字节。
+//   所以长度只校验下界（≥ 13），不能写死 20：写死就把 1.10.0 这类两位数段判成格式错。
+//   结构错（长度不对 / 版本号不是三段）给 NRC；内容"对不上"给正响应 01。
+//   通过之后凭证留在 Gate 里，等 0x34 取走（一次一用）。
+bool policyService (policy::Gate &g, const DidTable &d, bool allowDowngrade,
+                    const std::vector<std::uint8_t> &req,
+                    std::vector<std::uint8_t> &resp, std::string &why)
+{
+    if (req.size () < 4 || req[0] != 0x31 || req[1] != 0x01 || req[2] != 0x02 || req[3] != 0x04)
+        return false;
+
+    const std::vector<std::uint8_t> rec (req.begin () + 4, req.end ());
+    if (rec.size () < 13 || rec.size () > 12 + 16)
+    {
+        resp = {0x7F, 0x31, kNrcIncorrectLength};
+        why  = "0204 要 12 字节零件号 + 1–16 字节版本，实际 " + std::to_string (rec.size ()) + " 字节";
+        g.clear ();        // 没成立过的检查，不能留凭证
+        return true;
+    }
+
+    std::string targetPart, targetSw;
+    for (std::size_t i = 0; i < 12; ++i) targetPart.push_back (static_cast<char> (rec[i]));
+    for (std::size_t i = 12; i < rec.size (); ++i) targetSw.push_back (static_cast<char> (rec[i]));
+
+    const auto r = policy::checkIdentity (d.partNumber (), d.swVersion (),
+                                          targetPart, targetSw, allowDowngrade);
+    if (r.verdict == policy::Verdict::BadTargetVersion || r.verdict == policy::Verdict::BadCurrentVersion)
+    {
+        resp = {0x7F, 0x31, kNrcRequestOutOfRange};
+        why  = "兼容性：" + r.reason;
+        g.clear ();
+        return true;
+    }
+
+    g.set (r.ok (), r.reason);
+    if (r.ok ()) ++gCompatPass; else ++gCompatFail;
+    resp = {0x71, 0x01, 0x02, 0x04, static_cast<std::uint8_t> (r.ok () ? 0x00 : 0x01)};
+    why  = std::string ("兼容性：") + (r.ok () ? "可以刷" : "不能刷") + "（" + r.reason + "）";
+    return true;
 }
 
 // M19：前置条件检查（0x31 01 0203）。四条全过 → 71 01 02 03 00；任何一条不过 → … 01。
@@ -480,6 +559,9 @@ int main (int argc, char **argv)
     std::string  swVer    = "SW-1.0.3";
     std::string  serial   = "ECU-A-0007";
     std::uint32_t batteryMv = 12400;
+    // M20：刷写前的兼容性校验。默认关 —— 老脚本（M15–M19）不跑 0204 也能刷。
+    bool requireCompat = false;
+    bool allowDowngrade = false;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -501,6 +583,8 @@ int main (int argc, char **argv)
         else if (a == "--sw-version" && i + 1 < argc)  swVer      = argv[++i];
         else if (a == "--serial" && i + 1 < argc)      serial     = argv[++i];
         else if (a == "--battery-mv" && i + 1 < argc)  batteryMv  = static_cast<std::uint32_t> (std::atoi (argv[++i]));
+        else if (a == "--require-compat")              requireCompat = true;
+        else if (a == "--allow-downgrade")             allowDowngrade = true;
         else
         {
             std::fprintf (stderr,
@@ -510,7 +594,9 @@ int main (int argc, char **argv)
                           "          [--part-no PART-ABC1234] [--sw-version SW-1.0.3] [--serial ECU-A-0007] [--battery-mv 12400]\n"
                           "     --flash：打开 0x31 01 FF00/FF01、0x34、0x36、0x37（刷写链路，只做物理寻址）\n"
                           "     --secure：给刷写加门禁（先 0x10 02、再 0x27 解锁；S3 超时回落默认会话）\n"
-                          "     --battery-mv：这台 ECU 报的电压（0x22 F1A5），低于 11500 时 0x34 会被挡\n", argv[0]);
+                          "     --battery-mv：这台 ECU 报的电压（0x22 F1A5），低于 11500 时 0x34 会被挡\n"
+                          "     --require-compat：0x34 必须先拿到 0x31 01 0204 的凭证（一次一用）\n"
+                          "     --allow-downgrade：允许刷回比现在低的版本（默认拒）\n", argv[0]);
             return 2;
         }
     }
@@ -534,6 +620,12 @@ int main (int argc, char **argv)
 
     static constexpr std::uint32_t kMinBatteryMv = 11500;   // 12V 系统：低于 11.5V 不刷
     DidTable dids (partNo, swVer, serial, 0x00000000u, batteryMv);
+    policy::Gate policyGate;   // M20：0204 的凭证（擦除/复位/换会话/收尾都会 clear）
+    FlashContext fctx;
+    fctx.batteryMv     = batteryMv;
+    fctx.minBatteryMv  = kMinBatteryMv;
+    fctx.requireCompat = requireCompat;
+    fctx.gate          = &policyGate;
 
     std::string err;
     const int fd = openCan (iface, useFd, err);
@@ -590,6 +682,10 @@ int main (int argc, char **argv)
         std::printf ("           前置：0x31 01 0203 检查能不能刷（电压 ≥ %u mV、编程会话、已解锁、不在下载中）；"
                      "电压不够时 0x34 直接回 0x22\n",
                      static_cast<unsigned> (kMinBatteryMv));
+        std::printf ("           兼容：0x31 01 0204 报「零件号 + 目标版本」，零件号要等于 %s、版本不能低于 %s%s；"
+                     "0x34 %s\n", partNo.c_str (), swVer.c_str (),
+                     allowDowngrade ? "（allowDowngrade 已开，可降级）" : "",
+                     requireCompat ? "要凭证（一次一用）" : "不要求凭证（--require-compat 未开）");
     }
 
     IsoTpAssembler asm_ (4095, frameBytes);
@@ -673,12 +769,18 @@ int main (int argc, char **argv)
             {
                 std::printf ("  [会话] S3 超时（%u ms 没动静）→ 回到默认会话，解锁一起清掉\n",
                              static_cast<unsigned> (guard->s3Ms ()));
+                policyGate.clear ();   // M20：S3 超时和换会话一样，凭证跟着作废
             }
             guard->noteActivity (nowMs);   // 任何请求都算活着，不只是 0x3E
             if (!onFunc && sessionService (*guard, req, nowMs, flash && flash->active (),
                                            resp, why))
             {
                 handled = true;
+            }
+            if (handled && req[0] == 0x10)
+            {
+                // M20：换会话等于"换一个人来问"，上一个会话的凭证不作数
+                policyGate.clear ();
             }
             if (!handled && flash && !onFunc &&
                 precheckService (*guard, *flash, batteryMv, req, resp, why))
@@ -691,8 +793,13 @@ int main (int argc, char **argv)
                 handled = true;    // 被门挡住：回了 0x7F / 0x33，下面不再走刷写
             }
         }
+        if (!handled && !onFunc &&
+            policyService (policyGate, dids, allowDowngrade, req, resp, why))   // M20：0x31 01 0204
+        {
+            handled = true;
+        }
         if (!handled && flash && !onFunc &&
-            flashService (*flash, req, batteryMv, kMinBatteryMv, resp, why))
+            flashService (*flash, fctx, req, resp, why))
         {
             handled = true;
         }
@@ -746,11 +853,13 @@ int main (int argc, char **argv)
                 if (kind == 0x01 && flash)
                 {
                     flash->powerCycle ();
+                    policyGate.clear ();   // M20：复位之后镜像没了，凭证也没了
                     std::printf ("     [复位] %s：镜像已清（RAM 掉电），要重新 0x31 FF00 才能再下载\n", name);
                 }
                 else
                 {
                     std::printf ("     [复位] %s：会话/解锁/锁计数全清，镜像保留\n", name);
+                    policyGate.clear ();   // M20：只要真复位了，凭证就得重拿（被拒的不动）
                 }
             }
         }
@@ -769,6 +878,10 @@ int main (int argc, char **argv)
                      static_cast<unsigned> (gPrecheckPass + gPrecheckFail),
                      static_cast<unsigned> (gPrecheckPass), static_cast<unsigned> (gPrecheckFail),
                      static_cast<unsigned> (dids.fingerprint ()));
+        std::printf ("兼容：检查 %u 次 → 通过 %u 次 / 不通过 %u 次；凭证用掉 %u 次；当前 %s\n",
+                     static_cast<unsigned> (gCompatPass + gCompatFail),
+                     static_cast<unsigned> (gCompatPass), static_cast<unsigned> (gCompatFail),
+                     static_cast<unsigned> (policyGate.consumes ()), policyGate.note ().c_str ());
     }
     if (guard)
     {

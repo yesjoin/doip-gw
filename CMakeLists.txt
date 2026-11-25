@@ -112,6 +112,10 @@ target_include_directories(integrity-selftest PRIVATE include)
 add_executable(preconditions-selftest tests/preconditions_selftest.cpp)
 target_include_directories(preconditions-selftest PRIVATE include)
 
+# M20：版本比较（数值不按字符串）+ 零件号/版本比对 + 凭证（一次一用）
+add_executable(policy-selftest tests/policy_selftest.cpp)
+target_include_directories(policy-selftest PRIVATE include)
+
 # ---- 工具 ----
 add_executable(doip-dump tools/doip_dump.cpp)
 target_link_libraries(doip-dump PRIVATE doip-codec)
@@ -155,4 +159,5 @@ add_test(NAME doip-session   COMMAND session-selftest)
 add_test(NAME doip-reset     COMMAND reset-selftest)
 add_test(NAME doip-integrity COMMAND integrity-selftest)
 add_test(NAME doip-precheck COMMAND preconditions-selftest)
-set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic doip-isotp doip-route doip-pool doip-collector doip-stream doip-registry doip-entity doip-flash doip-session doip-reset doip-integrity doip-precheck PROPERTIES LABELS unit)
+add_test(NAME doip-policy COMMAND policy-selftest)
+set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic doip-isotp doip-route doip-pool doip-collector doip-stream doip-registry doip-entity doip-flash doip-session doip-reset doip-integrity doip-precheck doip-policy PROPERTIES LABELS unit)
