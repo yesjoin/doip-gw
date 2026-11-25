@@ -59,5 +59,8 @@ int main (int argc, char **argv)
                  srv.connectionsAccepted (), srv.activationsOk (), srv.aliveCheckTimeouts ());
     std::printf ("诊断请求 %zu 条：ACK %zu，NACK %zu。\n",
                  srv.diagnosticRequests (), srv.diagnosticAcks (), srv.diagnosticNacks ());
+    // M13：地址仲裁的账。0x03 = 同址冲突，0x01 = 激活名额满。
+    std::printf ("地址冲突 %zu 次（0x03），激活名额已满 %zu 次（0x01）。\n",
+                 srv.addressConflicts (), srv.activationCapacityRejects ());
     return 0;
 }

@@ -61,6 +61,10 @@ bool DoIpTcpServer::open (std::string &err)
 #if DOIP_HAS_POSIX
     close ();
 
+    // M13：把"能同时激活几台 tester"配进账本。
+    // 它和 maxConnections 是两个数：连接可以挂着等，激活名额才是稀缺资源。
+    registry_.setMaxActive (cfg_.maxActivated);
+
     listenFd_ = ::socket (AF_INET, SOCK_STREAM, 0);
     if (listenFd_ < 0)
     {
@@ -200,6 +204,7 @@ void DoIpTcpServer::acceptPending ()
         }
 
         Conn c;
+        c.id           = nextConnId_++;
         c.fd           = fd;
         c.routing      = RoutingActivation (cfg_.entityAddress);
         c.lastActivity = std::chrono::steady_clock::now ();
@@ -269,6 +274,32 @@ bool DoIpTcpServer::handleConn (Conn &c)
             }
 
             ActivationOutcome out = c.routing.handle (req);
+
+            // ---- M13：连接级判据过了，再做实体级仲裁 ----
+            //
+            // 顺序不能反：0x02（本 socket 换人）、0x06（类型不支持）、0x00（地址非法）
+            // 都是"你这条连接自己有问题"，而 0x03 / 0x01 是"实体这边的情况"。
+            // 先把自己判清楚，现场看到 0x03 才知道该去找另一台诊断仪，而不是怀疑自己写错。
+            //
+            // 实体级否决时，必须把连接级刚置上的激活状态**撤回去**。
+            // reset() 是唯一入口（M2 定的规矩），这里也一样，不许直接动 activated_。
+            if (out.activated && out.code == static_cast<std::uint8_t> (ActivationResponseCode::Success))
+            {
+                TesterRegistry::Result reg = registry_.tryRegister (req.sourceAddress, c.id);
+                if (!reg.ok)
+                {
+                    c.routing.reset ();
+                    out.activated = false;
+                    out.code      = reg.code;
+                    out.reason    = reg.reason;
+                }
+                else
+                {
+                    out.reason = "源地址 " + hex4 (req.sourceAddress) + " 路由激活成功" +
+                                 "（实体已登记 " + std::to_string (registry_.active ()) + "/" +
+                                 std::to_string (registry_.maxActive ()) + "）";
+                }
+            }
 
             RoutingActivationResponse res;
             res.testerAddress = req.sourceAddress;      // 回谁就问谁
@@ -631,6 +662,9 @@ void DoIpTcpServer::dropConn (Conn &c, const std::string &why)
     // 漏了这一句，"TCP 断了但激活状态还在"，重连就能直接发诊断 ——
     // 看起来更顺，实际是权限被继承。
     c.routing.reset ();
+    // M13：实体级的地址也要还回去，否则这个地址永远"在别人的名下"，
+    // 下一位 tester 拿同一个地址会一直吃 0x03 —— 地址泄漏比内存泄漏更难查。
+    registry_.release (c.id);
     c.in.clear ();
     c.aliveSent = false;
     log ("关闭连接：" + why);

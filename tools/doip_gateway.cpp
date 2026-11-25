@@ -179,6 +179,9 @@ int main (int argc, char **argv)
     cfg.port             = port;
     cfg.entityAddress    = 0x0001;
     cfg.maxConnections   = 8;                       // 网关要比单 ECU 接得住更多 tester
+    // M13：连接与激活分开计。8 条 TCP 挂着等，但只有 4 台能同时激活 ——
+    // 第 5 台会拿到 0x01，而不是连 TCP 都连不上（那样这个码永远出不来）。
+    cfg.maxActivated     = 4;
     cfg.idleBeforeAliveCheck = std::chrono::milliseconds (3000);
     cfg.aliveCheckTimeout    = std::chrono::milliseconds (1500);
 
@@ -194,6 +197,9 @@ int main (int argc, char **argv)
 
     std::printf ("DoIP→ISO-TP 网关：TCP %u ↔ %s，跑 %d 秒\n", static_cast<unsigned> (srv.port ()),
                  iface.c_str (), seconds);
+    // M13：把两个容量摆在明面上，否则 0x01 出现时没人知道"满"的是哪个数。
+    std::printf ("tester 地址仲裁：最多同时激活 %zu 台（连接上限 %zu）\n",
+                 cfg.maxActivated, cfg.maxConnections);
     std::printf ("路由表（%zu 条）：\n", table.size ());
     for (const auto &e : table.entries ())
     {
@@ -284,6 +290,11 @@ int main (int argc, char **argv)
                  srv.orphanResults (), srv.busyRejects ());
     std::printf ("作废 %zu 条（连接断开时还在途，结果不转交给下一台诊断仪）\n",
                  gw.abandonedJobs ());
+    // M13：两个码第一次有了账。0x03 是"同址冲突"，0x01 是"名额满了"——
+    // 前者要去找另一台诊断仪，后者要扩容，现场看一眼日志就知道该动哪边。
+    std::printf ("地址冲突 %zu 次（0x03：同一 SA 已在别的连接上激活），"
+                 "激活名额已满 %zu 次（0x01）\n",
+                 srv.addressConflicts (), srv.activationCapacityRejects ());
     if (stream)
     {
         std::printf ("流式交付 %zu 条（收到就转，不等一轮收齐；同一 job 交卷时只补差额）；"

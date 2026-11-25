@@ -18,11 +18,17 @@
 //   ② 结果从哪来：`asyncTake` 每轮 poll 之后被调用一次，把已完成的结果交进来；
 //      服务器只按 jobId 找连接，找不到（连接已断）就**丢弃并记账**，绝不转给下一个诊断仪。
 //      这条规矩和 M5 的"迟到帧丢弃"是同一件事的以太网版本。
+//
+// ★ M13：激活不只是"这条连接的事"。
+//   连接级的 RoutingActivation 只管"这条 socket 里 SA 不许换人"，
+//   它管不了"两台 tester 用同一个 SA 各开一条连接"——那需要一张实体级的账
+//   （TesterRegistry：SA ↔ 连接号）。0x03 / 0x01 两个码第一次真的被用起来。
 // ============================================================================
 #include "DoIpCodec.h"
 #include "DoIpDiagnostic.h"
 #include "DoIpRouting.h"
 #include "StreamLedger.h"   // M12：边收边发的记账（纯逻辑）
+#include "TesterRegistry.h" // M13：实体级的 tester 地址仲裁（纯逻辑）
 
 #include <chrono>
 #include <cstdint>
@@ -38,7 +44,12 @@ struct TcpServerConfig
 {
     std::uint16_t port             = 13400;   // 0 = 系统分配（自测用）
     std::uint16_t entityAddress    = 0x0001;
-    std::size_t   maxConnections   = 4;
+    // M13：两个数分开。**连接 ≠ 激活**：
+    //   maxConnections 是"能挂住几个 TCP socket"，maxActivated 是"同时能给几台 tester 激活"。
+    //   M13 之前它们是同一个数（4），于是 0x01 "socket 都占满了" 这个码永远出不来 ——
+    //   第 5 个客户端连 TCP 都连不上，根本走不到路由激活那一步。
+    std::size_t   maxConnections   = 8;
+    std::size_t   maxActivated     = 4;
     std::uint32_t maxPayload       = kDefaultMaxPayload;
     std::size_t   maxUds           = 512;     // 单条诊断的 UDS 上限（超过 → 0x8003 0x04）
 
@@ -92,6 +103,10 @@ public:
     std::size_t streamedReplies () const { return streamed_; }
     // M12：流式送达时连接已经断了（过期答案，丢弃并记账）
     std::size_t streamDropped () const { return streamDropped_; }
+    // M13：实体级仲裁的两个观测量。**它们只涨不回退**，退场日志用它们说话。
+    std::size_t addressConflicts () const { return registry_.conflicts (); }        // 0x03
+    std::size_t activationCapacityRejects () const { return registry_.capacityRejects (); } // 0x01
+    std::size_t activeTesters () const { return registry_.active (); }
 
     std::function<void (const std::string &)> logger;
 
@@ -117,6 +132,7 @@ public:
 private:
     struct Conn
     {
+        std::uint64_t                            id = 0;      // M13：连接号（实体级仲裁用它认人，不用 fd：fd 会被复用）
         int                                      fd = -1;
         std::vector<std::uint8_t>                in;          // 累积缓冲：半包就攒着
         RoutingActivation                        routing;
@@ -152,6 +168,12 @@ private:
     std::size_t     diagReplies_  = 0;
     std::size_t     orphanResults_ = 0;
     std::size_t     busyRejects_   = 0;
+
+    // M13：实体级的 tester 地址仲裁。
+    //   ★ 它不是连接状态，所以必须放在服务器上，而不是每条 Conn 里。
+    //     放错地方的表现是"两个连接用同一个地址都激活成功"——这正是 M13 要堵的洞。
+    TesterRegistry  registry_{4};     // open() 里按 cfg_.maxActivated 改上限
+    std::uint64_t   nextConnId_ = 1;  // 连接号从 1 开始（0 当"没有"用，和 jobId 同一个约定）
 
     // M12：流式交付
     struct PendingStream
