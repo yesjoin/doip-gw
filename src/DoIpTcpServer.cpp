@@ -280,6 +280,41 @@ bool DoIpTcpServer::handleConn (Conn &c)
 
             ActivationOutcome out = c.routing.handle (req);
 
+            // ---- M27：先验票，再谈别的 ----
+            //
+            // 顺序：连接级（handle 里已经做完）→ 凭据 → 实体级（M13 的地址仲裁）。
+            // 为什么票要在地址仲裁之前：0x03 说的是"两台都到场了"，
+            // 而票不对说的是"这一台根本不该到场"—— 后者更根本，先挡。
+            //
+            // 挡回去时照样必须走 reset()：handle() 已经把这条 socket 置成激活态了，
+            // 只回一个 0x04 而不撤销，就是"拒了但门还开着" —— M13 踩过的同一个坑。
+            //
+            // 注意 7 字节的 0x0005 变体（老客户端）没有 OEM 字段 → oemSpecific 是 0，
+            // 只要网关开了票，它必然被挡。这不是 bug：没带票就是没带票。
+            //
+            // ★ 通过时**不能**直接往 out.reason 后面接 —— 紧接着的 M13 登记分支会
+            //   `out.reason = "…激活成功…"` 整句覆盖（M26 那句"流水"也是这么被吃掉的）。
+            //   所以先把结论存在 authNote 里，等所有仲裁都做完再拼上去。
+            std::string authNote;
+            if (cfg_.authRequired && out.activated &&
+                out.code == static_cast<std::uint8_t> (ActivationResponseCode::Success))
+            {
+                if (auth::tokenMatches (cfg_.authKey, req.sourceAddress, req.oemSpecific))
+                {
+                    ++authPasses_;
+                    authNote = "，凭据已验证（token " + auth::tokenText (req.oemSpecific) + "）";
+                }
+                else
+                {
+                    c.routing.reset ();
+                    out.activated = false;
+                    out.code      = static_cast<std::uint8_t> (ActivationResponseCode::MissingAuthentication);
+                    out.reason    = "凭据不对（应为 SA " + hex4 (req.sourceAddress) +
+                                    " 的 HMAC 头 4 字节，收到 " + auth::tokenText (req.oemSpecific) + "）";
+                    ++authRejects_;
+                }
+            }
+
             // ---- M13：连接级判据过了，再做实体级仲裁 ----
             //
             // 顺序不能反：0x02（本 socket 换人）、0x06（类型不支持）、0x00（地址非法）
@@ -302,7 +337,7 @@ bool DoIpTcpServer::handleConn (Conn &c)
                 {
                     out.reason = "源地址 " + hex4 (req.sourceAddress) + " 路由激活成功" +
                                  "（实体已登记 " + std::to_string (registry_.active ()) + "/" +
-                                 std::to_string (registry_.maxActive ()) + "）";
+                                 std::to_string (registry_.maxActive ()) + "）" + authNote;
                 }
             }
 

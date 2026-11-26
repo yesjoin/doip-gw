@@ -34,6 +34,7 @@
 #include "DoIpDiagnostic.h"
 #include "DoIpEntityStatus.h"   // M14：实体状态快照的类型
 #include "DoIpRouting.h"
+#include "ActivationAuth.h"     // M27：激活凭据（HMAC token）
 #include "StreamLedger.h"   // M12：边收边发的记账（纯逻辑）
 #include "TesterRegistry.h" // M13：实体级的 tester 地址仲裁（纯逻辑）
 
@@ -60,6 +61,13 @@ struct TcpServerConfig
     std::size_t   maxActivated     = 4;
     std::uint32_t maxPayload       = kDefaultMaxPayload;
     std::size_t   maxUds           = 512;     // 单条诊断的 UDS 上限（超过 → 0x8003 0x04）
+
+    // ---- M27：入场券 ----
+    // 不给 --tester-key 时 authRequired = false，行为与 M26 完全一致（开发和教学默认）。
+    // 给了就等于"这一车上所有要动表的操作，先证明你是谁"。
+    // token 装在 0x0005 的 OEM 4 字节里，绑源地址（见 ActivationAuth.h）。
+    auth::Secret  authKey{};
+    bool          authRequired = false;
 
     // M6：谁能当诊断目标。为空 = 只认 entityAddress 自己（M3 语义）。
     std::function<bool (std::uint16_t)> targetKnown;
@@ -114,6 +122,9 @@ public:
     // M13：实体级仲裁的两个观测量。**它们只涨不回退**，退场日志用它们说话。
     std::size_t addressConflicts () const { return registry_.conflicts (); }        // 0x03
     std::size_t activationCapacityRejects () const { return registry_.capacityRejects (); } // 0x01
+    // M27：凭据的两本账。通过的次数就是"有过几个能证明自己的人"。
+    std::size_t authPasses () const { return authPasses_; }
+    std::size_t authRejects () const { return authRejects_; }
     std::size_t activeTesters () const { return registry_.active (); }
     // M14：现在开着几条 TCP_DATA socket（**连接数，不是激活数**）。
     //   原子量：UDP 线程（回答 0x4001）要读它，I/O 线程要写它。
@@ -182,6 +193,8 @@ private:
     std::size_t     diagReplies_  = 0;
     std::size_t     orphanResults_ = 0;
     std::size_t     busyRejects_   = 0;
+    std::size_t     authPasses_    = 0;   // M27：凭据对上的次数
+    std::size_t     authRejects_   = 0;   // M27：凭据不对被挡回去的次数
 
     // M13：实体级的 tester 地址仲裁。
     //   ★ 它不是连接状态，所以必须放在服务器上，而不是每条 Conn 里。

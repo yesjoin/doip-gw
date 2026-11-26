@@ -14,6 +14,7 @@
 #include "DoIpGateway.h"
 #include "DoIpTcpServer.h"
 #include "RouteTable.h"
+#include "ActivationAuth.h"   // M27：--tester-key 的解析与 token
 
 #include <chrono>
 #include <cstdio>
@@ -108,6 +109,8 @@ int main (int argc, char **argv)
     std::vector<std::string> funcSpecs;
     bool stream = true;          // M12：默认流式；--no-stream 用来做 A/B 对照
     std::uint8_t powerMode = kPowerReady;   // M14：0x4003 的答案
+    auth::Secret testerKey{};    // M27：预共享密钥；没给就是"不验票"
+    bool haveKey = false;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -120,6 +123,19 @@ int main (int argc, char **argv)
         else if (a == "--route" && i + 1 < argc)    routeSpecs.push_back (argv[++i]);
         else if (a == "--func" && i + 1 < argc)     funcSpecs.push_back (argv[++i]);
         else if (a == "--no-stream")                stream = false;   // M12：退回 M11 的"攒齐再发"
+        else if (a == "--tester-key" && i + 1 < argc)
+        {
+            // M27：64 位十六进制 = 32 字节预共享密钥。
+            //   长度不对或里面有非 hex 字符，直接退出 —— 密钥这种东西不能"猜一个差不多的"。
+            const std::string hex = argv[++i];
+            if (!auth::parseSecret (hex, testerKey))
+            {
+                std::fprintf (stderr, "--tester-key 要 64 位十六进制（32 字节），收到 %zu 个字符\n",
+                             hex.size ());
+                return 2;
+            }
+            haveKey = true;
+        }
         else if (a == "--power-mode" && i + 1 < argc)
         {
             // M14：0 = 还没上电 / 1 = 准备好 / 2 = 能答但给不出这个信息。
@@ -139,6 +155,7 @@ int main (int argc, char **argv)
                           "用法：%s [--iface vcan0] [--port 13400] [--seconds 20] [--stmin 10]\n"
                           "          [--vin LSVAA0000A1234567] [--route TA:TX:RX[:名字]]...\n"
                           "          [--func 功能地址:广播ID[:名字]]... [--no-stream] [--power-mode 0|1|2]\n"
+                          "          [--tester-key 64位十六进制]\n"
                           "      例：%s --route 0002:7E0:7E8:ECU_A --route 0003:7A0:7A8:ECU_B\n"
                           "          --func 0xE400:0x7DF:ALL\n",
                           argv[0], argv[0]);
@@ -199,6 +216,14 @@ int main (int argc, char **argv)
     cfg.idleBeforeAliveCheck = std::chrono::milliseconds (3000);
     cfg.aliveCheckTimeout    = std::chrono::milliseconds (1500);
 
+    // M27：给了密钥就开票。没给 = 维持 M26 的行为（谁都能激活），
+    //   因为本项目的大量 e2e 都在"不验票"的前提下跑；要验票必须显式说一声。
+    if (haveKey)
+    {
+        cfg.authKey      = testerKey;
+        cfg.authRequired = true;
+    }
+
     // 谁能当诊断目标 = 物理表里有谁 + 功能表里有谁。都不在的 TA 一律 0x8003 0x03。
     cfg.targetKnown = [&table] (std::uint16_t ta) { return table.reachable (ta); };
 
@@ -214,6 +239,13 @@ int main (int argc, char **argv)
     // M13：把两个容量摆在明面上，否则 0x01 出现时没人知道"满"的是哪个数。
     std::printf ("tester 地址仲裁：最多同时激活 %zu 台（连接上限 %zu）\n",
                  cfg.maxActivated, cfg.maxConnections);
+    // M27：把"门关没关"摆在明面上。没开票的网关在日志里必须看得出来，
+    //   否则现场会以为"已经验过了"，其实一直在裸奔。
+    if (cfg.authRequired)
+        std::printf ("路由激活凭据：开（0x0005 的 OEM 4 字节须等于 HMAC-SHA256 头 4 字节，绑 SA）\n"
+                     "  没带票/票不对 → 0x04 缺认证；*挡住了不等于安全* —— 4 字节静态票可重放，真车靠 TLS\n");
+    else
+        std::printf ("路由激活凭据：关（谁都能激活，教学默认；加 --tester-key 打开）\n");
     std::printf ("路由表（%zu 条）：\n", table.size ());
     for (const auto &e : table.entries ())
     {
@@ -335,6 +367,10 @@ int main (int argc, char **argv)
     std::printf ("地址冲突 %zu 次（0x03：同一 SA 已在别的连接上激活），"
                  "激活名额已满 %zu 次（0x01）\n",
                  srv.addressConflicts (), srv.activationCapacityRejects ());
+    // M27：凭据的两本账。通过的次数 = 有几个"能证明自己是谁"的诊断仪。
+    if (cfg.authRequired)
+        std::printf ("凭据：通过 %zu 次，挡回 %zu 次（0x04）\n",
+                     srv.authPasses (), srv.authRejects ());
     if (stream)
     {
         std::printf ("流式交付 %zu 条（收到就转，不等一轮收齐；同一 job 交卷时只补差额）；"
