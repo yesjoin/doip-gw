@@ -127,13 +127,14 @@ int main ()
                "C7 一句话里带版本和指纹");
     }
 
-    // ---- D. 版本落盘：v2 写、v1 也读 ----
+    // ---- D. 版本落盘：写 v3、v2 和 v1 也读 ----
     {
         keys::KeyRing r = ringOf ({{0x0001, keys::State::Active}, {0x0002, keys::State::Revoked}});
-        const std::string v2 = keys::encode (r, 9);
-        CHECK (v2.compare (0, 14, "DOIPKEYRING 2\n") == 0, "D1 写出来是 v2");
-        CHECK (v2.compare (14, 9, "VER 0009\n") == 0, "D2 VER 行带世代（4 hex）");
-        const keys::LoadResult back = keys::decode (v2);
+        const std::string v3 = keys::encode (r, 9);
+        CHECK (v3.compare (0, 14, "DOIPKEYRING 3\n") == 0, "D1 写出来是 v3（M26 起盘上只写新格式）");
+        CHECK (v3.compare (14, 9, "VER 0009\n") == 0, "D2 VER 行带世代（4 hex）");
+        CHECK (v3.compare (23, 10, "BOOT 0000\n") == 0, "D2b BOOT 行跟着世代一起写（没给上电序就是 0）");
+        const keys::LoadResult back = keys::decode (v3);
         CHECK (back.status == keys::LoadStatus::Ok && back.generation == 9, "D3 读回世代 9");
         CHECK (back.ring.dump () == r.dump (), "D4 表本身一个不差");
 

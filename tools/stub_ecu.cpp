@@ -490,7 +490,11 @@ bool packageCheckService (policy::Gate &g, const DidTable &d, bool allowDowngrad
 //   谁能装钥匙，谁就能给这台车签任何包。
 // M23：把表写到盘上。storePath 为空 = 这次没开 --key-store（只在内存，行为与 M22 一致）。
 //   写失败**不算成功**：内存改了、盘没改，重启就丢 —— 那种"装上了"是假的。
+// M26：变更和它的那一行流水必须在**同一次** rename 里落下去。
+//   分成两次写就会出现"表改了、账没记"（下一笔流水对不上 VER）或者"账记了、表没改"
+//   （账本说 4 号装上了，表里没有）—— 两种都比不记账更坏。
 static bool persistRing (const keys::KeyRing &ring, keys::Generation generation,
+                         const keys::ChangeLog &log, std::uint16_t boot,
                          const std::string &storePath, std::string &why)
 {
     if (storePath.empty ())
@@ -499,7 +503,7 @@ static bool persistRing (const keys::KeyRing &ring, keys::Generation generation,
         return true;
     }
     std::string w;
-    if (keys::save (ring, storePath, w, generation))
+    if (keys::save (ring, storePath, w, generation, boot, &log))
     {
         why = w;
         return true;
@@ -509,8 +513,25 @@ static bool persistRing (const keys::KeyRing &ring, keys::Generation generation,
     return false;
 }
 
-bool keyService (keys::KeyRing &ring, keys::Generation &generation, const std::string &storePath,
-                 bool storeLocked,
+// 记一条流水。指纹取"改完之后"的表 —— 对账时拿它对的是结果，不是起点。
+static keys::LogEntry makeEntry (keys::Act act, std::uint16_t keyId, const keys::KeyRing &ring,
+                                 keys::Generation generation, std::uint16_t boot,
+                                 keys::Channel channel, std::uint32_t nowSec)
+{
+    keys::LogEntry e;
+    e.generation  = generation;
+    e.fingerprint = keys::fingerprintOf (ring);
+    e.keyId       = keyId;
+    e.act         = act;
+    e.channel     = channel;
+    e.boot        = boot;
+    e.seconds     = nowSec;
+    return e;
+}
+
+bool keyService (keys::KeyRing &ring, keys::Generation &generation, keys::ChangeLog &log,
+                 std::uint16_t boot, const std::string &storePath, bool storeLocked, bool onFunc,
+                 std::uint32_t nowSec,
                  const std::vector<std::uint8_t> &req,
                  std::vector<std::uint8_t> &resp, std::string &why)
 {
@@ -566,6 +587,71 @@ bool keyService (keys::KeyRing &ring, keys::Generation &generation, const std::s
         return true;
     }
 
+    // M26：0x22 F1B3 变更流水概览 —— 62 F1 B3 <条数 1><最近动作 1><最近 keyId 2>，正好 7 字节，能广播。
+    //   它回答的是"这台车最近被人动过哪把、怎么动的"，是广播能问的最细的一句话。
+    //   没有记录时只回 `62 F1 B3 00`（4 字节）：**"没有变更"这件事本身要能说出口**，
+    //   不能拿一个"动作 = 0"的假记录来顶。
+    if (req.size () == 3 && req[0] == 0x22 && req[1] == 0xF1 && req[2] == 0xB3)
+    {
+        if (log.empty ())
+        {
+            resp = {0x62, 0xF1, 0xB3, 0x00};
+            why  = "流水：还没有变更（表从装上就没动过）";
+            return true;
+        }
+        const keys::LogEntry &e = log.at (0);
+        resp = {0x62, 0xF1, 0xB3, static_cast<std::uint8_t> (log.size ()),
+                keys::actCode (e.act),
+                static_cast<std::uint8_t> ((e.keyId >> 8) & 0xFF),
+                static_cast<std::uint8_t> (e.keyId & 0xFF)};
+        why = "流水概览：共 " + std::to_string (log.size ()) + " 条，最近一条是" +
+              keys::actName (e.act) + " 0x" + fw::keyIdText (e.keyId);
+        return true;
+    }
+
+    // M26：0x31 01 02 0B <i> 读流水第 i 条（1 = 最近）。19 字节，只能物理寻址。
+    //   为什么用例程不用 DID：0x22 的 DID 严格是 2 个字节，塞不下"第几条"这个参数；
+    //   再开一个 F1B4 也不对 —— 那是"另开一列"，不是"同一列的某一行"。
+    if (req.size () >= 4 && req[0] == 0x31 && req[1] == 0x01 && req[2] == 0x02 && req[3] == 0x0B)
+    {
+        const std::vector<std::uint8_t> rec (req.begin () + 4, req.end ());
+        if (rec.size () != 1)
+        {
+            resp = {0x7F, 0x31, kNrcIncorrectLength};
+            why  = "020B 要 1 字节序号（共 5 字节请求），实际 " + std::to_string (rec.size ()) + " 字节";
+            return true;
+        }
+        const std::uint8_t idx = rec[0];
+        if (idx == 0 || idx > log.size ())
+        {
+            resp = {0x7F, 0x31, kNrcRequestOutOfRange};
+            why  = "020B 要一条 1–" + std::to_string (log.size ()) + " 之间的流水，收到 " +
+                   std::to_string (idx) + "（1 = 最近一条）";
+            return true;
+        }
+        const keys::LogEntry &e = log.at (idx - 1);
+        resp = {0x71, 0x01, 0x02, 0x0B, idx,
+                static_cast<std::uint8_t> ((e.generation >> 8) & 0xFF),
+                static_cast<std::uint8_t> (e.generation & 0xFF),
+                static_cast<std::uint8_t> ((e.fingerprint >> 8) & 0xFF),
+                static_cast<std::uint8_t> (e.fingerprint & 0xFF),
+                keys::actCode (e.act), keys::chanCode (e.channel),
+                static_cast<std::uint8_t> ((e.keyId >> 8) & 0xFF),
+                static_cast<std::uint8_t> (e.keyId & 0xFF),
+                static_cast<std::uint8_t> ((e.boot >> 8) & 0xFF),
+                static_cast<std::uint8_t> (e.boot & 0xFF),
+                static_cast<std::uint8_t> ((e.seconds >> 24) & 0xFF),
+                static_cast<std::uint8_t> ((e.seconds >> 16) & 0xFF),
+                static_cast<std::uint8_t> ((e.seconds >> 8) & 0xFF),
+                static_cast<std::uint8_t> (e.seconds & 0xFF)};
+        why = "第 " + std::to_string (idx) + " 条：" + keys::actName (e.act) + " 0x" +
+              fw::keyIdText (e.keyId) + "，" + keys::channelName (e.channel) + "，版本 " +
+              std::to_string (static_cast<unsigned> (e.generation)) + "，第 " +
+              std::to_string (static_cast<unsigned> (e.boot)) + " 次上电 +" +
+              std::to_string (e.seconds) + "s";
+        return true;
+    }
+
     // M24：0x31 01 02 0A "这台现在能不能装一把" —— 问，不是做，所以不过门。
     //   为什么要这一问：装钥匙的请求 38 字节，功能寻址塞不进单帧，只能逐台下发；
     //   下发之前先广播问一圈"你们谁装不下"，比装到一半发现某台表满好。
@@ -605,6 +691,7 @@ bool keyService (keys::KeyRing &ring, keys::Generation &generation, const std::s
         }
         const keys::KeyRing before = ring;   // M23：落盘失败要退回这一份
         const keys::Generation genBefore = generation;   // M25：世代也要跟着回滚
+        const keys::ChangeLog logBefore = log;           // M26：账本同理
         const keys::Install ins = ring.install (id, key);
         switch (ins)
         {
@@ -612,8 +699,11 @@ bool keyService (keys::KeyRing &ring, keys::Generation &generation, const std::s
             {
                 ++gKeyInstallOk;
                 generation = keys::nextGeneration (generation);   // M25：成功改一次表 = 下一代
+                log.append (makeEntry (keys::Act::Install, id, ring, generation, boot,
+                                       onFunc ? keys::Channel::Broadcast : keys::Channel::Physical,
+                                       nowSec));
                 std::string pwhy;
-                if (persistRing (ring, generation, storePath, pwhy))
+                if (persistRing (ring, generation, log, boot, storePath, pwhy))
                 {
                     resp = {0x71, 0x01, 0x02, 0x06, 0x00};
                     why  = "装上新钥匙 0x" + fw::keyIdText (id) + "（启用）；" + pwhy +
@@ -623,6 +713,7 @@ bool keyService (keys::KeyRing &ring, keys::Generation &generation, const std::s
                 {
                     ring       = before;      // 盘上没写成功，就别在内存里假装装上了
                     generation = genBefore;   // 世代同理：盘上没有这一次变更，计数不能先走
+                    log        = logBefore;   // 账本同理：没落盘的那一笔不能留在流水里
                     resp = {0x71, 0x01, 0x02, 0x06, 0x01};
                     why  = "装上了但没写进盘：" + pwhy + "；已回滚（重启就丢的东西不能算装上了）";
                 }
@@ -667,14 +758,24 @@ bool keyService (keys::KeyRing &ring, keys::Generation &generation, const std::s
         }
         const keys::KeyRing before = ring;   // M23：落盘失败要退回这一份
         const keys::Generation genBefore = generation;   // M25：世代也要跟着回滚
+        const keys::ChangeLog logBefore = log;           // M26：账本同理
         switch (ring.setState (id, static_cast<keys::State> (want)))
         {
             case keys::Transition::Ok:
             {
                 ++gKeyStateChg;
                 generation = keys::nextGeneration (generation);   // M25
+                // 00 启用 / 01 退役 / 02 吊销 各是一个动作 ——
+                //   "改回启用"（复活）和"装入"是两件事，流水里必须分得开：
+                //   装一把新钥匙是"扩编"，把退役的改回来是"撤回一次退役"。
+                const keys::Act act = (want == 0x00) ? keys::Act::Revive
+                                     : (want == 0x01) ? keys::Act::Retire
+                                                      : keys::Act::Revoke;
+                log.append (makeEntry (act, id, ring, generation, boot,
+                                       onFunc ? keys::Channel::Broadcast : keys::Channel::Physical,
+                                       nowSec));
                 std::string pwhy;
-                if (persistRing (ring, generation, storePath, pwhy))
+                if (persistRing (ring, generation, log, boot, storePath, pwhy))
                 {
                     resp = {0x71, 0x01, 0x02, 0x07, 0x00};
                     why  = "0x" + fw::keyIdText (id) + " → " +
@@ -685,6 +786,7 @@ bool keyService (keys::KeyRing &ring, keys::Generation &generation, const std::s
                 {
                     ring       = before;
                     generation = genBefore;
+                    log        = logBefore;
                     resp = {0x71, 0x01, 0x02, 0x07, 0x01};
                     why  = "状态改了但没写进盘：" + pwhy + "；已回滚（吊销必须落盘，否则重启就复活）";
                 }
@@ -982,6 +1084,13 @@ int main (int argc, char **argv)
     keys::KeyRing keyRing;
     // M25：清单世代（每成功改一次表 +1，落盘跟着走）。0 = 没改过 / v1 旧文件。
     keys::Generation keyGen = 0;
+    // M26：变更流水 + "第几次带变更的上电"。
+    //   boot 在启动时算成"文件里那个 +1"，但**只在真有变更落盘时才写下去**。
+    //   为什么不当启动计数器：每次上电都写一次盘，等于给 flash 找麻烦；
+    //   而"什么都没改的那次上电"本来也不需要一条流水。
+    //   代价要写在说明书上：这是"带变更的上电次数"，不是"上电次数"。
+    keys::ChangeLog keyLog;
+    std::uint16_t   keyBoot = 0;
     keys::LoadStatus storeStatus = keys::LoadStatus::Missing;
     std::string      storeNote   = "没开 --key-store：只在内存（重启回到默认两把）";
 
@@ -996,10 +1105,15 @@ int main (int argc, char **argv)
     }
     else if (resetKeyStore)
     {
+        // 重建 = 回到出厂：表、世代、流水一起推倒。
+        //   历史也留着行不行？留着就等于"新表上挂着一份旧账"，对账时反而会混淆。
+        //   要留证据就不要重建 —— 吊销一把（--revoke-key）才是正路，它留痕、也不抹别人。
         seedDefaults (keyRing);
-        keyGen = 0;                        // 重建 = 从头开始，世代归零
+        keyGen = 0;
+        keyBoot = 0;          // 出厂：文件里写 BOOT 0000（"一次变更都还没有"）
+        keyLog.clear ();
         std::string w;
-        if (keys::save (keyRing, keyStorePath, w, keyGen))
+        if (keys::save (keyRing, keyStorePath, w, keyGen, keyBoot, &keyLog))
         {
             storeStatus = keys::LoadStatus::Ok;
             storeNote   = "--reset-key-store 重建并 " + w;
@@ -1009,6 +1123,9 @@ int main (int argc, char **argv)
             ++gKeyPersistFail;
             storeNote = "--reset-key-store 重建了内存里的表，但没写进盘：" + w;
         }
+        // 出厂文件是 BOOT 0000；但"这一次上电"已经是第 1 次可能带变更的上电了 ——
+        //   下笔变更落盘时写 BOOT 0001。盘上的数只描述"已经发生过的账"。
+        keyBoot = 1;
     }
     else
     {
@@ -1019,13 +1136,19 @@ int main (int argc, char **argv)
         {
             keyRing = lr.ring;
             keyGen  = lr.generation;       // M25：世代也活过重启（v1 旧文件是 0）
+            keyLog  = lr.log;              // M26：流水也活过重启（v1/v2 旧文件是空）
+            keyBoot = static_cast<std::uint16_t> (lr.boot == 0xFFFF ? 1 : lr.boot + 1);
+            if (keyLog.empty () && keyGen != 0)
+                storeNote += "；⚠ 这份表被改过 " + std::to_string (static_cast<unsigned> (keyGen)) +
+                             " 次，但文件里没有流水（那时候还不记）";
         }
         else if (lr.status == keys::LoadStatus::Missing)
         {
             seedDefaults (keyRing);
             keyGen = 0;
+            keyBoot = 0;                   // 出厂文件：BOOT 0000
             std::string w;
-            if (keys::save (keyRing, keyStorePath, w, keyGen))
+            if (keys::save (keyRing, keyStorePath, w, keyGen, keyBoot, &keyLog))
             {
                 storeStatus = keys::LoadStatus::Ok;
                 storeNote   = "第一次上电：" + w;
@@ -1035,6 +1158,7 @@ int main (int argc, char **argv)
                 ++gKeyPersistFail;
                 storeNote = "第一次上电，但默认两把没写进盘：" + w;
             }
+            keyBoot = 1;                   // 这一次上电就是第 1 次"可能带变更"的上电
         }
         else
         {
@@ -1043,26 +1167,32 @@ int main (int argc, char **argv)
                         "（表按空处理，谁都验不过；确认真要重建再加 --reset-key-store）";
         }
     }
-    // M25：启动参数改状态也是"改过表"，每改成功一把就算一代
+
+    // M25/M26：启动参数改状态也是"改过表" —— 每改成功一把算一代、记一条（通道 = 上电参数），
+    //   时间记成"这次上电 +0s"：上电参数本来就是启动那一刻做的事。
     std::size_t startupChanges = 0;
+    const auto bumpAndLog = [&] (keys::Act act, std::uint32_t rawId) {
+        ++startupChanges;
+        keyGen = keys::nextGeneration (keyGen);
+        keyLog.append (makeEntry (act, static_cast<std::uint16_t> (rawId), keyRing, keyGen, keyBoot,
+                                  keys::Channel::Startup, 0));
+    };
     for (std::uint32_t id : retireKeys)
         if (keyRing.setState (static_cast<std::uint16_t> (id), keys::State::Retiring) !=
             keys::Transition::Ok)
             std::printf ("  [警告] --retire-key 0x%04X：表里没有这把，忽略\n", id);
-        else ++startupChanges;
+        else bumpAndLog (keys::Act::Retire, id);
     for (std::uint32_t id : revokeKeys)
         if (keyRing.setState (static_cast<std::uint16_t> (id), keys::State::Revoked) !=
             keys::Transition::Ok)
             std::printf ("  [警告] --revoke-key 0x%04X：表里没有这把，忽略\n", id);
-        else ++startupChanges;
+        else bumpAndLog (keys::Act::Revoke, id);
 
     // 启动参数改过状态就要落盘，否则"这次吊销"活不过下一个重启
-    if (!keyStorePath.empty () && (!retireKeys.empty () || !revokeKeys.empty ())
-        && storeStatus != keys::LoadStatus::Corrupt)
+    if (!keyStorePath.empty () && startupChanges > 0 && storeStatus != keys::LoadStatus::Corrupt)
     {
-        for (std::size_t i = 0; i < startupChanges; ++i) keyGen = keys::nextGeneration (keyGen);
         std::string w;
-        if (!keys::save (keyRing, keyStorePath, w, keyGen))
+        if (!keys::save (keyRing, keyStorePath, w, keyGen, keyBoot, &keyLog))
         {
             ++gKeyPersistFail;
             std::printf ("  [警告] --retire-key/--revoke-key 没能落盘：%s\n", w.c_str ());
@@ -1145,11 +1275,14 @@ int main (int argc, char **argv)
                      "标签盖住身份）；0x31 01 0205 只收 v2，预检通过直接发凭证\n");
         std::printf ("           钥匙：0x22 F1B0 读表 / 0x22 F1B1 摘要（4 个计数，7 字节，可广播）/ "
                      "0x22 F1B2 清单指纹（世代 2 + 指纹 2，6 字节，可广播）/ "
+                     "0x22 F1B3 流水概览（条数 + 最近动作 + keyId，7 字节，可广播）/ "
+                     "0x31 01 02 0B <i> 读流水第 i 条（1 = 最近，19 字节，只能物理寻址）/ "
                      "0x31 01 02 0A 能不能装（问，不过门）/ 0x31 01 02 06 装 / 0x31 01 02 07 改状态；"
                      "装与改都要编程会话 + 解锁\n");
         std::printf ("           钥匙表：%s —— %s\n",
                      keyStorePath.empty () ? "（内存）" : keyStorePath.c_str (), storeNote.c_str ());
-        std::printf ("           清单：%s（世代落盘跟着走：v2 文件里一行 VER）\n",
+        std::printf ("           流水：最近 %zu 条（%s）\n", keyLog.size (), keyLog.dump ().c_str ());
+        std::printf ("           清单：%s（世代落盘跟着走：v3 文件里一行 VER + 一行 BOOT）\n",
                      keys::stampText (keyRing, keyGen).c_str ());
     }
 
@@ -1278,8 +1411,10 @@ int main (int argc, char **argv)
         // M24：钥匙服务允许走功能寻址 —— 一条广播让几台一起装/改。
         //   代价写在协议里：功能寻址的应答必须塞进一个单帧，所以"广播读整张表"在经典帧下答不出来。
         if (!handled &&
-            keyService (keyRing, keyGen, keyStorePath, storeStatus == keys::LoadStatus::Corrupt,
-                        req, resp, why))   // M22/M24/M25：F1B0 读表 / F1B1 摘要 / F1B2 指纹 / 0206 装 / 0207 改状态
+            keyService (keyRing, keyGen, keyLog, keyBoot, keyStorePath,
+                        storeStatus == keys::LoadStatus::Corrupt, onFunc, msNow () / 1000u,
+                        req, resp, why))   // M22/M24/M25/M26：F1B0 读表 / F1B1 摘要 / F1B2 指纹 / F1B3 流水概览 /
+                                            //                  020B 读流水 / 0206 装 / 0207 改状态
         {
             handled = true;
         }
@@ -1375,6 +1510,7 @@ int main (int argc, char **argv)
                      keyStorePath.empty () ? "（内存，重启即丢）" : keyStorePath.c_str (),
                      static_cast<unsigned> (gKeyStoreCorrupt), static_cast<unsigned> (gKeyPersistFail),
                      keys::stampText (keyRing, keyGen).c_str ());
+        std::printf ("流水：%s\n", keyLog.dump ().c_str ());
     }
     if (guard)
     {

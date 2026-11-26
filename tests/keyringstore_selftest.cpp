@@ -58,9 +58,11 @@ int main ()
     // ---- A. 编码 ----
     {
         const std::string empty = keys::encode (keys::KeyRing {});
-        CHECK (empty.compare (0, 14, "DOIPKEYRING 2\n") == 0, "A1 第一行是版本行（写永远写 2）");
+        CHECK (empty.compare (0, 14, "DOIPKEYRING 3\n") == 0, "A1 第一行是版本行（写永远写 3）");
         CHECK (empty.compare (14, 9, "VER 0000\n") == 0, "A1b 第二行是 VER（默认世代 0）");
-        CHECK (empty.size () == 14 + 9 + 4 + 16 + 1, "A2 空表就是版本行 + VER 行 + 校验和行（没有空 K 行）");
+        CHECK (empty.compare (23, 10, "BOOT 0000\n") == 0, "A1c 第三行是 BOOT（默认上电序 0）");
+        CHECK (empty.size () == 14 + 9 + 10 + 4 + 16 + 1,
+               "A2 空表就是版本行 + VER + BOOT + 校验和行（没有空 K 行）");
 
         const std::string two = keys::encode (makeRing ());
         CHECK (two.find ("\nK 0001 00 ") != std::string::npos, "A3 1 号以「K 0001 00」开头（状态是 00 启用）");
@@ -125,11 +127,11 @@ int main ()
         wrongSum[good.size () - 3] = (good[good.size () - 3] == 'a') ? 'b' : 'a';
         CHECK (keys::decode (wrongSum).status == keys::LoadStatus::Corrupt, "C5 校验和改一位 → 判坏");
 
-        // C6 版本行不认识（1 / 2 之外的一律不认）
+        // C6 版本行不认识（1 / 2 / 3 之外的一律不认）
         std::string v2 = body;
-        v2.replace (0, 14, "DOIPKEYRING 3\n");
+        v2.replace (0, 14, "DOIPKEYRING 4\n");
         CHECK (keys::decode (signedText (v2)).status == keys::LoadStatus::Corrupt,
-               "C6 版本行不是 1 也不是 2 → 判坏");
+               "C6 版本行不是 1/2/3 → 判坏");
 
         // 以下四条：校验和都是对的（用 signedText 重算），坏在**内容**
         std::string dup = "DOIPKEYRING 1\nK 0001 00 " + Sha256::hex (fw::demoKey (0x0001)) + "\n" +

@@ -90,7 +90,7 @@ rm -f "$STORE_A" "$STORE_B" "$STORE_C" "$STORE_A.tmp" "$STORE_B.tmp" "$STORE_C.t
 start_fleet "$PORT_A" 30 1
 
 grep -q "清单：" "$ELOG_A" && ok "启动行报了清单（版本 + 指纹）" || bad "启动行没有清单"
-grep -q "DOIPKEYRING 2" "$STORE_A" && ok "盘上是 v2 文件（带 VER 行）" || bad "盘上不是 v2"
+grep -q "DOIPKEYRING 3" "$STORE_A" && ok "盘上是 v3 文件（M26 起写新格式，仍带 VER 行）" || bad "盘上不是 v3"
 grep -q "^VER " "$STORE_A" && ok "文件里有 VER 行（世代落盘）" || bad "文件里没有 VER 行"
 
 python3 "$CHECK" "$PORT_A" 1 > "$OUT" 2>&1
@@ -146,8 +146,9 @@ import sys
 p = sys.argv[1]
 with open(p, "r") as f:
     lines = [ln.rstrip("\n") for ln in f if ln.strip()]
-assert lines[0] == "DOIPKEYRING 2", lines[0]
-body = "DOIPKEYRING 1\n" + "\n".join(ln for ln in lines[1:-1] if not ln.startswith("VER ")) + "\n"
+assert lines[0].startswith("DOIPKEYRING "), lines[0]
+keep = [ln for ln in lines[1:-1] if not ln.startswith(("VER ", "BOOT ", "L "))]
+body = "DOIPKEYRING 1\n" + "\n".join(keep) + "\n"
 checksum = hashlib.sha256(body.encode()).hexdigest()[:16]
 with open(p + ".v1", "w") as f:
     f.write(body + "SUM " + checksum + "\n")

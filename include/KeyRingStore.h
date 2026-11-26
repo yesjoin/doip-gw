@@ -22,17 +22,21 @@
 //
 // 落盘格式（文本，一行一条，最后一行校验和）：
 //
-//   DOIPKEYRING 2
+//   DOIPKEYRING 3
 //   VER 0007
+//   BOOT 0002
 //   K 0001 00 <64 hex>
 //   K 0002 02 <64 hex>
+//   L 0007 70D3 01 01 0003 0002 00000012
 //   SUM 3f7c1a0e5b2d9c48
 //
-// M25 加了一行 VER（世代，见 KeyRingStamp.h）。格式从 1 升到 2，但**读的时候两种都认**：
-//   · 看到 `DOIPKEYRING 2` → 必须紧跟一行 `VER <4hex>`；
-//   · 看到 `DOIPKEYRING 1` → 没有 VER，世代按 0 算（M23 写出来的旧文件因此还能用）。
-// 这是"写新读旧"：盘上只会被写成 2，但老文件不需要人手迁移 ——
-//   要人手迁移的那一刻，现场就已经断电了。
+// 三个版本一路下来：**写永远写 3，读 1 / 2 / 3 都认**。
+//   · v1（M23）：没有 VER、没有 BOOT、没有流水 → 世代 0、上电序 0、流水空；
+//   · v2（M25）：有 VER，没有 BOOT / 流水 → 上电序 0、流水空；
+//   · v3（M26）：VER + BOOT + 流水。
+// 为什么老版本也认：老文件升级后钥匙表不能变成空的。人手迁移那一刻，现场通常已经断电了。
+//   v2 → v3 的代价是"历史那一栏没了"（流水没写下来过），这件事必须让启动横幅说出来，
+//   不能假装流水是满的。
 //
 // 为什么用文本：现场排障 `cat` 一眼能看；二进制省下的那点字节在这个场景没有收益，
 //   而"人能直接读一行"有收益。SUM 取 SHA-256 前 8 字节（16 个 hex 字符）——
@@ -42,6 +46,7 @@
 #define DOIP_KEY_RING_STORE_H
 
 #include "KeyRing.h"
+#include "KeyRingLog.h"
 #include "KeyRingStamp.h"
 #include "Sha256.h"
 
@@ -77,6 +82,8 @@ struct LoadResult
     LoadStatus   status = LoadStatus::Missing;
     KeyRing      ring;                 // Corrupt 时是空表，**不是**默认两把
     Generation   generation = 0;       // M25：v1 旧文件读进来是 0（见文件头）
+    std::uint16_t boot = 0;            // M26：第几次带变更的上电（v1/v2 文件读进来是 0）
+    ChangeLog    log;                  // M26：最近 8 笔变更（v1/v2 文件读进来是空）
     std::string  why;                  // 给人看的一句话
 };
 
@@ -86,11 +93,15 @@ inline std::string checksumOf (const std::string &body)
     return Sha256::hex (Sha256::ofText (body)).substr (0, 16);
 }
 
-inline std::string encode (const KeyRing &ring, Generation generation = 0)
+// log 用指针而不是引用：默认 nullptr，让 M23/M25 那些两三个参数的旧调用一行都不用改。
+inline std::string encode (const KeyRing &ring, Generation generation = 0,
+                           std::uint16_t boot = 0, const ChangeLog *log = nullptr)
 {
-    std::string body = "DOIPKEYRING 2\n";
+    std::string body = "DOIPKEYRING 3\n";
     char buf[96];
     std::snprintf (buf, sizeof buf, "VER %04X\n", static_cast<unsigned> (generation));
+    body += buf;
+    std::snprintf (buf, sizeof buf, "BOOT %04X\n", static_cast<unsigned> (boot));
     body += buf;
     for (std::size_t i = 0; i < ring.size (); ++i)
     {
@@ -99,6 +110,11 @@ inline std::string encode (const KeyRing &ring, Generation generation = 0)
                        static_cast<unsigned> (stateCode (e.state)), Sha256::hex (e.key).c_str ());
         body += buf;
     }
+    // 流水按"旧 → 新"写下去，读的时候 append 起来就正好是"新在前"。
+    //   为什么不直接按内存顺序写：读的一方只有 append，写的一方要是也按"新在前"，
+    //   读回来就整颠倒 —— 落盘顺序和读回顺序必须互相抵消，这事要一次定死。
+    if (log != nullptr)
+        for (std::size_t i = log->size (); i > 0; --i) body += logLine (log->at (i - 1));
     return body + "SUM " + checksumOf (body) + "\n";
 }
 
@@ -148,22 +164,24 @@ inline LoadResult decode (const std::string &text)
         lines.push_back (cur);
     }
 
-    // 行数下界：版本行 + SUM 行。一个合法的**空表**就是两行（v2 是三行：多一行 VER）。
+    // 行数下界：版本行 + SUM 行。一个合法的**空表**：v1 两行、v2 三行、v3 四行。
     if (lines.size () < 2)
     {
         r.why = "文件里连两行都没有（" + std::to_string (lines.size ()) + " 行）";
         return r;
     }
 
-    // 版本行：写永远写 2，读 1 和 2 都认。
-    //   v1 = M23 的文件，没有 VER 行，世代按 0 算；v2 = 现在，VER 行必须紧跟版本行。
-    std::size_t firstKeyLine = 1;
-    Generation gen = 0;
-    if (lines[0] == "DOIPKEYRING 2")
+    // 版本行：写永远写 3，读 1 / 2 / 3 都认。
+    std::size_t firstBodyLine = 1;
+    Generation  gen  = 0;
+    std::uint16_t boot = 0;
+    const bool  hasLog = (lines[0] == "DOIPKEYRING 3");
+
+    if (lines[0] == "DOIPKEYRING 3" || lines[0] == "DOIPKEYRING 2")
     {
         if (lines.size () < 3)
         {
-            r.why = "v2 文件至少要三行（版本行 / VER / SUM），现在 " +
+            r.why = lines[0] + " 文件至少要三行（版本行 / VER / SUM），现在 " +
                     std::to_string (lines.size ()) + " 行";
             return r;
         }
@@ -180,15 +198,40 @@ inline LoadResult decode (const std::string &text)
             return r;
         }
         gen = static_cast<Generation> (gv);
-        firstKeyLine = 2;
+        firstBodyLine = 2;
+
+        if (hasLog)
+        {
+            // v3 第三行必须是 BOOT。缺了就不能"当 0 用"——那是猜，猜出来的时间没有意义。
+            if (lines.size () < 4)
+            {
+                r.why = "v3 文件至少要四行（版本行 / VER / BOOT / SUM），现在 " +
+                        std::to_string (lines.size ()) + " 行";
+                return r;
+            }
+            const std::string &bt = lines[2];
+            std::uint64_t bv = 0;
+            if (bt.size () != 9 || bt.compare (0, 5, "BOOT ") != 0 || !parseHex (bt.substr (5), bv))
+            {
+                r.why = "第三行不是「BOOT <4 hex>」（读到「" + bt + "」）";
+                return r;
+            }
+            if (bv > 0xFFFF)
+            {
+                r.why = "BOOT 超出 16 位";
+                return r;
+            }
+            boot = static_cast<std::uint16_t> (bv);
+            firstBodyLine = 3;
+        }
     }
     else if (lines[0] == "DOIPKEYRING 1")
     {
-        firstKeyLine = 1;   // 旧文件：没有 VER，世代 0
+        firstBodyLine = 1;   // 旧文件：没有 VER，世代 0；也没有 BOOT / 流水
     }
     else
     {
-        r.why = "版本行不对（读到「" + lines[0] + "」，只认 DOIPKEYRING 1 / 2）";
+        r.why = "版本行不对（读到「" + lines[0] + "」，只认 DOIPKEYRING 1 / 2 / 3）";
         return r;
     }
 
@@ -212,11 +255,35 @@ inline LoadResult decode (const std::string &text)
 
     // 校验和对上了，再逐条查内容合法性。
     //   校验和只能证明"这段字节没变过"，不能证明"内容是合法的" —— 两件事要分开查。
-    KeyRing ring;
+    KeyRing   ring;
+    ChangeLog log;
     std::vector<std::uint16_t> seen;
-    for (std::size_t i = firstKeyLine; i + 1 < lines.size (); ++i)
+    for (std::size_t i = firstBodyLine; i + 1 < lines.size (); ++i)
     {
         const std::string &ln = lines[i];
+
+        if (ln.compare (0, 2, "L ") == 0)
+        {
+            LogEntry e;
+            if (!hasLog)
+            {
+                r.why = "第 " + std::to_string (i + 1) + " 行有流水，但版本行不是 3";
+                return r;
+            }
+            if (!parseLogLine (ln, e))
+            {
+                r.why = "第 " + std::to_string (i + 1) + " 行不是合法的流水（形状或字段越界）";
+                return r;
+            }
+            if (log.size () >= ChangeLog::kMax)
+            {
+                r.why = "流水超过 " + std::to_string (ChangeLog::kMax) + " 条";
+                return r;
+            }
+            log.append (e);
+            continue;
+        }
+
         if (ln.size () != 2 + 4 + 1 + 2 + 1 + 64 || ln.compare (0, 2, "K ") != 0)
         {
             r.why = "第 " + std::to_string (i + 1) + " 行不是「K iddd ss <64 hex>」的形状";
@@ -279,10 +346,28 @@ inline LoadResult decode (const std::string &text)
         seen.push_back (static_cast<std::uint16_t> (idv));
     }
 
+    // 最后一道自洽检查：流水最新一条的世代必须等于 VER（M26）。
+    //   为什么查这个：两段内容各自合法、拼在一起不合法 —— 这是"文件被拼过"的典型样子，
+    //   校验和只能抓"改了没重算"，抓不到"用别处的合法两段拼一份新的再重算"。
+    //
+    // 但"有世代、没流水"**不判坏**：那是 v2 文件升上来的样子（表可信、账本没写过）。
+    //   判坏的代价是把一张能用的表变成空表（谁都验不过）；账本缺页不带来这个后果。
+    //   两件事的代价不一样，处理也就不该一样 —— 这一条只报，不判。
+    if (hasLog && !log.empty () && log.at (0).generation != gen)
+    {
+        r.why = "流水最新一条的世代（" + std::to_string (static_cast<unsigned> (log.at (0).generation)) +
+                "）与 VER（" + std::to_string (static_cast<unsigned> (gen)) + "）对不上：文件被拼过";
+        return r;
+    }
+
     r.status     = LoadStatus::Ok;
     r.ring       = ring;
     r.generation = gen;
+    r.boot       = boot;
+    r.log        = log;
     r.why        = "读到 " + std::to_string (ring.size ()) + " 把：" + ring.dump ();
+    if (hasLog && log.empty () && gen != 0)
+        r.why += "（改过 " + std::to_string (static_cast<unsigned> (gen)) + " 次，但文件里没有流水）";
     return r;
 }
 
@@ -316,11 +401,14 @@ inline LoadResult load (const std::string &path)
 // 写盘：临时文件 → rename（原子）→ 读回来核对。
 //   写完立刻读回来是有必要的：写成功不等于写对了（磁盘满、路径被换、编码截断都可能）。
 //   M25：世代也要跟着写、跟着核对 —— 版本没落盘，重启后"改过几次"就归零了。
+//   M26：上电序和流水同理 —— 变更和它的那一行流水必须在**同一次** rename 里落下去，
+//        否则会出现"表改了、账没记"或者"账记了、表没改"，两种都比不做更坏。
 inline bool save (const KeyRing &ring, const std::string &path, std::string &why,
-                  Generation generation = 0)
+                  Generation generation = 0, std::uint16_t boot = 0,
+                  const ChangeLog *log = nullptr)
 {
     const std::string tmp = path + ".tmp";
-    const std::string text = encode (ring, generation);
+    const std::string text = encode (ring, generation, boot, log);
     std::FILE *fp = std::fopen (tmp.c_str (), "wb");
     if (fp == nullptr)
     {
@@ -346,13 +434,15 @@ inline bool save (const KeyRing &ring, const std::string &path, std::string &why
     }
 
     const LoadResult back = load (path);
-    if (back.status != LoadStatus::Ok || encode (back.ring, back.generation) != text)
+    if (back.status != LoadStatus::Ok ||
+        encode (back.ring, back.generation, back.boot, &back.log) != text)
     {
         why = "写完读回来对不上：" + back.why;
         return false;
     }
     why = "已写入 " + path + "（" + std::to_string (ring.size ()) + " 把，版本 " +
-          std::to_string (static_cast<unsigned> (generation)) + "）";
+          std::to_string (static_cast<unsigned> (generation)) + "，流水 " +
+          std::to_string (log == nullptr ? 0 : log->size ()) + " 条）";
     return true;
 }
 
