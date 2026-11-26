@@ -193,6 +193,11 @@ static std::uint32_t gPrecheckFail = 0;
 static std::uint32_t gCompatPass = 0;
 static std::uint32_t gCompatFail = 0;
 
+// M21：预检（0205）与"整包验签时身份不符"的账
+static std::uint32_t gPackagePass = 0;
+static std::uint32_t gPackageFail = 0;
+static std::uint32_t gIdentityMismatch = 0;
+
 // M15：刷写服务（0x31 / 0x34 / 0x36 / 0x37）—— 只做物理寻址，不参与广播。
 //   返回 false = "这不是刷写服务"，交给 M6 起就有的 answer() 去处理。
 //   刷写是**有状态的会话**，所以它必须待在主循环里（一个 FlashTarget 跟着这台 ECU 活）。
@@ -203,8 +208,10 @@ struct FlashContext
 {
     std::uint32_t     batteryMv    = 12400;
     std::uint32_t     minBatteryMv = 11500;
-    bool              requireCompat= false;       // 0x34 是否必须持有 0204 的凭证
+    bool              requireCompat= false;       // 0x34 是否必须持有 0204/0205 的凭证
+    bool              allowDowngrade= false;      // 允许降级
     policy::Gate     *gate         = nullptr;     // 凭证（nullptr = 这条路径不管凭证）
+    const DidTable   *dids         = nullptr;     // 车自己的身份（M21：验签时比对清单里的目标身份）
 };
 
 bool flashService (FlashTarget &t, const FlashContext &ctx, const std::vector<std::uint8_t> &req,
@@ -252,12 +259,35 @@ bool flashService (FlashTarget &t, const FlashContext &ctx, const std::vector<st
                         r.reason   = "验签：" + c.reason;
                         ++gVerifyFail;   // 格式错也算"这次没验过"
                     }
+                    else if (c.hasIdentity && ctx.dids != nullptr)
+                    {
+                        // M21：清单自带身份（v2）。验签通过只说明"包是真的"，
+                        // 还得问一句"是不是给这台车的" —— 两件事，两个状态码。
+                        const auto pr = policy::checkIdentity (ctx.dids->partNumber (), ctx.dids->swVersion (),
+                                                               c.targetPart, c.targetSw, ctx.allowDowngrade);
+                        r.positive = true;
+                        if (pr.ok ())
+                        {
+                            r.uds    = {0x71, 0x01, 0xFF, 0x02, 0x00};
+                            r.reason = "验签：整包对得上，身份也对（" + pr.reason + "）";
+                            ++gVerifyPass;
+                        }
+                        else
+                        {
+                            r.uds    = {0x71, 0x01, 0xFF, 0x02, 0x02};
+                            r.reason = "验签：包是真的，但不是给这台车的（" + pr.reason + "）";
+                            ++gVerifyFail;
+                            ++gIdentityMismatch;
+                        }
+                    }
                     else
                     {
                         r.positive = true;
                         r.uds      = {0x71, 0x01, 0xFF, 0x02, static_cast<std::uint8_t> (c.ok () ? 0x00 : 0x01)};
                         r.reason   = "验签：" + c.reason;
                         if (c.ok ()) ++gVerifyPass; else ++gVerifyFail;
+                        if (c.ok () && c.manifestVersion == 0x01)
+                            r.reason += "（v1 清单没有身份字段，兼容性还得靠 0204/0205）";
                     }
                 }
             }
@@ -375,6 +405,50 @@ bool sessionService (SessionGuard &g, const std::vector<std::uint8_t> &req,
         return true;
     }
     return false;
+}
+
+// M21：包预检（0x31 01 0205）。tester 把**整份 v2 清单**（104 字节）发上来，
+//   ECU 只验"信封"（结构 + 标签 + 身份），**不验哈希** —— 镜像还没传。
+//   为什么要这一步：M20 的目标身份是 tester 在 0204 里口述的，ECU 无从校验；
+//   身份一进清单、又落在标签下面，改一个字符标签就崩，tester 就说不了谎了。
+//   预检通过 → 直接拿到凭证（0x34 一次一用），这一轮的"能不能刷"不再依赖口述。
+//   只收 v2：v1（76 字节）没有身份字段，建立不了"已比对"的凭证。
+bool packageCheckService (policy::Gate &g, const DidTable &d, bool allowDowngrade,
+                          const std::vector<std::uint8_t> &req,
+                          std::vector<std::uint8_t> &resp, std::string &why)
+{
+    if (req.size () < 4 || req[0] != 0x31 || req[1] != 0x01 || req[2] != 0x02 || req[3] != 0x05)
+        return false;
+
+    const std::vector<std::uint8_t> m (req.begin () + 4, req.end ());
+    if (m.size () == fw::kManifestBytes)
+    {
+        resp = {0x7F, 0x31, kNrcRequestOutOfRange};
+        why  = "0205 只收带身份的 v2 清单（104 字节），收到的是 v1（76 字节）";
+        g.clear ();
+        return true;
+    }
+
+    const auto c = fw::checkEnvelope (m);
+    if (!c.ok ())
+    {
+        const std::uint8_t nrcCode = (c.verdict == fw::Verdict::BadLength) ? kNrcIncorrectLength
+                                                                          : kNrcRequestOutOfRange;
+        resp = {0x7F, 0x31, nrcCode};
+        why  = "预检：" + c.reason;
+        g.clear ();
+        ++gPackageFail;
+        return true;
+    }
+
+    // 信封没问题，剩下的是"这包是不是给这台车的"
+    const auto pr = policy::checkIdentity (d.partNumber (), d.swVersion (),
+                                           c.targetPart, c.targetSw, allowDowngrade);
+    g.set (pr.ok (), "预检 v2：" + pr.reason);
+    if (pr.ok ()) ++gPackagePass; else ++gPackageFail;
+    resp = {0x71, 0x01, 0x02, 0x05, static_cast<std::uint8_t> (pr.ok () ? 0x00 : 0x01)};
+    why  = std::string ("预检：") + (pr.ok () ? "可以刷" : "不能刷") + "（" + pr.reason + "）";
+    return true;
 }
 
 // M20：兼容性检查（0x31 01 0204）。记录 = <12 字节零件号><1–16 字节版本>。
@@ -625,7 +699,9 @@ int main (int argc, char **argv)
     fctx.batteryMv     = batteryMv;
     fctx.minBatteryMv  = kMinBatteryMv;
     fctx.requireCompat = requireCompat;
+    fctx.allowDowngrade= allowDowngrade;
     fctx.gate          = &policyGate;
+    fctx.dids          = &dids;
 
     std::string err;
     const int fd = openCan (iface, useFd, err);
@@ -686,6 +762,8 @@ int main (int argc, char **argv)
                      "0x34 %s\n", partNo.c_str (), swVer.c_str (),
                      allowDowngrade ? "（allowDowngrade 已开，可降级）" : "",
                      requireCompat ? "要凭证（一次一用）" : "不要求凭证（--require-compat 未开）");
+        std::printf ("           清单：v1 76 字节（无身份，0x31 01 FF02 整包验）/ v2 104 字节（含目标零件号+版本，"
+                     "标签盖住身份）；0x31 01 0205 只收 v2，预检通过直接发凭证\n");
     }
 
     IsoTpAssembler asm_ (4095, frameBytes);
@@ -794,6 +872,11 @@ int main (int argc, char **argv)
             }
         }
         if (!handled && !onFunc &&
+            packageCheckService (policyGate, dids, allowDowngrade, req, resp, why))   // M21：0x31 01 0205
+        {
+            handled = true;
+        }
+        if (!handled && !onFunc &&
             policyService (policyGate, dids, allowDowngrade, req, resp, why))   // M20：0x31 01 0204
         {
             handled = true;
@@ -882,6 +965,10 @@ int main (int argc, char **argv)
                      static_cast<unsigned> (gCompatPass + gCompatFail),
                      static_cast<unsigned> (gCompatPass), static_cast<unsigned> (gCompatFail),
                      static_cast<unsigned> (policyGate.consumes ()), policyGate.note ().c_str ());
+        std::printf ("预检：v2 清单 %u 次 → 通过 %u 次 / 不通过 %u 次；整包验签时身份不符 %u 次\n",
+                     static_cast<unsigned> (gPackagePass + gPackageFail),
+                     static_cast<unsigned> (gPackagePass), static_cast<unsigned> (gPackageFail),
+                     static_cast<unsigned> (gIdentityMismatch));
     }
     if (guard)
     {

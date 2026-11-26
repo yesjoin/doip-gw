@@ -191,6 +191,76 @@ int main ()
         CHECK (!fw::verify (image, m).ok (), "1000 字节里改最后一个字节也验不过");
     }
 
+    // ---- D. M21：v2 清单（含身份，标签盖住身份）----
+    {
+        std::vector<std::uint8_t> image = {9, 8, 7, 6, 5, 4, 3, 2};
+        const auto key1 = fw::demoKey (0x0001);
+        const auto m2   = fw::buildManifestV2 (8u, Sha256::of (image), 0x0001,
+                                               "PART-ABC1234", "SW-1.10.0", key1);
+
+        CHECK (m2.size () == fw::kManifestV2Bytes, "D1 v2 清单恰好 104 字节");
+        CHECK (m2[4] == 0x02, "D2 版本字节是 0x02");
+        CHECK (fw::readU16 (m2, 42) == 0x0001, "D3 v2 的 keyId 仍在偏移 42（前 44 字节与 v1 一致）");
+        CHECK (fw::trimText (m2, 44, 12) == "PART-ABC1234", "D4 目标零件号 12 字节读得回来");
+        CHECK (fw::trimText (m2, 56, 16) == "SW-1.10.0", "D5 目标版本（9 字节）能放进 16 字节字段，尾部补空格");
+
+        const auto ok2 = fw::verify (image, m2);
+        CHECK (ok2.ok () && ok2.hasIdentity && ok2.manifestVersion == 0x02,
+               "D6 v2 整包验签通过，并且带回身份");
+        CHECK (ok2.targetPart == "PART-ABC1234" && ok2.targetSw == "SW-1.10.0",
+               "D7 验签结果里带着目标身份（" + ok2.targetPart + " / " + ok2.targetSw + "）");
+
+        // 改一个字符的零件号：标签盖住这个字段，所以必须验不过
+        auto changed = m2;
+        changed[44] = static_cast<std::uint8_t> ('Q');
+        CHECK (!fw::verify (image, changed).ok (),
+               "D8 **改零件号一个字符 → 标签不符**（身份在标签范围内，改不了）");
+
+        // 改版本号同理
+        auto changed2 = m2;
+        changed2[58] = static_cast<std::uint8_t> ('9');
+        CHECK (!fw::verify (image, changed2).ok (), "D9 改目标版本一个字符 → 标签不符");
+
+        // 换镜像
+        auto swapped = image;
+        swapped[0] = 0x11;
+        CHECK (!fw::verify (swapped, m2).ok (), "D10 镜像换掉 → 哈希不符（v2 也要管内容）");
+
+        // 长度与版本必须成对
+        auto v1len = fw::buildManifest (8u, Sha256::of (image), 0x0001, key1);
+        v1len[4] = 0x02;
+        CHECK (fw::verify (image, v1len).verdict == fw::Verdict::BadMagic,
+               "D11 76 字节却写版本 0x02 → 0x31（长度与版本必须成对）");
+        auto v2len = m2;
+        v2len[4] = 0x01;
+        CHECK (fw::verify (image, v2len).verdict == fw::Verdict::BadMagic,
+               "D12 104 字节却写版本 0x01 → 0x31");
+
+        // 信封检查：不看镜像也能验结构 + 标签 + 身份
+        const auto env = fw::checkEnvelope (m2);
+        CHECK (env.ok () && env.hasIdentity && env.targetSw == "SW-1.10.0",
+               "D13 checkEnvelope：只验信封也给身份（0205 预检就靠它）");
+        CHECK (fw::checkEnvelope (changed).verdict == fw::Verdict::BadTag,
+               "D14 信封检查同样抓改身份（标签不符）");
+        CHECK (fw::checkEnvelope (v1len).verdict == fw::Verdict::BadMagic,
+               "D15 信封检查也查长度与版本的配对");
+
+        // v1 仍然能用（老包不能因为加了 v2 就作废）
+        const auto m1 = fw::buildManifest (8u, Sha256::of (image), 0x0001, key1);
+        const auto ok1 = fw::verify (image, m1);
+        CHECK (ok1.ok () && !ok1.hasIdentity && ok1.manifestVersion == 0x01,
+               "D16 v1 清单照旧能验，只是没有身份（hasIdentity=false）");
+
+        // 标签覆盖长度不同：v1 的标签不能拿来当 v2 的标签
+        auto mixed = m2;
+        for (int i = 0; i < 32; ++i) mixed[72 + i] = m1[44 + i];
+        CHECK (!fw::verify (image, mixed).ok (), "D17 把 v1 的标签搬到 v2 上 → 验不过（覆盖长度不同）");
+
+        CHECK (fw::buildManifestV2 (8u, Sha256::of (image), 0x0001, "PART-ABC12345", "SW-1.0.3", key1)
+                   .size () == fw::kManifestV2Bytes,
+               "D18 零件号超 12 字节时也只是截断到 12（不改变结构长度）");
+    }
+
     std::printf ("\n通过 %d 项，失败 %d 项\n", gPass, gFail);
     return gFail == 0 ? 0 : 1;
 }
