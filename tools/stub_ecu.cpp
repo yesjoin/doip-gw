@@ -36,6 +36,7 @@
 #include "FlashPolicy.h"
 #include "FlashPreconditions.h"
 #include "FlashTarget.h"
+#include "KeyRingStore.h"
 #include "SessionGuard.h"
 #include "IsoTpStack.h"
 
@@ -205,6 +206,10 @@ static std::uint32_t gKeyInstallOk  = 0;
 static std::uint32_t gKeyInstallRej = 0;
 static std::uint32_t gKeyStateChg   = 0;
 static std::uint32_t gRetiredVerify = 0;
+
+// M23：落盘的账 —— 坏文件几次、写盘失败几次
+static std::uint32_t gKeyStoreCorrupt = 0;
+static std::uint32_t gKeyPersistFail  = 0;
 
 // M15：刷写服务（0x31 / 0x34 / 0x36 / 0x37）—— 只做物理寻址，不参与广播。
 //   返回 false = "这不是刷写服务"，交给 M6 起就有的 answer() 去处理。
@@ -483,7 +488,28 @@ bool packageCheckService (policy::Gate &g, const DidTable &d, bool allowDowngrad
 //
 //   为什么装钥匙也要过门：装进去的钥匙能签出"验得过"的包 —— 它等价于发证书。
 //   谁能装钥匙，谁就能给这台车签任何包。
-bool keyService (keys::KeyRing &ring, const std::vector<std::uint8_t> &req,
+// M23：把表写到盘上。storePath 为空 = 这次没开 --key-store（只在内存，行为与 M22 一致）。
+//   写失败**不算成功**：内存改了、盘没改，重启就丢 —— 那种"装上了"是假的。
+static bool persistRing (const keys::KeyRing &ring, const std::string &storePath, std::string &why)
+{
+    if (storePath.empty ())
+    {
+        why = "没有 --key-store：只改内存";
+        return true;
+    }
+    std::string w;
+    if (keys::save (ring, storePath, w))
+    {
+        why = w;
+        return true;
+    }
+    ++gKeyPersistFail;
+    why = "落盘失败：" + w;
+    return false;
+}
+
+bool keyService (keys::KeyRing &ring, const std::string &storePath, bool storeLocked,
+                 const std::vector<std::uint8_t> &req,
                  std::vector<std::uint8_t> &resp, std::string &why)
 {
     if (req.size () == 3 && req[0] == 0x22 && req[1] == 0xF1 && req[2] == 0xB0)
@@ -518,14 +544,36 @@ bool keyService (keys::KeyRing &ring, const std::vector<std::uint8_t> &req,
         Sha256::Digest key;
         for (int i = 0; i < 32; ++i) key[i] = rec[2 + static_cast<std::size_t> (i)];
 
+        // 坏表上不许再写：半截的表说明"上一笔没落干净"，先重建再说。
+        //   允许往里补一笔，等于用一份新表悄悄盖掉旧表里可能还活着的吊销记录。
+        if (storeLocked)
+        {
+            resp = {0x7F, 0x31, kNrcConditionsNotCorrect};
+            why  = "钥匙表文件是坏的（启动时判 Corrupt），先 --reset-key-store 重建，别在半截的表上再写";
+            return true;
+        }
+        const keys::KeyRing before = ring;   // M23：落盘失败要退回这一份
         const keys::Install ins = ring.install (id, key);
         switch (ins)
         {
             case keys::Install::Ok:
+            {
                 ++gKeyInstallOk;
-                resp = {0x71, 0x01, 0x02, 0x06, 0x00};
-                why  = "装上新钥匙 0x" + fw::keyIdText (id) + "（启用）。表：" + ring.dump ();
+                std::string pwhy;
+                if (persistRing (ring, storePath, pwhy))
+                {
+                    resp = {0x71, 0x01, 0x02, 0x06, 0x00};
+                    why  = "装上新钥匙 0x" + fw::keyIdText (id) + "（启用）；" + pwhy +
+                           "。表：" + ring.dump ();
+                }
+                else
+                {
+                    ring = before;   // 盘上没写成功，就别在内存里假装装上了
+                    resp = {0x71, 0x01, 0x02, 0x06, 0x01};
+                    why  = "装上了但没写进盘：" + pwhy + "；已回滚（重启就丢的东西不能算装上了）";
+                }
                 break;
+            }
             case keys::Install::Full:
                 resp = {0x7F, 0x31, kNrcConditionsNotCorrect};
                 why  = "钥匙表满了（" + std::to_string (keys::KeyRing::kMaxKeys) +
@@ -557,14 +605,34 @@ bool keyService (keys::KeyRing &ring, const std::vector<std::uint8_t> &req,
             why  = "0207 的状态只认 00 启用 / 01 退役 / 02 吊销，收到 " + std::to_string (want);
             return true;
         }
+        if (storeLocked)
+        {
+            resp = {0x7F, 0x31, kNrcConditionsNotCorrect};
+            why  = "钥匙表文件是坏的（启动时判 Corrupt），先 --reset-key-store 重建，别在半截的表上再写";
+            return true;
+        }
+        const keys::KeyRing before = ring;   // M23：落盘失败要退回这一份
         switch (ring.setState (id, static_cast<keys::State> (want)))
         {
             case keys::Transition::Ok:
+            {
                 ++gKeyStateChg;
-                resp = {0x71, 0x01, 0x02, 0x07, 0x00};
-                why  = "0x" + fw::keyIdText (id) + " → " +
-                       keys::stateName (static_cast<keys::State> (want)) + "。表：" + ring.dump ();
+                std::string pwhy;
+                if (persistRing (ring, storePath, pwhy))
+                {
+                    resp = {0x71, 0x01, 0x02, 0x07, 0x00};
+                    why  = "0x" + fw::keyIdText (id) + " → " +
+                           keys::stateName (static_cast<keys::State> (want)) + "；" + pwhy +
+                           "。表：" + ring.dump ();
+                }
+                else
+                {
+                    ring = before;
+                    resp = {0x71, 0x01, 0x02, 0x07, 0x01};
+                    why  = "状态改了但没写进盘：" + pwhy + "；已回滚（吊销必须落盘，否则重启就复活）";
+                }
                 break;
+            }
             case keys::Transition::Immutable:
                 resp = {0x71, 0x01, 0x02, 0x07, 0x01};
                 why  = "0x" + fw::keyIdText (id) + " 已吊销，终态出不去（要恢复请装一把新 keyId 的钥匙）";
@@ -775,6 +843,9 @@ int main (int argc, char **argv)
     // M22：把某把钥匙挪到退役 / 吊销（默认两把都启用，老脚本不动）
     std::vector<std::uint32_t> retireKeys;
     std::vector<std::uint32_t> revokeKeys;
+    // M23：钥匙表落在哪个文件上（空 = 不落盘，行为与 M22 一致）
+    std::string keyStorePath;
+    bool        resetKeyStore = false;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -800,6 +871,8 @@ int main (int argc, char **argv)
         else if (a == "--allow-downgrade")             allowDowngrade = true;
         else if (a == "--retire-key" && i + 1 < argc)  retireKeys.push_back (static_cast<std::uint32_t> (std::strtoul (argv[++i], nullptr, 16)));
         else if (a == "--revoke-key" && i + 1 < argc)  revokeKeys.push_back (static_cast<std::uint32_t> (std::strtoul (argv[++i], nullptr, 16)));
+        else if (a == "--key-store" && i + 1 < argc)   keyStorePath = argv[++i];
+        else if (a == "--reset-key-store")             resetKeyStore = true;
         else
         {
             std::fprintf (stderr,
@@ -813,7 +886,9 @@ int main (int argc, char **argv)
                           "     --require-compat：0x34 必须先拿到 0x31 01 0204 的凭证（一次一用）\n"
                           "     --allow-downgrade：允许刷回比现在低的版本（默认拒）\n"
                           "     --retire-key <id>：启动时把这把钥匙置为退役（默认两把都启用）\n"
-                          "     --revoke-key <id>：启动时把这把钥匙置为吊销（终态，拒收它签的一切）\n", argv[0]);
+                          "     --revoke-key <id>：启动时把这把钥匙置为吊销（终态，拒收它签的一切）\n"
+                          "     --key-store <path>：钥匙表落到这个文件，重启后仍然生效（不写就只在内存）\n"
+                          "     --reset-key-store：不管文件里是什么，重建默认两把（现场换钥匙才用）\n", argv[0]);
             return 2;
         }
     }
@@ -841,9 +916,71 @@ int main (int argc, char **argv)
 
     // M22：这台车自己的钥匙表。默认两把（1/2 号）都启用 —— 与 M18–M21 等价，
     //   所以老脚本一条都不用改；--retire-key / --revoke-key 把某把挪到别的状态。
+    //
+    // M23：给 --key-store 就改成"从盘上读"：
+    //   ① 文件不存在 → 第一次上电，铺默认两把并写下去；
+    //   ② 文件读懂了 → 就按文件来（吊销记录这样活过重启）；
+    //   ③ 文件坏了 → **空表**，谁都验不过，绝不套默认两把 ——
+    //      因为"把损坏当默认"会把刚吊销的钥匙复活，那比起不来严重得多。
     keys::KeyRing keyRing;
-    keyRing.install (0x0001, fw::demoKey (0x0001));
-    keyRing.install (0x0002, fw::demoKey (0x0002));
+    keys::LoadStatus storeStatus = keys::LoadStatus::Missing;
+    std::string      storeNote   = "没开 --key-store：只在内存（重启回到默认两把）";
+
+    const auto seedDefaults = [] (keys::KeyRing &r) {
+        r.install (0x0001, fw::demoKey (0x0001));
+        r.install (0x0002, fw::demoKey (0x0002));
+    };
+
+    if (keyStorePath.empty ())
+    {
+        seedDefaults (keyRing);
+    }
+    else if (resetKeyStore)
+    {
+        seedDefaults (keyRing);
+        std::string w;
+        if (keys::save (keyRing, keyStorePath, w))
+        {
+            storeStatus = keys::LoadStatus::Ok;
+            storeNote   = "--reset-key-store 重建并 " + w;
+        }
+        else
+        {
+            ++gKeyPersistFail;
+            storeNote = "--reset-key-store 重建了内存里的表，但没写进盘：" + w;
+        }
+    }
+    else
+    {
+        const keys::LoadResult lr = keys::load (keyStorePath);
+        storeStatus = lr.status;
+        storeNote   = lr.why;
+        if (lr.status == keys::LoadStatus::Ok)
+        {
+            keyRing = lr.ring;
+        }
+        else if (lr.status == keys::LoadStatus::Missing)
+        {
+            seedDefaults (keyRing);
+            std::string w;
+            if (keys::save (keyRing, keyStorePath, w))
+            {
+                storeStatus = keys::LoadStatus::Ok;
+                storeNote   = "第一次上电：" + w;
+            }
+            else
+            {
+                ++gKeyPersistFail;
+                storeNote = "第一次上电，但默认两把没写进盘：" + w;
+            }
+        }
+        else
+        {
+            ++gKeyStoreCorrupt;   // 空表 + 大声说；重建要人明确 --reset-key-store
+            storeNote = "文件坏了，不采用：" + lr.why +
+                        "（表按空处理，谁都验不过；确认真要重建再加 --reset-key-store）";
+        }
+    }
     for (std::uint32_t id : retireKeys)
         if (keyRing.setState (static_cast<std::uint16_t> (id), keys::State::Retiring) !=
             keys::Transition::Ok)
@@ -852,6 +989,22 @@ int main (int argc, char **argv)
         if (keyRing.setState (static_cast<std::uint16_t> (id), keys::State::Revoked) !=
             keys::Transition::Ok)
             std::printf ("  [警告] --revoke-key 0x%04X：表里没有这把，忽略\n", id);
+
+    // 启动参数改过状态就要落盘，否则"这次吊销"活不过下一个重启
+    if (!keyStorePath.empty () && (!retireKeys.empty () || !revokeKeys.empty ())
+        && storeStatus != keys::LoadStatus::Corrupt)
+    {
+        std::string w;
+        if (!keys::save (keyRing, keyStorePath, w))
+        {
+            ++gKeyPersistFail;
+            std::printf ("  [警告] --retire-key/--revoke-key 没能落盘：%s\n", w.c_str ());
+        }
+        else
+        {
+            storeNote += "；启动参数改过的状态已落盘";
+        }
+    }
 
     FlashContext fctx;
     fctx.batteryMv     = batteryMv;
@@ -925,6 +1078,8 @@ int main (int argc, char **argv)
                      "标签盖住身份）；0x31 01 0205 只收 v2，预检通过直接发凭证\n");
         std::printf ("           钥匙：0x22 F1B0 读表 / 0x31 01 02 06 装新钥匙 / 0x31 01 02 07 改状态"
                      "（00 启用·01 退役·02 吊销，吊销是终态）；装与改都要编程会话 + 解锁\n");
+        std::printf ("           钥匙表：%s —— %s\n",
+                     keyStorePath.empty () ? "（内存）" : keyStorePath.c_str (), storeNote.c_str ());
     }
 
     IsoTpAssembler asm_ (4095, frameBytes);
@@ -1048,7 +1203,7 @@ int main (int argc, char **argv)
             handled = true;
         }
         if (!handled && !onFunc &&
-            keyService (keyRing, req, resp, why))   // M22：0x22 F1B0 读表 / 0206 装钥匙 / 0207 改状态
+            keyService (keyRing, keyStorePath, storeStatus == keys::LoadStatus::Corrupt, req, resp, why))   // M22：0x22 F1B0 读表 / 0206 装钥匙 / 0207 改状态
         {
             handled = true;
         }
@@ -1140,6 +1295,9 @@ int main (int argc, char **argv)
                      static_cast<unsigned> (gKeyInstallOk), static_cast<unsigned> (gKeyInstallRej),
                      static_cast<unsigned> (gKeyStateChg), static_cast<unsigned> (gRetiredVerify),
                      keyRing.dump ().c_str ());
+        std::printf ("钥匙表：%s；坏文件 %u 次；落盘失败 %u 次\n",
+                     keyStorePath.empty () ? "（内存，重启即丢）" : keyStorePath.c_str (),
+                     static_cast<unsigned> (gKeyStoreCorrupt), static_cast<unsigned> (gKeyPersistFail));
     }
     if (guard)
     {

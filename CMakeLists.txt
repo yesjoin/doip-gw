@@ -120,6 +120,10 @@ target_include_directories(policy-selftest PRIVATE include)
 add_executable(keyring-selftest tests/keyring_selftest.cpp)
 target_include_directories(keyring-selftest PRIVATE include)
 
+# M23：钥匙表落盘（编码 / 往返 / 坏文件不猜 / 原子写）
+add_executable(keyringstore-selftest tests/keyringstore_selftest.cpp)
+target_include_directories(keyringstore-selftest PRIVATE include)
+
 # ---- 工具 ----
 add_executable(doip-dump tools/doip_dump.cpp)
 target_link_libraries(doip-dump PRIVATE doip-codec)
@@ -165,4 +169,5 @@ add_test(NAME doip-integrity COMMAND integrity-selftest)
 add_test(NAME doip-precheck COMMAND preconditions-selftest)
 add_test(NAME doip-policy COMMAND policy-selftest)
 add_test(NAME doip-keyring COMMAND keyring-selftest)
-set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic doip-isotp doip-route doip-pool doip-collector doip-stream doip-registry doip-entity doip-flash doip-session doip-reset doip-integrity doip-precheck doip-policy doip-keyring PROPERTIES LABELS unit)
+add_test(NAME doip-keyringstore COMMAND keyringstore-selftest)
+set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic doip-isotp doip-route doip-pool doip-collector doip-stream doip-registry doip-entity doip-flash doip-session doip-reset doip-integrity doip-precheck doip-policy doip-keyring doip-keyringstore PROPERTIES LABELS unit)
