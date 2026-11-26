@@ -55,7 +55,9 @@ stdbuf -oL "$GW" --iface "$IFACE" --port "$PORT_A" --seconds 24 \
         --route 0003:7A0:7A8:ECU_A > "$SLOG" 2>&1 &
 sleep 1.2
 
-grep -q "钥匙：0x22 F1B0 读表 / 0x31 01 02 06 装新钥匙" "$ELOG" \
+# M24 给 banner 加了摘要与容量表决两行，所以这里只认"三个服务的名字"——不认整句措辞。
+# （读表 / 装钥匙 / 改状态 三个都在；整句会随新服务增加而变，拿整句当接口就得每次跟着改）
+grep -q "钥匙：0x22 F1B0 读表" "$ELOG" && grep -q "0x31 01 02 06" "$ELOG" && grep -q "0x31 01 02 07" "$ELOG" \
     && ok "启动行说清了读表 / 装钥匙 / 改状态三个服务" || bad "启动行没提钥匙服务"
 
 echo

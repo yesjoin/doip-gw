@@ -531,6 +531,38 @@ bool keyService (keys::KeyRing &ring, const std::string &storePath, bool storeLo
         return true;
     }
 
+    // M24：0x22 F1B1 钥匙表摘要 —— 全表压成 4 个计数，正好 7 字节，能塞进功能寻址的一个单帧。
+    //   车队"先看一眼大家一不一样"，用它；要看细节再逐台读 F1B0（那条 3+3N 在经典帧下塞不下）。
+    if (req.size () == 3 && req[0] == 0x22 && req[1] == 0xF1 && req[2] == 0xB1)
+    {
+        resp = {0x62, 0xF1, 0xB1,
+                static_cast<std::uint8_t> (ring.size ()),
+                static_cast<std::uint8_t> (ring.count (keys::State::Active)),
+                static_cast<std::uint8_t> (ring.count (keys::State::Retiring)),
+                static_cast<std::uint8_t> (ring.count (keys::State::Revoked))};
+        why = "钥匙摘要：共 " + std::to_string (ring.size ()) + " / 启用 " +
+              std::to_string (ring.count (keys::State::Active)) + " / 退役 " +
+              std::to_string (ring.count (keys::State::Retiring)) + " / 吊销 " +
+              std::to_string (ring.count (keys::State::Revoked));
+        return true;
+    }
+
+    // M24：0x31 01 02 0A "这台现在能不能装一把" —— 问，不是做，所以不过门。
+    //   为什么要这一问：装钥匙的请求 38 字节，功能寻址塞不进单帧，只能逐台下发；
+    //   下发之前先广播问一圈"你们谁装不下"，比装到一半发现某台表满好。
+    if (req.size () == 4 && req[0] == 0x31 && req[1] == 0x01 && req[2] == 0x02 && req[3] == 0x0A)
+    {
+        std::uint8_t verdict = 0x00;
+        if (storeLocked)                                    verdict = 0x02;
+        else if (ring.size () >= keys::KeyRing::kMaxKeys)   verdict = 0x01;
+        resp = {0x71, 0x01, 0x02, 0x0A, verdict};
+        why  = (verdict == 0x00) ? "能装（" + std::to_string (ring.size ()) + "/" +
+                                      std::to_string (keys::KeyRing::kMaxKeys) + " 槽已用）"
+               : (verdict == 0x01) ? "表满了，装不下"
+                                   : "钥匙表文件是坏的，先重建";
+        return true;
+    }
+
     if (req.size () >= 4 && req[0] == 0x31 && req[1] == 0x01 && req[2] == 0x02 && req[3] == 0x06)
     {
         const std::vector<std::uint8_t> rec (req.begin () + 4, req.end ());
@@ -1076,8 +1108,9 @@ int main (int argc, char **argv)
                      requireCompat ? "要凭证（一次一用）" : "不要求凭证（--require-compat 未开）");
         std::printf ("           清单：v1 76 字节（无身份，0x31 01 FF02 整包验）/ v2 104 字节（含目标零件号+版本，"
                      "标签盖住身份）；0x31 01 0205 只收 v2，预检通过直接发凭证\n");
-        std::printf ("           钥匙：0x22 F1B0 读表 / 0x31 01 02 06 装新钥匙 / 0x31 01 02 07 改状态"
-                     "（00 启用·01 退役·02 吊销，吊销是终态）；装与改都要编程会话 + 解锁\n");
+        std::printf ("           钥匙：0x22 F1B0 读表 / 0x22 F1B1 摘要（4 个计数，7 字节，可广播）/ "
+                     "0x31 01 02 0A 能不能装（问，不过门）/ 0x31 01 02 06 装 / 0x31 01 02 07 改状态；"
+                     "装与改都要编程会话 + 解锁\n");
         std::printf ("           钥匙表：%s —— %s\n",
                      keyStorePath.empty () ? "（内存）" : keyStorePath.c_str (), storeNote.c_str ());
     }
@@ -1181,7 +1214,9 @@ int main (int argc, char **argv)
             {
                 handled = true;    // 0x31 01 0203：正响应 + 状态 00/01
             }
-            if (!handled && flash && !onFunc &&
+            // M24：门禁对**广播来的动作**也生效 —— 但每台用自己那份会话状态判。
+            //   功能寻址不会"因为其中一台解锁了就替所有人放行"：每个 ECU 自己过自己的门。
+            if (!handled && flash &&
                 flashGateDenied (*guard, req, resp, why))
             {
                 handled = true;    // 被门挡住：回了 0x7F / 0x33，下面不再走刷写
@@ -1202,8 +1237,10 @@ int main (int argc, char **argv)
         {
             handled = true;
         }
-        if (!handled && !onFunc &&
-            keyService (keyRing, keyStorePath, storeStatus == keys::LoadStatus::Corrupt, req, resp, why))   // M22：0x22 F1B0 读表 / 0206 装钥匙 / 0207 改状态
+        // M24：钥匙服务允许走功能寻址 —— 一条广播让几台一起装/改。
+        //   代价写在协议里：功能寻址的应答必须塞进一个单帧，所以"广播读整张表"在经典帧下答不出来。
+        if (!handled &&
+            keyService (keyRing, keyStorePath, storeStatus == keys::LoadStatus::Corrupt, req, resp, why))   // M22/M24：0x22 F1B0 读表 / 0206 装钥匙 / 0207 改状态
         {
             handled = true;
         }
