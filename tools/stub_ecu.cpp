@@ -47,12 +47,14 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <memory>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace doip;
@@ -198,6 +200,12 @@ static std::uint32_t gPackagePass = 0;
 static std::uint32_t gPackageFail = 0;
 static std::uint32_t gIdentityMismatch = 0;
 
+// M22：钥匙的三本账 + "退役钥匙验过几次"
+static std::uint32_t gKeyInstallOk  = 0;
+static std::uint32_t gKeyInstallRej = 0;
+static std::uint32_t gKeyStateChg   = 0;
+static std::uint32_t gRetiredVerify = 0;
+
 // M15：刷写服务（0x31 / 0x34 / 0x36 / 0x37）—— 只做物理寻址，不参与广播。
 //   返回 false = "这不是刷写服务"，交给 M6 起就有的 answer() 去处理。
 //   刷写是**有状态的会话**，所以它必须待在主循环里（一个 FlashTarget 跟着这台 ECU 活）。
@@ -212,6 +220,7 @@ struct FlashContext
     bool              allowDowngrade= false;      // 允许降级
     policy::Gate     *gate         = nullptr;     // 凭证（nullptr = 这条路径不管凭证）
     const DidTable   *dids         = nullptr;     // 车自己的身份（M21：验签时比对清单里的目标身份）
+    const keys::KeyRing *ring      = nullptr;     // M22：验签要用这台车**自己的**钥匙表
 };
 
 bool flashService (FlashTarget &t, const FlashContext &ctx, const std::vector<std::uint8_t> &req,
@@ -238,7 +247,10 @@ bool flashService (FlashTarget &t, const FlashContext &ctx, const std::vector<st
                 //   格式不对（长度/magic/版本/不认识这把钥匙）→ 我这边按 NRC 回（请求本身不合法）；
                 //   内容不对（标签/长度/哈希）→ 正响应带状态 01（请求合法，是包不对）。
                 // 这两个分类别混：NRC 0x31 会让诊断仪以为"服务用错了"，而状态 01 才是"重刷一份包"。
-                const auto c = fw::verify (t.image (), std::vector<std::uint8_t> (req.begin () + 4, req.end ()));
+                // M22：验签用这台车**自己的**钥匙表（没有就退回演示表，只为兼容老测试）
+                const std::vector<std::uint8_t> man (req.begin () + 4, req.end ());
+                const auto c = fw::verify (t.image (), man,
+                                           ctx.ring != nullptr ? *ctx.ring : fw::demoRing ());
                 if (t.image ().empty ())
                 {
                     r.positive = false;
@@ -249,8 +261,9 @@ bool flashService (FlashTarget &t, const FlashContext &ctx, const std::vector<st
                 {
                     std::uint8_t nrcCode = 0;
                     if (c.verdict == fw::Verdict::BadLength) nrcCode = kNrcIncorrectLength;
-                    else if (c.verdict == fw::Verdict::BadMagic || c.verdict == fw::Verdict::UnknownKey)
-                        nrcCode = kNrcRequestOutOfRange;
+                    else if (c.verdict == fw::Verdict::BadMagic || c.verdict == fw::Verdict::UnknownKey ||
+                             c.verdict == fw::Verdict::RevokedKey)
+                        nrcCode = kNrcRequestOutOfRange;   // M22：吊销也是"这包不是我们能收的"
 
                     if (nrcCode != 0)
                     {
@@ -288,6 +301,14 @@ bool flashService (FlashTarget &t, const FlashContext &ctx, const std::vector<st
                         if (c.ok ()) ++gVerifyPass; else ++gVerifyFail;
                         if (c.ok () && c.manifestVersion == 0x01)
                             r.reason += "（v1 清单没有身份字段，兼容性还得靠 0204/0205）";
+                    }
+
+                    // M22：退役钥匙签的包**照验**，但要单独记账
+                    //   —— 安全审计真正关心的是"还有多少包在用旧钥匙"，不是"验没验过"。
+                    if (c.ok () && c.keyState == keys::State::Retiring)
+                    {
+                        ++gRetiredVerify;
+                        r.reason += "（退役钥匙 0x" + fw::keyIdText (fw::readU16 (man, 42)) + "，照验）";
                     }
                 }
             }
@@ -414,6 +435,7 @@ bool sessionService (SessionGuard &g, const std::vector<std::uint8_t> &req,
 //   预检通过 → 直接拿到凭证（0x34 一次一用），这一轮的"能不能刷"不再依赖口述。
 //   只收 v2：v1（76 字节）没有身份字段，建立不了"已比对"的凭证。
 bool packageCheckService (policy::Gate &g, const DidTable &d, bool allowDowngrade,
+                          const keys::KeyRing &ring,
                           const std::vector<std::uint8_t> &req,
                           std::vector<std::uint8_t> &resp, std::string &why)
 {
@@ -429,7 +451,7 @@ bool packageCheckService (policy::Gate &g, const DidTable &d, bool allowDowngrad
         return true;
     }
 
-    const auto c = fw::checkEnvelope (m);
+    const auto c = fw::checkEnvelope (m, ring);   // M22：钥匙从这台车的表里查
     if (!c.ok ())
     {
         const std::uint8_t nrcCode = (c.verdict == fw::Verdict::BadLength) ? kNrcIncorrectLength
@@ -446,9 +468,116 @@ bool packageCheckService (policy::Gate &g, const DidTable &d, bool allowDowngrad
                                            c.targetPart, c.targetSw, allowDowngrade);
     g.set (pr.ok (), "预检 v2：" + pr.reason);
     if (pr.ok ()) ++gPackagePass; else ++gPackageFail;
+    if (c.keyState == keys::State::Retiring) ++gRetiredVerify;   // M22：退役钥匙过的预检也记账
     resp = {0x71, 0x01, 0x02, 0x05, static_cast<std::uint8_t> (pr.ok () ? 0x00 : 0x01)};
     why  = std::string ("预检：") + (pr.ok () ? "可以刷" : "不能刷") + "（" + pr.reason + "）";
+    if (c.keyState == keys::State::Retiring)
+        why += "（用的是退役钥匙 0x" + fw::keyIdText (fw::readU16 (m, 42)) + "）";
     return true;
+}
+
+// M22：钥匙管理。三个服务，两种性质：
+//   0x22 F1B0       读钥匙表（谁都能问：诊断仪要知道这台车认哪几把钥匙）
+//   0x31 01 02 06   装一把新钥匙（动作，归 flashGateDenied 管：编程会话 + 解锁）
+//   0x31 01 02 07   改状态 00 启用 / 01 退役 / 02 吊销（动作，同上）
+//
+//   为什么装钥匙也要过门：装进去的钥匙能签出"验得过"的包 —— 它等价于发证书。
+//   谁能装钥匙，谁就能给这台车签任何包。
+bool keyService (keys::KeyRing &ring, const std::vector<std::uint8_t> &req,
+                 std::vector<std::uint8_t> &resp, std::string &why)
+{
+    if (req.size () == 3 && req[0] == 0x22 && req[1] == 0xF1 && req[2] == 0xB0)
+    {
+        // 表按装入顺序存，报出去按 id 升序 —— 诊断仪要能一眼数清
+        std::vector<std::pair<std::uint16_t, keys::State>> rows;
+        for (std::size_t i = 0; i < ring.size (); ++i)
+            rows.emplace_back (ring.at (i).id, ring.at (i).state);
+        std::sort (rows.begin (), rows.end ());
+
+        resp = {0x62, 0xF1, 0xB0};
+        for (const auto &row : rows)
+        {
+            resp.push_back (static_cast<std::uint8_t> ((row.first >> 8) & 0xFF));
+            resp.push_back (static_cast<std::uint8_t> (row.first & 0xFF));
+            resp.push_back (keys::stateCode (row.second));
+        }
+        why = "钥匙表：" + ring.dump ();
+        return true;
+    }
+
+    if (req.size () >= 4 && req[0] == 0x31 && req[1] == 0x01 && req[2] == 0x02 && req[3] == 0x06)
+    {
+        const std::vector<std::uint8_t> rec (req.begin () + 4, req.end ());
+        if (rec.size () != 34)
+        {
+            resp = {0x7F, 0x31, kNrcIncorrectLength};
+            why  = "0206 要 2 字节 keyId + 32 字节材料（共 34），实际 " + std::to_string (rec.size ()) + " 字节";
+            return true;
+        }
+        const std::uint16_t id = static_cast<std::uint16_t> ((rec[0] << 8) | rec[1]);
+        Sha256::Digest key;
+        for (int i = 0; i < 32; ++i) key[i] = rec[2 + static_cast<std::size_t> (i)];
+
+        const keys::Install ins = ring.install (id, key);
+        switch (ins)
+        {
+            case keys::Install::Ok:
+                ++gKeyInstallOk;
+                resp = {0x71, 0x01, 0x02, 0x06, 0x00};
+                why  = "装上新钥匙 0x" + fw::keyIdText (id) + "（启用）。表：" + ring.dump ();
+                break;
+            case keys::Install::Full:
+                resp = {0x7F, 0x31, kNrcConditionsNotCorrect};
+                why  = "钥匙表满了（" + std::to_string (keys::KeyRing::kMaxKeys) +
+                       " 把），要装新钥匙得先腾一个槽";
+                break;
+            default:   // Exists / BadId：都是"这个槽位不能用"
+                ++gKeyInstallRej;
+                resp = {0x71, 0x01, 0x02, 0x06, 0x01};
+                why  = std::string ("没装上：") + keys::installName (ins);
+                break;
+        }
+        return true;
+    }
+
+    if (req.size () >= 4 && req[0] == 0x31 && req[1] == 0x01 && req[2] == 0x02 && req[3] == 0x07)
+    {
+        const std::vector<std::uint8_t> rec (req.begin () + 4, req.end ());
+        if (rec.size () != 3)
+        {
+            resp = {0x7F, 0x31, kNrcIncorrectLength};
+            why  = "0207 要 2 字节 keyId + 1 字节目标状态（共 3），实际 " + std::to_string (rec.size ()) + " 字节";
+            return true;
+        }
+        const std::uint16_t id   = static_cast<std::uint16_t> ((rec[0] << 8) | rec[1]);
+        const std::uint8_t  want = rec[2];
+        if (want > 0x02)
+        {
+            resp = {0x7F, 0x31, kNrcRequestOutOfRange};
+            why  = "0207 的状态只认 00 启用 / 01 退役 / 02 吊销，收到 " + std::to_string (want);
+            return true;
+        }
+        switch (ring.setState (id, static_cast<keys::State> (want)))
+        {
+            case keys::Transition::Ok:
+                ++gKeyStateChg;
+                resp = {0x71, 0x01, 0x02, 0x07, 0x00};
+                why  = "0x" + fw::keyIdText (id) + " → " +
+                       keys::stateName (static_cast<keys::State> (want)) + "。表：" + ring.dump ();
+                break;
+            case keys::Transition::Immutable:
+                resp = {0x71, 0x01, 0x02, 0x07, 0x01};
+                why  = "0x" + fw::keyIdText (id) + " 已吊销，终态出不去（要恢复请装一把新 keyId 的钥匙）";
+                break;
+            default:
+                resp = {0x71, 0x01, 0x02, 0x07, 0x01};
+                why  = "0x" + fw::keyIdText (id) + " 不在钥匙表里（表：" + ring.dump () + "）";
+                break;
+        }
+        return true;
+    }
+
+    return false;
 }
 
 // M20：兼容性检查（0x31 01 0204）。记录 = <12 字节零件号><1–16 字节版本>。
@@ -539,10 +668,17 @@ bool flashGateDenied (const SessionGuard &g, const std::vector<std::uint8_t> &re
     bool isFlashSid = (req[0] == 0x34 || req[0] == 0x36 || req[0] == 0x37 || req[0] == 0x2E);
     if (!isFlashSid && req[0] == 0x31)
     {
-        // 只挡 FF00 擦除 / FF01 校验，别的例程照旧走老 answer()（回 7F 31 31）
-        isFlashSid = req.size () >= 4 && req[1] == 0x01 &&
-                     ((req[2] == 0xFF && req[3] == 0x00) || (req[2] == 0xFF && req[3] == 0x01) ||
-                      (req[2] == 0xFF && req[3] == 0x02));
+        // 只挡刷写这一族例程，别的照旧走老 answer()（回 7F 31 31）
+        //   M22：把 0205 也补进来（它发凭证，属于动作）；再加 0206 装钥匙 / 0207 改状态
+        //   —— 装进去的钥匙能签出"验得过"的包，这个动作的权限等于发证书。
+        //   注意：先判长度再读 req[3] —— 短请求（如只有 "31 01"）在这里不能越界。
+        if (req.size () >= 4 && req[1] == 0x01)
+        {
+            const bool flashFamily = (req[2] == 0xFF && req[3] <= 0x02);
+            const bool credFamily  = (req[2] == 0x02 &&
+                                      (req[3] == 0x05 || req[3] == 0x06 || req[3] == 0x07));
+            isFlashSid = flashFamily || credFamily;
+        }
     }
     if (!isFlashSid) return false;
     if (g.flashAllowed ()) return false;
@@ -636,6 +772,9 @@ int main (int argc, char **argv)
     // M20：刷写前的兼容性校验。默认关 —— 老脚本（M15–M19）不跑 0204 也能刷。
     bool requireCompat = false;
     bool allowDowngrade = false;
+    // M22：把某把钥匙挪到退役 / 吊销（默认两把都启用，老脚本不动）
+    std::vector<std::uint32_t> retireKeys;
+    std::vector<std::uint32_t> revokeKeys;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -659,6 +798,8 @@ int main (int argc, char **argv)
         else if (a == "--battery-mv" && i + 1 < argc)  batteryMv  = static_cast<std::uint32_t> (std::atoi (argv[++i]));
         else if (a == "--require-compat")              requireCompat = true;
         else if (a == "--allow-downgrade")             allowDowngrade = true;
+        else if (a == "--retire-key" && i + 1 < argc)  retireKeys.push_back (static_cast<std::uint32_t> (std::strtoul (argv[++i], nullptr, 16)));
+        else if (a == "--revoke-key" && i + 1 < argc)  revokeKeys.push_back (static_cast<std::uint32_t> (std::strtoul (argv[++i], nullptr, 16)));
         else
         {
             std::fprintf (stderr,
@@ -670,7 +811,9 @@ int main (int argc, char **argv)
                           "     --secure：给刷写加门禁（先 0x10 02、再 0x27 解锁；S3 超时回落默认会话）\n"
                           "     --battery-mv：这台 ECU 报的电压（0x22 F1A5），低于 11500 时 0x34 会被挡\n"
                           "     --require-compat：0x34 必须先拿到 0x31 01 0204 的凭证（一次一用）\n"
-                          "     --allow-downgrade：允许刷回比现在低的版本（默认拒）\n", argv[0]);
+                          "     --allow-downgrade：允许刷回比现在低的版本（默认拒）\n"
+                          "     --retire-key <id>：启动时把这把钥匙置为退役（默认两把都启用）\n"
+                          "     --revoke-key <id>：启动时把这把钥匙置为吊销（终态，拒收它签的一切）\n", argv[0]);
             return 2;
         }
     }
@@ -695,6 +838,21 @@ int main (int argc, char **argv)
     static constexpr std::uint32_t kMinBatteryMv = 11500;   // 12V 系统：低于 11.5V 不刷
     DidTable dids (partNo, swVer, serial, 0x00000000u, batteryMv);
     policy::Gate policyGate;   // M20：0204 的凭证（擦除/复位/换会话/收尾都会 clear）
+
+    // M22：这台车自己的钥匙表。默认两把（1/2 号）都启用 —— 与 M18–M21 等价，
+    //   所以老脚本一条都不用改；--retire-key / --revoke-key 把某把挪到别的状态。
+    keys::KeyRing keyRing;
+    keyRing.install (0x0001, fw::demoKey (0x0001));
+    keyRing.install (0x0002, fw::demoKey (0x0002));
+    for (std::uint32_t id : retireKeys)
+        if (keyRing.setState (static_cast<std::uint16_t> (id), keys::State::Retiring) !=
+            keys::Transition::Ok)
+            std::printf ("  [警告] --retire-key 0x%04X：表里没有这把，忽略\n", id);
+    for (std::uint32_t id : revokeKeys)
+        if (keyRing.setState (static_cast<std::uint16_t> (id), keys::State::Revoked) !=
+            keys::Transition::Ok)
+            std::printf ("  [警告] --revoke-key 0x%04X：表里没有这把，忽略\n", id);
+
     FlashContext fctx;
     fctx.batteryMv     = batteryMv;
     fctx.minBatteryMv  = kMinBatteryMv;
@@ -702,6 +860,7 @@ int main (int argc, char **argv)
     fctx.allowDowngrade= allowDowngrade;
     fctx.gate          = &policyGate;
     fctx.dids          = &dids;
+    fctx.ring          = &keyRing;
 
     std::string err;
     const int fd = openCan (iface, useFd, err);
@@ -764,6 +923,8 @@ int main (int argc, char **argv)
                      requireCompat ? "要凭证（一次一用）" : "不要求凭证（--require-compat 未开）");
         std::printf ("           清单：v1 76 字节（无身份，0x31 01 FF02 整包验）/ v2 104 字节（含目标零件号+版本，"
                      "标签盖住身份）；0x31 01 0205 只收 v2，预检通过直接发凭证\n");
+        std::printf ("           钥匙：0x22 F1B0 读表 / 0x31 01 02 06 装新钥匙 / 0x31 01 02 07 改状态"
+                     "（00 启用·01 退役·02 吊销，吊销是终态）；装与改都要编程会话 + 解锁\n");
     }
 
     IsoTpAssembler asm_ (4095, frameBytes);
@@ -872,7 +1033,7 @@ int main (int argc, char **argv)
             }
         }
         if (!handled && !onFunc &&
-            packageCheckService (policyGate, dids, allowDowngrade, req, resp, why))   // M21：0x31 01 0205
+            packageCheckService (policyGate, dids, allowDowngrade, keyRing, req, resp, why))   // M21：0x31 01 0205
         {
             handled = true;
         }
@@ -883,6 +1044,11 @@ int main (int argc, char **argv)
         }
         if (!handled && flash && !onFunc &&
             flashService (*flash, fctx, req, resp, why))
+        {
+            handled = true;
+        }
+        if (!handled && !onFunc &&
+            keyService (keyRing, req, resp, why))   // M22：0x22 F1B0 读表 / 0206 装钥匙 / 0207 改状态
         {
             handled = true;
         }
@@ -969,6 +1135,11 @@ int main (int argc, char **argv)
                      static_cast<unsigned> (gPackagePass + gPackageFail),
                      static_cast<unsigned> (gPackagePass), static_cast<unsigned> (gPackageFail),
                      static_cast<unsigned> (gIdentityMismatch));
+        std::printf ("钥匙：安装 %u 次（成 %u / 拒 %u），状态变更 %u 次；退役钥匙验签 %u 次；表：%s\n",
+                     static_cast<unsigned> (gKeyInstallOk + gKeyInstallRej),
+                     static_cast<unsigned> (gKeyInstallOk), static_cast<unsigned> (gKeyInstallRej),
+                     static_cast<unsigned> (gKeyStateChg), static_cast<unsigned> (gRetiredVerify),
+                     keyRing.dump ().c_str ());
     }
     if (guard)
     {

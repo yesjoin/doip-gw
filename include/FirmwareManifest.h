@@ -39,9 +39,11 @@
 #ifndef DOIP_FIRMWARE_MANIFEST_H
 #define DOIP_FIRMWARE_MANIFEST_H
 
+#include "KeyRing.h"
 #include "Sha256.h"
 
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <vector>
 
@@ -61,6 +63,7 @@ enum class Verdict
     BadLength,       // 既不是 76 也不是 104（格式外的东西，0x13）
     BadMagic,        // magic / 版本 / flags 不对（不是我们这个格式，0x31）
     UnknownKey,      // keyId 不认识（0x31）
+    RevokedKey,      // M22：keyId 在表里，但已被吊销（0x31，理由不同）
     BadTag,          // 标签对不上（有人换了清单或不知道钥匙）→ 状态 01
     LengthMismatch,  // 清单说的长度与镜像实际长度不符 → 状态 01
     HashMismatch     // 镜像哈希不符（包与镜像不是一对）→ 状态 01
@@ -75,6 +78,7 @@ struct Check
     bool         hasIdentity     = false;  // v2 才有
     std::string  targetPart;             // v2 的零件号（已去掉尾部空格）
     std::string  targetSw;               // v2 的目标版本（已去掉尾部空格）
+    keys::State  keyState = keys::State::Active;   // M22：用的是哪一档钥匙（退役/吊销要记账）
 
     bool ok () const { return verdict == Verdict::Ok; }
 };
@@ -84,6 +88,23 @@ struct Check
 inline Sha256::Digest demoKey (std::uint16_t id)
 {
     return Sha256::ofText ("doip-gw demo key " + std::to_string (id));
+}
+
+// 演示用的钥匙表：1 号、2 号两把都启用（等于 M18–M21 里那个 switch 的等价物）。
+// M22 的真表由 stub 用 KeyRing 建，这里只是给老单元测试留一条默认路径。
+inline keys::KeyRing demoRing ()
+{
+    keys::KeyRing ring;
+    ring.install (0x0001, demoKey (0x0001));
+    ring.install (0x0002, demoKey (0x0002));
+    return ring;
+}
+
+inline std::string keyIdText (std::uint16_t id)
+{
+    char buf[8];
+    std::snprintf (buf, sizeof buf, "%04X", static_cast<unsigned> (id));
+    return buf;
 }
 
 // headerBytes 决定标签盖住清单的前多少字节（v1 = 44，v2 = 72）
@@ -192,7 +213,7 @@ inline bool lookupKey (std::uint16_t keyId, Sha256::Digest &outKey)
 // "信封"检查：长度 / magic / 版本 / 钥匙 / 标签 / 身份字段。
 //   不看镜像 —— 所以它可以在镜像还没传上来之前就跑（M21 的 0x31 01 0205 用它做预检）。
 //   校验顺序仍是先便宜后贵：长度 → magic/版本 → 钥匙 ID → 标签（只看头部）。
-inline Check checkEnvelope (const std::vector<std::uint8_t> &manifest)
+inline Check checkEnvelope (const std::vector<std::uint8_t> &manifest, const keys::KeyRing &ring)
 {
     Check c;
     const std::size_t n = manifest.size ();
@@ -223,16 +244,27 @@ inline Check checkEnvelope (const std::vector<std::uint8_t> &manifest)
         return c;
     }
 
-    Sha256::Digest key;
-    std::uint16_t  keyId = readU16 (manifest, 42);
-    if (!lookupKey (keyId, key))
+    // M22：钥匙从表里查，不是从源码里查。三种结论必须分开：
+    //   表里没有 → 不认识（这包不是我们这套体系签的）；
+    //   表里有但吊销了 → 拒收（这包可能是一个已知泄露的密钥签的）；
+    //   表里有、退役了 → **照验**（在途的包还得能过），但要记账。
+    const std::uint16_t keyId = readU16 (manifest, 42);
+    const keys::Entry *entry = ring.find (keyId);
+    if (entry == nullptr)
     {
         c.verdict = Verdict::UnknownKey;
-        c.reason  = "keyId 0x" + std::to_string (keyId) + " 不认识（ECU 里没有这把钥匙）";
+        c.reason  = "keyId 0x" + keyIdText (keyId) + " 不在钥匙表里（当前：" + ring.dump () + "）";
         return c;
     }
+    if (entry->state == keys::State::Revoked)
+    {
+        c.verdict = Verdict::RevokedKey;
+        c.reason  = "keyId 0x" + keyIdText (keyId) + " 已被吊销（这把钥匙不可信，拒收它签的一切）";
+        return c;
+    }
+    c.keyState = entry->state;
 
-    const Sha256::Digest tag = tagOf (manifest, key, headerBytes);
+    const Sha256::Digest tag = tagOf (manifest, entry->key, headerBytes);
     bool tagSame = true;
     for (int i = 0; i < 32; ++i)
         if (tag[i] != manifest[headerBytes + static_cast<std::size_t> (i)]) { tagSame = false; break; }
@@ -252,14 +284,21 @@ inline Check checkEnvelope (const std::vector<std::uint8_t> &manifest)
 
     c.verdict = Verdict::Ok;
     c.reason  = std::string ("信封对得上（v") + std::to_string (c.manifestVersion) + "，keyId 0x" +
-                std::to_string (keyId) + "）";
+                keyIdText (keyId) + " " + keys::stateName (entry->state) + "）";
     return c;
 }
 
-inline Check verify (const std::vector<std::uint8_t> &image,
-                     const std::vector<std::uint8_t> &manifest)
+// 老路径：不传钥匙表就用演示表（1/2 号两把都启用）
+inline Check checkEnvelope (const std::vector<std::uint8_t> &manifest)
 {
-    Check c = checkEnvelope (manifest);
+    return checkEnvelope (manifest, demoRing ());
+}
+
+inline Check verify (const std::vector<std::uint8_t> &image,
+                     const std::vector<std::uint8_t> &manifest,
+                     const keys::KeyRing &ring)
+{
+    Check c = checkEnvelope (manifest, ring);
     if (!c.ok ()) return c;
 
     const std::uint32_t imageLen = readU32 (manifest, 6);
@@ -289,6 +328,12 @@ inline Check verify (const std::vector<std::uint8_t> &image,
     c.reason  = "清单与镜像对得上（v" + std::to_string (c.manifestVersion) + "，长度 " +
                 std::to_string (imageLen) + "）";
     return c;
+}
+
+inline Check verify (const std::vector<std::uint8_t> &image,
+                     const std::vector<std::uint8_t> &manifest)
+{
+    return verify (image, manifest, demoRing ());
 }
 
 } // namespace fw
