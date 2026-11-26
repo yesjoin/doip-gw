@@ -124,6 +124,9 @@ target_include_directories(keyring-selftest PRIVATE include)
 add_executable(keyringstore-selftest tests/keyringstore_selftest.cpp)
 target_include_directories(keyringstore-selftest PRIVATE include)
 
+# M25：清单指纹 + 变更世代（规范串 / 指纹抓假一致 / 世代绕回 / v2 与 v1 兼容）
+add_executable(keyringstamp-selftest tests/keyringstamp_selftest.cpp)
+target_include_directories(keyringstamp-selftest PRIVATE include)
 # ---- 工具 ----
 add_executable(doip-dump tools/doip_dump.cpp)
 target_link_libraries(doip-dump PRIVATE doip-codec)
@@ -170,4 +173,5 @@ add_test(NAME doip-precheck COMMAND preconditions-selftest)
 add_test(NAME doip-policy COMMAND policy-selftest)
 add_test(NAME doip-keyring COMMAND keyring-selftest)
 add_test(NAME doip-keyringstore COMMAND keyringstore-selftest)
-set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic doip-isotp doip-route doip-pool doip-collector doip-stream doip-registry doip-entity doip-flash doip-session doip-reset doip-integrity doip-precheck doip-policy doip-keyring doip-keyringstore PROPERTIES LABELS unit)
+add_test(NAME doip-keyringstamp  COMMAND keyringstamp-selftest)
+set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic doip-isotp doip-route doip-pool doip-collector doip-stream doip-registry doip-entity doip-flash doip-session doip-reset doip-integrity doip-precheck doip-policy doip-keyring doip-keyringstore doip-keyringstamp PROPERTIES LABELS unit)

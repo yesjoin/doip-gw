@@ -22,10 +22,17 @@
 //
 // 落盘格式（文本，一行一条，最后一行校验和）：
 //
-//   DOIPKEYRING 1
+//   DOIPKEYRING 2
+//   VER 0007
 //   K 0001 00 <64 hex>
 //   K 0002 02 <64 hex>
 //   SUM 3f7c1a0e5b2d9c48
+//
+// M25 加了一行 VER（世代，见 KeyRingStamp.h）。格式从 1 升到 2，但**读的时候两种都认**：
+//   · 看到 `DOIPKEYRING 2` → 必须紧跟一行 `VER <4hex>`；
+//   · 看到 `DOIPKEYRING 1` → 没有 VER，世代按 0 算（M23 写出来的旧文件因此还能用）。
+// 这是"写新读旧"：盘上只会被写成 2，但老文件不需要人手迁移 ——
+//   要人手迁移的那一刻，现场就已经断电了。
 //
 // 为什么用文本：现场排障 `cat` 一眼能看；二进制省下的那点字节在这个场景没有收益，
 //   而"人能直接读一行"有收益。SUM 取 SHA-256 前 8 字节（16 个 hex 字符）——
@@ -35,6 +42,7 @@
 #define DOIP_KEY_RING_STORE_H
 
 #include "KeyRing.h"
+#include "KeyRingStamp.h"
 #include "Sha256.h"
 
 #include <cstdint>
@@ -66,9 +74,10 @@ inline const char *loadStatusName (LoadStatus s)
 
 struct LoadResult
 {
-    LoadStatus status = LoadStatus::Missing;
-    KeyRing    ring;                 // Corrupt 时是空表，**不是**默认两把
-    std::string why;                 // 给人看的一句话
+    LoadStatus   status = LoadStatus::Missing;
+    KeyRing      ring;                 // Corrupt 时是空表，**不是**默认两把
+    Generation   generation = 0;       // M25：v1 旧文件读进来是 0（见文件头）
+    std::string  why;                  // 给人看的一句话
 };
 
 // 校验和：对"SUM 行之前的全部内容（含行尾换行）"取 SHA-256 前 16 个 hex
@@ -77,10 +86,12 @@ inline std::string checksumOf (const std::string &body)
     return Sha256::hex (Sha256::ofText (body)).substr (0, 16);
 }
 
-inline std::string encode (const KeyRing &ring)
+inline std::string encode (const KeyRing &ring, Generation generation = 0)
 {
-    std::string body = "DOIPKEYRING 1\n";
+    std::string body = "DOIPKEYRING 2\n";
     char buf[96];
+    std::snprintf (buf, sizeof buf, "VER %04X\n", static_cast<unsigned> (generation));
+    body += buf;
     for (std::size_t i = 0; i < ring.size (); ++i)
     {
         const Entry &e = ring.at (i);
@@ -137,15 +148,47 @@ inline LoadResult decode (const std::string &text)
         lines.push_back (cur);
     }
 
-    // 行数下界：版本行 + SUM 行。一个合法的**空表**就是两行。
+    // 行数下界：版本行 + SUM 行。一个合法的**空表**就是两行（v2 是三行：多一行 VER）。
     if (lines.size () < 2)
     {
         r.why = "文件里连两行都没有（" + std::to_string (lines.size ()) + " 行）";
         return r;
     }
-    if (lines[0] != "DOIPKEYRING 1")
+
+    // 版本行：写永远写 2，读 1 和 2 都认。
+    //   v1 = M23 的文件，没有 VER 行，世代按 0 算；v2 = 现在，VER 行必须紧跟版本行。
+    std::size_t firstKeyLine = 1;
+    Generation gen = 0;
+    if (lines[0] == "DOIPKEYRING 2")
     {
-        r.why = "版本行不对（读到「" + lines[0] + "」，期望「DOIPKEYRING 1」）";
+        if (lines.size () < 3)
+        {
+            r.why = "v2 文件至少要三行（版本行 / VER / SUM），现在 " +
+                    std::to_string (lines.size ()) + " 行";
+            return r;
+        }
+        const std::string &ver = lines[1];
+        std::uint64_t gv = 0;
+        if (ver.size () != 8 || ver.compare (0, 4, "VER ") != 0 || !parseHex (ver.substr (4), gv))
+        {
+            r.why = "第二行不是「VER <4 hex>」（读到「" + ver + "」）";
+            return r;
+        }
+        if (gv > 0xFFFF)
+        {
+            r.why = "VER 超出 16 位";
+            return r;
+        }
+        gen = static_cast<Generation> (gv);
+        firstKeyLine = 2;
+    }
+    else if (lines[0] == "DOIPKEYRING 1")
+    {
+        firstKeyLine = 1;   // 旧文件：没有 VER，世代 0
+    }
+    else
+    {
+        r.why = "版本行不对（读到「" + lines[0] + "」，只认 DOIPKEYRING 1 / 2）";
         return r;
     }
 
@@ -171,7 +214,7 @@ inline LoadResult decode (const std::string &text)
     //   校验和只能证明"这段字节没变过"，不能证明"内容是合法的" —— 两件事要分开查。
     KeyRing ring;
     std::vector<std::uint16_t> seen;
-    for (std::size_t i = 1; i + 1 < lines.size (); ++i)
+    for (std::size_t i = firstKeyLine; i + 1 < lines.size (); ++i)
     {
         const std::string &ln = lines[i];
         if (ln.size () != 2 + 4 + 1 + 2 + 1 + 64 || ln.compare (0, 2, "K ") != 0)
@@ -236,9 +279,10 @@ inline LoadResult decode (const std::string &text)
         seen.push_back (static_cast<std::uint16_t> (idv));
     }
 
-    r.status = LoadStatus::Ok;
-    r.ring   = ring;
-    r.why    = "读到 " + std::to_string (ring.size ()) + " 把：" + ring.dump ();
+    r.status     = LoadStatus::Ok;
+    r.ring       = ring;
+    r.generation = gen;
+    r.why        = "读到 " + std::to_string (ring.size ()) + " 把：" + ring.dump ();
     return r;
 }
 
@@ -271,10 +315,12 @@ inline LoadResult load (const std::string &path)
 
 // 写盘：临时文件 → rename（原子）→ 读回来核对。
 //   写完立刻读回来是有必要的：写成功不等于写对了（磁盘满、路径被换、编码截断都可能）。
-inline bool save (const KeyRing &ring, const std::string &path, std::string &why)
+//   M25：世代也要跟着写、跟着核对 —— 版本没落盘，重启后"改过几次"就归零了。
+inline bool save (const KeyRing &ring, const std::string &path, std::string &why,
+                  Generation generation = 0)
 {
     const std::string tmp = path + ".tmp";
-    const std::string text = encode (ring);
+    const std::string text = encode (ring, generation);
     std::FILE *fp = std::fopen (tmp.c_str (), "wb");
     if (fp == nullptr)
     {
@@ -300,12 +346,13 @@ inline bool save (const KeyRing &ring, const std::string &path, std::string &why
     }
 
     const LoadResult back = load (path);
-    if (back.status != LoadStatus::Ok || encode (back.ring) != text)
+    if (back.status != LoadStatus::Ok || encode (back.ring, back.generation) != text)
     {
         why = "写完读回来对不上：" + back.why;
         return false;
     }
-    why = "已写入 " + path + "（" + std::to_string (ring.size ()) + " 把）";
+    why = "已写入 " + path + "（" + std::to_string (ring.size ()) + " 把，版本 " +
+          std::to_string (static_cast<unsigned> (generation)) + "）";
     return true;
 }
 

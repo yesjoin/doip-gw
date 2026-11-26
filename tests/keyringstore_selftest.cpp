@@ -58,8 +58,9 @@ int main ()
     // ---- A. 编码 ----
     {
         const std::string empty = keys::encode (keys::KeyRing {});
-        CHECK (empty.compare (0, 14, "DOIPKEYRING 1\n") == 0, "A1 第一行是版本行");
-        CHECK (empty.size () == 14 + 4 + 16 + 1, "A2 空表就是版本行 + 校验和行（没有空 K 行）");
+        CHECK (empty.compare (0, 14, "DOIPKEYRING 2\n") == 0, "A1 第一行是版本行（写永远写 2）");
+        CHECK (empty.compare (14, 9, "VER 0000\n") == 0, "A1b 第二行是 VER（默认世代 0）");
+        CHECK (empty.size () == 14 + 9 + 4 + 16 + 1, "A2 空表就是版本行 + VER 行 + 校验和行（没有空 K 行）");
 
         const std::string two = keys::encode (makeRing ());
         CHECK (two.find ("\nK 0001 00 ") != std::string::npos, "A3 1 号以「K 0001 00」开头（状态是 00 启用）");
@@ -124,10 +125,11 @@ int main ()
         wrongSum[good.size () - 3] = (good[good.size () - 3] == 'a') ? 'b' : 'a';
         CHECK (keys::decode (wrongSum).status == keys::LoadStatus::Corrupt, "C5 校验和改一位 → 判坏");
 
-        // C6 版本行不对
+        // C6 版本行不认识（1 / 2 之外的一律不认）
         std::string v2 = body;
-        v2.replace (0, 14, "DOIPKEYRING 2\n");
-        CHECK (keys::decode (signedText (v2)).status == keys::LoadStatus::Corrupt, "C6 版本行不是 1 → 判坏");
+        v2.replace (0, 14, "DOIPKEYRING 3\n");
+        CHECK (keys::decode (signedText (v2)).status == keys::LoadStatus::Corrupt,
+               "C6 版本行不是 1 也不是 2 → 判坏");
 
         // 以下四条：校验和都是对的（用 signedText 重算），坏在**内容**
         std::string dup = "DOIPKEYRING 1\nK 0001 00 " + Sha256::hex (fw::demoKey (0x0001)) + "\n" +
@@ -172,6 +174,12 @@ int main ()
         CHECK (keys::save (r, kPath, why), "D1 写盘成功");
         CHECK (keys::load (kPath).status == keys::LoadStatus::Ok, "D2 读回来是 Ok");
         CHECK (keys::load (kPath).ring.dump () == r.dump (), "D3 读回来的表与写下去的一致");
+
+        // M25：世代也要跟着落盘（版本没写下去，重启后"改过几次"就归零了）
+        CHECK (keys::save (r, kPath, why, 7), "D3b 带世代 7 再写一次");
+        const keys::LoadResult gen = keys::load (kPath);
+        CHECK (gen.generation == 7, "D3c 世代读回来还是 7");
+        CHECK (gen.ring.dump () == r.dump (), "D3d 加一行 VER 不影响表本身");
         {
             std::FILE *tf = std::fopen ((std::string (kPath) + ".tmp").c_str (), "rb");
             CHECK (tf == nullptr, "D4 写完不留 .tmp");
