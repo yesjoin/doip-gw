@@ -36,6 +36,7 @@
 #include "DoIpRouting.h"
 #include "ActivationAuth.h"     // M27：激活凭据（HMAC token）
 #include "SourceSlot.h"         // M28：SA ↔ 1 字节位子（写上 CAN 源地址）
+#include "OpPermission.h"
 #include "SlotLedger.h"          // M29：位子租约账（把 ECU 的"第几号位子"还原成"哪台 SA"）
 #include "StreamLedger.h"   // M12：边收边发的记账（纯逻辑）
 #include "TesterRegistry.h" // M13：实体级的 tester 地址仲裁（纯逻辑）
@@ -74,6 +75,12 @@ struct TcpServerConfig
     // M28：要不要给每条激活的连接分一个 1 字节的"位子"，让它跟着请求走到 CAN。
     //   默认关：关着的时候总线上所有诊断仪都是路由表里写的那个源地址（透明桥接）。
     bool          stampSlots = false;
+
+    // ---- M30：诊断防火墙（按 SA 分"读 / 写 / 刷写"三档）----
+    //   默认关：关着的时候一条诊断请求都不会被网关多看一眼前面 —— 和 M29 逐字节一样。
+    //   开了之后越权的请求**不转发**，网关替 ECU 回 7F <SID> 33（越界，所以默认关）。
+    bool                  enforceOps = false;
+    ops::PermissionTable  opTable;
 
     // M6：谁能当诊断目标。为空 = 只认 entityAddress 自己（M3 语义）。
     std::function<bool (std::uint16_t)> targetKnown;
@@ -142,6 +149,13 @@ public:
     }
     std::string slotLedgerText () const { return slotLedger_.text (); }
     const slots::SlotLedger &slotLedger () const { return slotLedger_; }
+    // M30：权限的两本账。放行多少、挡回多少，挡回里按"要哪一档"分开记 ——
+    //   只报一个总数看不出"是谁在越刷写的界"。
+    std::size_t opAllowed () const { return opAllowed_; }
+    std::size_t opDenied () const { return opDenied_; }
+    std::size_t opDeniedRead () const { return opDeniedRead_; }
+    std::size_t opDeniedWrite () const { return opDeniedWrite_; }
+    std::size_t opDeniedFlash () const { return opDeniedFlash_; }
     std::size_t activeTesters () const { return registry_.active (); }
     // M14：现在开着几条 TCP_DATA socket（**连接数，不是激活数**）。
     //   原子量：UDP 线程（回答 0x4001）要读它，I/O 线程要写它。
@@ -213,6 +227,12 @@ private:
     std::size_t     orphanResults_ = 0;
     std::size_t     busyRejects_   = 0;
     std::size_t     authPasses_    = 0;   // M27：凭据对上的次数
+    // M30：诊断防火墙的三个数（挡回按"要哪一档"分开记）
+    std::size_t     opAllowed_      = 0;
+    std::size_t     opDenied_       = 0;
+    std::size_t     opDeniedRead_   = 0;
+    std::size_t     opDeniedWrite_  = 0;
+    std::size_t     opDeniedFlash_  = 0;
     std::size_t     authRejects_   = 0;   // M27：凭据不对被挡回去的次数
 
     // M13：实体级的 tester 地址仲裁。

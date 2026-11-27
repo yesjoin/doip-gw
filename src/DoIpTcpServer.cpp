@@ -37,6 +37,14 @@ std::string hex4 (std::uint16_t v)
     return std::string (b);
 }
 
+// M30：服务号是 1 字节，日志里要写成 0x31 这种，不然 49 和 0x31 会被看混。
+std::string hex2 (std::uint8_t v)
+{
+    char b[8];
+    std::snprintf (b, sizeof (b), "0x%02X", static_cast<unsigned> (v));
+    return std::string (b);
+}
+
 } // namespace
 
 DoIpTcpServer::DoIpTcpServer (const TcpServerConfig &cfg)
@@ -453,6 +461,38 @@ bool DoIpTcpServer::handleConn (Conn &c)
             sendBytes (c.fd, build (PayloadType::DiagnosticPositiveAck, encodePayload (pa)));
             log ("0x8001 ← " + hex4 (o.sourceAddress) + "，" + std::to_string (o.uds.size ()) +
                  " 字节 UDS → 回 0x8002 ACK");
+
+            // ---- M30：诊断防火墙 ----
+            // ★ 为什么放在 ACK 之后：ACK 说的是"这条报文我收到了、格式对"，这是传输层的话；
+            //   权限是应用层的话。先 ACK 再拒，诊断仪能分清"网关没收到"和"网关收到但不让做"。
+            // ★ 为什么是替 ECU 回 7F <SID> 33：DoIP 的 0x8003 里没有"没权限"这一码，
+            //   而 UDS 的 0x33 就是 securityAccessDenied —— 这句话本来该 ECU 说，
+            //   现在由网关说。这就是"越界"，所以开它必须显式（--enforce-ops），日志要点名。
+            if (cfg_.enforceOps)
+            {
+                ops::OpInfo info;
+                const ops::Tier need = ops::classify (o.uds.data (), o.uds.size (), info);
+                const ops::PermissionTable::Decision d = cfg_.opTable.decide (o.sourceAddress, need);
+                if (!d.permit)
+                {
+                    ++opDenied_;
+                    if (need == ops::Tier::Read)       ++opDeniedRead_;
+                    else if (need == ops::Tier::Write) ++opDeniedWrite_;
+                    else                               ++opDeniedFlash_;
+
+                    DiagnosticMessage deny;
+                    deny.sourceAddress = o.targetAddress;   // 代那台 ECU 说话，源写 ECU
+                    deny.targetAddress = o.sourceAddress;
+                    // 7F <SID> 33：只回第一个字节，不回整条 —— 错的是"这件事"，不是"这个参数"。
+                    deny.uds = {0x7F, info.sid, 0x33};
+                    sendBytes (c.fd, build (PayloadType::DiagnosticMessage, encodePayload (deny)));
+                    log ("权限挡回：SA " + hex4 (o.sourceAddress) + " 想「" + info.what + "」(" +
+                         ops::tierName (need) + "档)，但它只有「" + ops::tierName (d.have) +
+                         "」→ 替 ECU 回 7F " + hex2 (info.sid) + " 33（未转发）");
+                    continue;
+                }
+                ++opAllowed_;
+            }
 
             DiagnosticRequest req;
             req.sourceAddress = o.sourceAddress;

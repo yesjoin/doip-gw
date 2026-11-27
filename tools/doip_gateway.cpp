@@ -113,6 +113,9 @@ int main (int argc, char **argv)
     bool haveKey = false;
     bool stampSa = false;        // M28：把"谁"写成 CAN 源地址（默认关 = 透明桥接）
     std::string slotLedgerPath;  // M29：位子租约账落盘的路径（不写 = 不落盘）
+    // M30：诊断防火墙。enforceOps 默认关 —— 关着的时候网关不会多看一眼请求内容。
+    bool              enforceOps = false;
+    ops::PermissionTable opTable;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -127,6 +130,46 @@ int main (int argc, char **argv)
         else if (a == "--no-stream")                stream = false;   // M12：退回 M11 的"攒齐再发"
         else if (a == "--stamp-sa")                 stampSa = true;   // M28：在位子上写源地址
         else if (a == "--slot-ledger" && i + 1 < argc) slotLedgerPath = argv[++i];   // M29：位子账
+        // M30：诊断防火墙的三条参数。档位名只认 read / write / flash，
+        //   拼错的档名直接退出 —— 权限这种东西，"猜一个差不多的"等于没设。
+        else if (a == "--enforce-ops") enforceOps = true;
+        else if (a == "--default-grant" && i + 1 < argc)
+        {
+            ops::Tier t{};
+            if (!ops::parseTier (argv[++i], t))
+            {
+                std::fprintf (stderr, "--default-grant 只认 read / write / flash，收到 %s\n", argv[i]);
+                return 2;
+            }
+            opTable.setDefault (t);
+        }
+        else if (a == "--grant" && i + 1 < argc)
+        {
+            const std::string spec = argv[++i];
+            const std::size_t colon = spec.find (':');
+            if (colon == std::string::npos)
+            {
+                std::fprintf (stderr, "--grant 要写成 SA:档，例如 0E00:read，收到 %s\n", spec.c_str ());
+                return 2;
+            }
+            std::string h = spec.substr (0, colon);
+            if (h.size () > 2 && h[0] == '0' && (h[1] == 'x' || h[1] == 'X')) h = h.substr (2);
+            char *end = nullptr;
+            const unsigned long sa = h.empty () ? 0UL : std::strtoul (h.c_str (), &end, 16);
+            if (h.empty () || end == nullptr || *end != '\0' || sa == 0 || sa > 0xFFFF)
+            {
+                std::fprintf (stderr, "--grant 的 SA 要是 1..FFFF 的十六进制，收到 %s\n",
+                             spec.c_str ());
+                return 2;
+            }
+            ops::Tier t{};
+            if (!ops::parseTier (spec.substr (colon + 1), t))
+            {
+                std::fprintf (stderr, "--grant 的档只认 read / write / flash，收到 %s\n", spec.c_str ());
+                return 2;
+            }
+            opTable.grant (static_cast<std::uint16_t> (sa), t);
+        }
         else if (a == "--tester-key" && i + 1 < argc)
         {
             // M27：64 位十六进制 = 32 字节预共享密钥。
@@ -160,6 +203,7 @@ int main (int argc, char **argv)
                           "          [--vin LSVAA0000A1234567] [--route TA:TX:RX[:名字]]...\n"
                           "          [--func 功能地址:广播ID[:名字]]... [--no-stream] [--power-mode 0|1|2]\n"
                           "          [--tester-key 64位十六进制] [--stamp-sa] [--slot-ledger 路径]\n"
+                          "          [--enforce-ops] [--grant SA:read|write|flash]... [--default-grant read|write|flash]\n"
                           "      例：%s --route 0002:7E0:7E8:ECU_A --route 0003:7A0:7A8:ECU_B\n"
                           "          --func 0xE400:0x7DF:ALL\n",
                           argv[0], argv[0]);
@@ -231,6 +275,11 @@ int main (int argc, char **argv)
     // M28：开了位子，网关才给每条激活的连接发号；ECU 那边也要按掩码收帧。
     cfg.stampSlots = stampSa;
 
+    // M30：诊断防火墙。档位表在参数解析时已经建好（--grant / --default-grant），
+    //   这里只决定"开不开"。不开的时候这条链路与 M29 逐字节一样。
+    cfg.enforceOps = enforceOps;
+    cfg.opTable    = opTable;
+
     // 谁能当诊断目标 = 物理表里有谁 + 功能表里有谁。都不在的 TA 一律 0x8003 0x03。
     cfg.targetKnown = [&table] (std::uint16_t ta) { return table.reachable (ta); };
 
@@ -259,6 +308,18 @@ int main (int argc, char **argv)
                      "  11 位 ID 没有源地址那一格 → 原样发。诊断仪在总线上看到的源地址不再是自己的声明）\n");
     else
         std::printf ("源地址改写：关（所有诊断仪在总线上都是路由表里写的那个源地址）\n");
+    // M30：把"门禁开到哪一档"摆在明面上 —— 这一层替 ECU 说话（越界），必须显式说。
+    if (cfg.enforceOps)
+    {
+        std::printf ("诊断防火墙：开（按 SA 分三档：读 < 写 < 刷写；不认识的服务号按刷写档要求）\n");
+        for (std::size_t i = 0; i < cfg.opTable.size (); ++i)
+            std::printf ("  SA 0x%04X → %s\n", static_cast<unsigned> (cfg.opTable.saAt (i)),
+                         ops::tierName (cfg.opTable.tierAt (i)));
+        std::printf ("  默认档：%s（没列出来的 SA 按这一档）；越权时不转发，网关替 ECU 回 7F <SID> 33\n",
+                     ops::tierName (cfg.opTable.defaultTier ()));
+    }
+    else
+        std::printf ("诊断防火墙：关（网关只做传输，不看服务号；加 --enforce-ops 才打开）\n");
     // M29：位子账说清楚 —— 账是"谁在什么时候占着哪个位子"，对账工具靠它把 ECU 的位子还原成 SA。
     if (!slotLedgerPath.empty ())
         std::printf ("位子账：写到 %s（退出时落盘；doip-audit 拿它和 ECU 的流水对账）\n",
@@ -388,6 +449,11 @@ int main (int argc, char **argv)
     if (cfg.authRequired)
         std::printf ("凭据：通过 %zu 次，挡回 %zu 次（0x04）\n",
                      srv.authPasses (), srv.authRejects ());
+    // M30：权限的两本账。挡回按"要哪一档"分开报 —— 一个总数看不出是谁在越刷写的界。
+    if (cfg.enforceOps)
+        std::printf ("权限：放行 %zu 条，挡回 %zu 条（要读 %zu / 要写 %zu / 要刷写 %zu）\n",
+                     srv.opAllowed (), srv.opDenied (), srv.opDeniedRead (), srv.opDeniedWrite (),
+                     srv.opDeniedFlash ());
     // M28：位子账。**没还的**才叫问题 —— 这里报的是"此刻还占着几个"，
     //   正常收尾应该是 0（每条连接断开都还了）。不是 0 就说明有人没还。
     if (cfg.stampSlots)
