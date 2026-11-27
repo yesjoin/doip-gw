@@ -471,7 +471,19 @@ bool DoIpTcpServer::handleConn (Conn &c)
             if (cfg_.enforceOps)
             {
                 ops::OpInfo info;
-                const ops::Tier need = ops::classify (o.uds.data (), o.uds.size (), info);
+                const ops::Tier baseNeed = ops::classify (o.uds.data (), o.uds.size (), info);
+                ops::Tier need = baseNeed;
+
+                // ---- M31：DID 白名单 ----
+                // ★ 0x22 读的"是什么"也分档：把"要什么档"按 DID 再抬一次
+                //   （公开 → 读档够 / 受限 → 要写档 / 锁死 → 要刷写档）。
+                //   判定不另写一套：抬完的 need 仍交给 PermissionTable::decide，
+                //   阶梯、默认档、SA 表全部复用 M30。
+                // ★ 不是 DID 读请求时 need 一个字都不动 —— 这一层只碰 0x22。
+                dids::DidInfo did;
+                if (cfg_.didGuard)
+                    need = dids::needFor (cfg_.didTable, o.uds.data (), o.uds.size (), baseNeed, did);
+
                 const ops::PermissionTable::Decision d = cfg_.opTable.decide (o.sourceAddress, need);
                 if (!d.permit)
                 {
@@ -479,6 +491,12 @@ bool DoIpTcpServer::handleConn (Conn &c)
                     if (need == ops::Tier::Read)       ++opDeniedRead_;
                     else if (need == ops::Tier::Write) ++opDeniedWrite_;
                     else                               ++opDeniedFlash_;
+                    // "被 DID 抬档挡掉的"单独记一笔：没有这一层时它本来是过得去的。
+                    //   条件 = 这是一条 DID 读 且 原档（只看服务号）够、抬完才不够。
+                    const bool byDid = did.isRead && baseNeed != need &&
+                                       static_cast<std::uint8_t> (baseNeed) <=
+                                           static_cast<std::uint8_t> (d.have);
+                    if (byDid) ++didDenied_;
 
                     DiagnosticMessage deny;
                     deny.sourceAddress = o.targetAddress;   // 代那台 ECU 说话，源写 ECU
@@ -486,9 +504,12 @@ bool DoIpTcpServer::handleConn (Conn &c)
                     // 7F <SID> 33：只回第一个字节，不回整条 —— 错的是"这件事"，不是"这个参数"。
                     deny.uds = {0x7F, info.sid, 0x33};
                     sendBytes (c.fd, build (PayloadType::DiagnosticMessage, encodePayload (deny)));
-                    log ("权限挡回：SA " + hex4 (o.sourceAddress) + " 想「" + info.what + "」(" +
+                    // 读 DID 的挡回，说清楚"是哪个 DID、它几级"——只报 0x22 挡了，等于没说。
+                    const std::string what = did.isRead ? did.what : std::string (info.what);
+                    log ("权限挡回：SA " + hex4 (o.sourceAddress) + " 想「" + what + "」(" +
                          ops::tierName (need) + "档)，但它只有「" + ops::tierName (d.have) +
-                         "」→ 替 ECU 回 7F " + hex2 (info.sid) + " 33（未转发）");
+                         "」" + (byDid ? "（DID 抬档挡的）" : "") +
+                         " → 替 ECU 回 7F " + hex2 (info.sid) + " 33（未转发）");
                     continue;
                 }
                 ++opAllowed_;

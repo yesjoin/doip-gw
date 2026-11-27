@@ -116,6 +116,10 @@ int main (int argc, char **argv)
     // M30：诊断防火墙。enforceOps 默认关 —— 关着的时候网关不会多看一眼请求内容。
     bool              enforceOps = false;
     ops::PermissionTable opTable;
+    // M31：DID 白名单。didGuard 靠 enforceOps 执行（只给 --did-guard 时自动把防火墙打开），
+    //   didTable 记 DID → 公开/受限/锁死；默认"受限"（没登记的 DID 至少要有写档）。
+    bool              didGuard = false;
+    dids::DidPolicy   didTable;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -170,6 +174,48 @@ int main (int argc, char **argv)
             }
             opTable.grant (static_cast<std::uint16_t> (sa), t);
         }
+        // M31：DID 白名单三条参数。写法与 --grant 一致（DID:级别），DID 是十六进制。
+        //   只给 --did-guard 不给 --enforce-ops 时**自动打开防火墙**：DID 抬档只是把"要什么档"
+        //   变高，真正判定和执行在防火墙那一层；少了它，白名单就只是写在纸上的话。
+        else if (a == "--did-guard") { didGuard = true; enforceOps = true; }
+        else if (a == "--did-default" && i + 1 < argc)
+        {
+            dids::Level l{};
+            if (!dids::parseLevel (argv[++i], l))
+            {
+                std::fprintf (stderr, "--did-default 只认 open / guarded / secret，收到 %s\n", argv[i]);
+                return 2;
+            }
+            didTable.setDefault (l);
+        }
+        else if (a == "--did" && i + 1 < argc)
+        {
+            const std::string spec = argv[++i];
+            const std::size_t colon = spec.find (':');
+            if (colon == std::string::npos)
+            {
+                std::fprintf (stderr, "--did 要写成 DID:级别，例如 F1B0:secret，收到 %s\n", spec.c_str ());
+                return 2;
+            }
+            std::string h = spec.substr (0, colon);
+            if (h.size () > 2 && h[0] == '0' && (h[1] == 'x' || h[1] == 'X')) h = h.substr (2);
+            char *end = nullptr;
+            const unsigned long v = h.empty () ? 0UL : std::strtoul (h.c_str (), &end, 16);
+            if (h.empty () || end == nullptr || *end != '\0' || v == 0 || v > 0xFFFF)
+            {
+                std::fprintf (stderr, "--did 的 DID 要是 1..FFFF 的十六进制，收到 %s\n",
+                             spec.c_str ());
+                return 2;
+            }
+            dids::Level l{};
+            if (!dids::parseLevel (spec.substr (colon + 1), l))
+            {
+                std::fprintf (stderr, "--did 的级别只认 open / guarded / secret，收到 %s\n",
+                             spec.c_str ());
+                return 2;
+            }
+            didTable.set (static_cast<std::uint16_t> (v), l);
+        }
         else if (a == "--tester-key" && i + 1 < argc)
         {
             // M27：64 位十六进制 = 32 字节预共享密钥。
@@ -204,6 +250,7 @@ int main (int argc, char **argv)
                           "          [--func 功能地址:广播ID[:名字]]... [--no-stream] [--power-mode 0|1|2]\n"
                           "          [--tester-key 64位十六进制] [--stamp-sa] [--slot-ledger 路径]\n"
                           "          [--enforce-ops] [--grant SA:read|write|flash]... [--default-grant read|write|flash]\n"
+                          "          [--did-guard] [--did DID:open|guarded|secret]... [--did-default open|guarded|secret]\n"
                           "      例：%s --route 0002:7E0:7E8:ECU_A --route 0003:7A0:7A8:ECU_B\n"
                           "          --func 0xE400:0x7DF:ALL\n",
                           argv[0], argv[0]);
@@ -279,6 +326,8 @@ int main (int argc, char **argv)
     //   这里只决定"开不开"。不开的时候这条链路与 M29 逐字节一样。
     cfg.enforceOps = enforceOps;
     cfg.opTable    = opTable;
+    cfg.didGuard   = didGuard;
+    cfg.didTable   = didTable;
 
     // 谁能当诊断目标 = 物理表里有谁 + 功能表里有谁。都不在的 TA 一律 0x8003 0x03。
     cfg.targetKnown = [&table] (std::uint16_t ta) { return table.reachable (ta); };
@@ -320,6 +369,24 @@ int main (int argc, char **argv)
     }
     else
         std::printf ("诊断防火墙：关（网关只做传输，不看服务号；加 --enforce-ops 才打开）\n");
+    // M31：DID 白名单。开的时候把"哪些 DID 放宽、哪些收紧"逐条列出来 ——
+    //   读档读走 VIN 没事、读走钥匙表就是另一回事，这件事得在横幅上看得见。
+    if (cfg.didGuard)
+    {
+        std::printf ("DID 白名单：开（0x22 读的 DID 再分三档：公开 < 受限 < 锁死；"
+                     "公开→读档 / 受限→写档 / 锁死→刷写档）\n");
+        for (std::size_t i = 0; i < cfg.didTable.size (); ++i)
+        {
+            const std::uint16_t did = cfg.didTable.didAt (i);
+            std::printf ("  %s → %s（%s）\n", dids::hex4 (did).c_str (),
+                         dids::levelName (cfg.didTable.levelAt (i)), dids::didName (did));
+        }
+        std::printf ("  默认级别：%s（没登记的 DID 按这一级）；"
+                     "不够档就替 ECU 回 7F 22 33（未转发）\n",
+                     dids::levelName (cfg.didTable.defaultLevel ()));
+    }
+    else
+        std::printf ("DID 白名单：关（0x22 读什么都按「读」档；加 --did-guard 才分 DID）\n");
     // M29：位子账说清楚 —— 账是"谁在什么时候占着哪个位子"，对账工具靠它把 ECU 的位子还原成 SA。
     if (!slotLedgerPath.empty ())
         std::printf ("位子账：写到 %s（退出时落盘；doip-audit 拿它和 ECU 的流水对账）\n",
@@ -454,6 +521,9 @@ int main (int argc, char **argv)
         std::printf ("权限：放行 %zu 条，挡回 %zu 条（要读 %zu / 要写 %zu / 要刷写 %zu）\n",
                      srv.opAllowed (), srv.opDenied (), srv.opDeniedRead (), srv.opDeniedWrite (),
                      srv.opDeniedFlash ());
+    // M31：其中有多少条是"只看服务号本来能过、被 DID 级别抬掉"的 —— 这一层自己的账。
+    if (cfg.didGuard)
+        std::printf ("DID 白名单：因 DID 级别不够而挡回 %zu 条\n", srv.didDenied ());
     // M28：位子账。**没还的**才叫问题 —— 这里报的是"此刻还占着几个"，
     //   正常收尾应该是 0（每条连接断开都还了）。不是 0 就说明有人没还。
     if (cfg.stampSlots)

@@ -147,6 +147,10 @@ target_include_directories(slotledger-selftest PRIVATE include)
 # M30：按操作分权限（服务号 → 读/写/刷写三档 / 阶梯判定 / 默认档）
 add_executable(oppermission-selftest tests/oppermission_selftest.cpp)
 target_include_directories(oppermission-selftest PRIVATE include)
+
+# M31：DID 白名单（0x22 读的"是什么"也分档 / 抬档 / 默认级别）
+add_executable(didpolicy-selftest tests/didpolicy_selftest.cpp)
+target_include_directories(didpolicy-selftest PRIVATE include)
 # ---- 工具 ----
 add_executable(doip-dump tools/doip_dump.cpp)
 target_link_libraries(doip-dump PRIVATE doip-codec)
@@ -203,4 +207,5 @@ add_test(NAME doip-activationauth COMMAND activationauth-selftest)
 add_test(NAME doip-sourceslot COMMAND sourceslot-selftest)
 add_test(NAME doip-slotledger COMMAND slotledger-selftest)
 add_test(NAME doip-oppermission COMMAND oppermission-selftest)
-set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic doip-isotp doip-route doip-pool doip-collector doip-stream doip-registry doip-entity doip-flash doip-session doip-reset doip-integrity doip-precheck doip-policy doip-keyring doip-keyringstore doip-keyringstamp doip-keyringlog doip-activationauth doip-sourceslot doip-slotledger doip-oppermission PROPERTIES LABELS unit)
+add_test(NAME doip-didpolicy COMMAND didpolicy-selftest)
+set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic doip-isotp doip-route doip-pool doip-collector doip-stream doip-registry doip-entity doip-flash doip-session doip-reset doip-integrity doip-precheck doip-policy doip-keyring doip-keyringstore doip-keyringstamp doip-keyringlog doip-activationauth doip-sourceslot doip-slotledger doip-oppermission doip-didpolicy PROPERTIES LABELS unit)
