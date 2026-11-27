@@ -363,6 +363,11 @@ bool DoIpTcpServer::handleConn (Conn &c)
                             std::snprintf (saHex, sizeof saHex, "%02X",
                                            static_cast<unsigned> (slots::canSourceOf (c.slot)));
                             out.reason += "，位子 " + std::to_string (c.slot) + "（CAN 源地址 0x" + saHex + "）";
+                            // M29：租约记账。**只在真的发出去之后记** —— 发不出去就没有这条租约，
+                            //   账上不该出现"分到了但没用上"的记录（那种记录会让对账多出假候选）。
+                            slotLedger_.noteTake (c.slot, req.sourceAddress,
+                                              static_cast<std::uint32_t> (c.id),
+                                              slots::nowSec ());
                         }
                     }
                 }
@@ -746,6 +751,9 @@ void DoIpTcpServer::dropConn (Conn &c, const std::string &why)
     if (c.slot != 0)
     {
         slots_.release (c.slotSa);
+        // M29：租约账也要跟着关掉。顺序同样重要 —— 必须在 slotSa 被清空之前记，
+        //   否则账上留下的是一条"不知道是谁还的"，对账时又变成一条歧义。
+        slotLedger_.noteRelease (c.slot, c.slotSa, slots::nowSec ());
         c.slot   = 0;
         c.slotSa = 0;
     }

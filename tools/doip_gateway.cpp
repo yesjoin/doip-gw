@@ -112,6 +112,7 @@ int main (int argc, char **argv)
     auth::Secret testerKey{};    // M27：预共享密钥；没给就是"不验票"
     bool haveKey = false;
     bool stampSa = false;        // M28：把"谁"写成 CAN 源地址（默认关 = 透明桥接）
+    std::string slotLedgerPath;  // M29：位子租约账落盘的路径（不写 = 不落盘）
 
     for (int i = 1; i < argc; ++i)
     {
@@ -125,6 +126,7 @@ int main (int argc, char **argv)
         else if (a == "--func" && i + 1 < argc)     funcSpecs.push_back (argv[++i]);
         else if (a == "--no-stream")                stream = false;   // M12：退回 M11 的"攒齐再发"
         else if (a == "--stamp-sa")                 stampSa = true;   // M28：在位子上写源地址
+        else if (a == "--slot-ledger" && i + 1 < argc) slotLedgerPath = argv[++i];   // M29：位子账
         else if (a == "--tester-key" && i + 1 < argc)
         {
             // M27：64 位十六进制 = 32 字节预共享密钥。
@@ -157,7 +159,7 @@ int main (int argc, char **argv)
                           "用法：%s [--iface vcan0] [--port 13400] [--seconds 20] [--stmin 10]\n"
                           "          [--vin LSVAA0000A1234567] [--route TA:TX:RX[:名字]]...\n"
                           "          [--func 功能地址:广播ID[:名字]]... [--no-stream] [--power-mode 0|1|2]\n"
-                          "          [--tester-key 64位十六进制] [--stamp-sa]\n"
+                          "          [--tester-key 64位十六进制] [--stamp-sa] [--slot-ledger 路径]\n"
                           "      例：%s --route 0002:7E0:7E8:ECU_A --route 0003:7A0:7A8:ECU_B\n"
                           "          --func 0xE400:0x7DF:ALL\n",
                           argv[0], argv[0]);
@@ -257,6 +259,10 @@ int main (int argc, char **argv)
                      "  11 位 ID 没有源地址那一格 → 原样发。诊断仪在总线上看到的源地址不再是自己的声明）\n");
     else
         std::printf ("源地址改写：关（所有诊断仪在总线上都是路由表里写的那个源地址）\n");
+    // M29：位子账说清楚 —— 账是"谁在什么时候占着哪个位子"，对账工具靠它把 ECU 的位子还原成 SA。
+    if (!slotLedgerPath.empty ())
+        std::printf ("位子账：写到 %s（退出时落盘；doip-audit 拿它和 ECU 的流水对账）\n",
+                     slotLedgerPath.c_str ());
     std::printf ("路由表（%zu 条）：\n", table.size ());
     for (const auto &e : table.entries ())
     {
@@ -386,6 +392,33 @@ int main (int argc, char **argv)
     //   正常收尾应该是 0（每条连接断开都还了）。不是 0 就说明有人没还。
     if (cfg.stampSlots)
         std::printf ("位子：此刻还占着 %zu 个（断开就回收；位子不是人，是位子）\n", srv.slotsUsed ());
+    // M29：位子租约账。这里报"账上有几条租约、有几条还没还"，
+    //   然后（如果给了路径）落盘。**没还的租约**说明有人没走正常收尾路径，
+    //   对账时这些位子可能被判歧义 —— 所以这个数要能被看见。
+    if (cfg.stampSlots)
+    {
+        std::printf ("位子账：%zu 条租约（未归还 %zu，多还 %zu 次，超容量丢弃 %zu 条）\n",
+                     srv.slotLedger ().size (), srv.slotLedger ().openCount (),
+                     srv.slotLedger ().orphanReleases (), srv.slotLedger ().dropped ());
+        if (!slotLedgerPath.empty ())
+        {
+            std::string why;
+            if (srv.saveSlotLedger (slotLedgerPath, why))
+                std::printf ("位子账已写入 %s（供 doip-audit 对账）\n", slotLedgerPath.c_str ());
+            else
+                std::printf ("位子账写失败：%s\n", why.c_str ());
+        }
+    }
+    else if (!slotLedgerPath.empty ())
+    {
+        // 没开改写就没有位子这回事：照样写一份空账，明确说"这次运行没有位子"，
+        //   而不是让对账工具拿一个不存在的文件去猜。
+        std::string why;
+        if (srv.saveSlotLedger (slotLedgerPath, why))
+            std::printf ("位子账已写入 %s（空账：本次没开 --stamp-sa）\n", slotLedgerPath.c_str ());
+        else
+            std::printf ("位子账写失败：%s\n", why.c_str ());
+    }
     if (stream)
     {
         std::printf ("流式交付 %zu 条（收到就转，不等一轮收齐；同一 job 交卷时只补差额）；"

@@ -117,15 +117,29 @@ class Tester:
         got = self._drain(1, 3.0)
         return got[0][1] if got else None
 
-    def broadcast(self, req, expect=None):
-        self.s.sendall(msg(0x8001, struct.pack("!HH", self.sa, FUNC_TA) + req))
+    def broadcast(self, req, expect=None, tries=3):
+        """功能寻址一问多答。
+
+        ★ 为什么带重试：功能应答是网关按固定窗口逐通道轮询收的（M8 的边界），
+          ECU 起得慢一点，第一问就"零应答"。2026-11-27 的 gcc 腿 CI 上就这么红过一次：
+          BC_STAMP_COUNT=0，紧跟着的三条断言全空，而单独重跑 24/24。
+          所以**只在"一条都没回"时重试**（最多 3 次）；回了哪怕一条就不重试——
+          那说明链路活着，缺的那台是"没答"，不该被重试盖掉。
+        """
         out = {}
         nack = None
-        for sa, uds in self._drain(expect, QUIET):
-            if sa == 0xFFFF:
-                nack = uds
-            else:
-                out[sa] = uds
+        for attempt in range(tries):
+            self.s.sendall(msg(0x8001, struct.pack("!HH", self.sa, FUNC_TA) + req))
+            out = {}
+            nack = None
+            for sa, uds in self._drain(expect, QUIET):
+                if sa == 0xFFFF:
+                    nack = uds
+                else:
+                    out[sa] = uds
+            if out or attempt + 1 >= tries:
+                break
+            time.sleep(0.4)
         return out, nack
 
     def close(self):

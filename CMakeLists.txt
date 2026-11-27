@@ -139,9 +139,17 @@ target_include_directories(activationauth-selftest PRIVATE include)
 # M28：源地址位子（SA→槽位分配 / 29 位 ID 最低字节改写 / 11 位帧没有这一格）
 add_executable(sourceslot-selftest tests/sourceslot_selftest.cpp)
 target_include_directories(sourceslot-selftest PRIVATE include)
+
+# M29：位子租约账（记账照实 / 判谁三态不猜 / 定长 36 与校验和自证）
+add_executable(slotledger-selftest tests/slotledger_selftest.cpp)
+target_include_directories(slotledger-selftest PRIVATE include)
 # ---- 工具 ----
 add_executable(doip-dump tools/doip_dump.cpp)
 target_link_libraries(doip-dump PRIVATE doip-codec)
+
+# M29：对账工具（ECU 流水 + 网关位子账 → 谁）
+add_executable(doip-audit tools/doip_audit.cpp)
+target_include_directories(doip-audit PRIVATE include)
 
 add_executable(doip-discover tools/doip_discover.cpp)
 target_link_libraries(doip-discover PRIVATE doip-discovery Threads::Threads)
@@ -189,4 +197,5 @@ add_test(NAME doip-keyringstamp  COMMAND keyringstamp-selftest)
 add_test(NAME doip-keyringlog    COMMAND keyringlog-selftest)
 add_test(NAME doip-activationauth COMMAND activationauth-selftest)
 add_test(NAME doip-sourceslot COMMAND sourceslot-selftest)
-set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic doip-isotp doip-route doip-pool doip-collector doip-stream doip-registry doip-entity doip-flash doip-session doip-reset doip-integrity doip-precheck doip-policy doip-keyring doip-keyringstore doip-keyringstamp doip-keyringlog doip-activationauth doip-sourceslot PROPERTIES LABELS unit)
+add_test(NAME doip-slotledger COMMAND slotledger-selftest)
+set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic doip-isotp doip-route doip-pool doip-collector doip-stream doip-registry doip-entity doip-flash doip-session doip-reset doip-integrity doip-precheck doip-policy doip-keyring doip-keyringstore doip-keyringstamp doip-keyringlog doip-activationauth doip-sourceslot doip-slotledger PROPERTIES LABELS unit)

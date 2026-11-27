@@ -36,6 +36,7 @@
 #include "DoIpRouting.h"
 #include "ActivationAuth.h"     // M27：激活凭据（HMAC token）
 #include "SourceSlot.h"         // M28：SA ↔ 1 字节位子（写上 CAN 源地址）
+#include "SlotLedger.h"          // M29：位子租约账（把 ECU 的"第几号位子"还原成"哪台 SA"）
 #include "StreamLedger.h"   // M12：边收边发的记账（纯逻辑）
 #include "TesterRegistry.h" // M13：实体级的 tester 地址仲裁（纯逻辑）
 
@@ -132,6 +133,15 @@ public:
     std::size_t authRejects () const { return authRejects_; }
     // M28：现在占了几个"位子"（0 = 没开，或者一台都没激活）
     std::size_t slotsUsed () const { return slots_.used (); }
+    // M29：把这份"位子租约账"落盘（给 doip-audit 对账用）。
+    //   只在开了 --stamp-sa（cfg_.stampSlots）时才有内容；否则写出来就是空账 ——
+    //   空账也有意义：它明确说"这次运行没有位子这回事"，而不是"文件丢了"。
+    bool saveSlotLedger (const std::string &path, std::string &why) const
+    {
+        return slotLedger_.save (path, why);
+    }
+    std::string slotLedgerText () const { return slotLedger_.text (); }
+    const slots::SlotLedger &slotLedger () const { return slotLedger_; }
     std::size_t activeTesters () const { return registry_.active (); }
     // M14：现在开着几条 TCP_DATA socket（**连接数，不是激活数**）。
     //   原子量：UDP 线程（回答 0x4001）要读它，I/O 线程要写它。
@@ -212,6 +222,9 @@ private:
     // M28：SA ↔ 位子的映射。放在服务器上，因为位子是"实体级资源"（和 M13 的地址账同层）：
     //   放连接里 = 每条连接自己发号，两台会拿到同一个号。
     slots::SlotTable slots_;
+    // M29：位子租约账（谁在什么时间段占着哪个位子）。同样放服务器上：
+    //   它是"实体级"的历史，不属于某一条连接。落盘后由 doip-audit 与 ECU 流水对账。
+    slots::SlotLedger       slotLedger_;      // M29：位子租约账（和 M12 的流式账不是一回事）
     std::uint64_t   nextConnId_ = 1;  // 连接号从 1 开始（0 当"没有"用，和 jobId 同一个约定）
 
     // M14：给 UDP 线程读的"现在开着几条 socket"。
