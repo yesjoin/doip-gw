@@ -49,6 +49,26 @@ static ops::Tier need (const dids::DidPolicy &t, std::initializer_list<std::uint
 
 static std::uint8_t T (ops::Tier t) { return static_cast<std::uint8_t> (t); }
 
+// M32：响应方向的判定。0x62 <DID> 才算"读 DID 响应"，别的（7F / 50 / 71 / …）原样走。
+static bool isResp (std::initializer_list<std::uint8_t> b, dids::DidInfo *out = nullptr)
+{
+    std::vector<std::uint8_t> v (b);
+    dids::DidInfo tmp;
+    const bool r = dids::classifyResponse (v.data (), v.size (), tmp);
+    if (out != nullptr) *out = tmp;
+    return r;
+}
+
+static ops::Tier needResp (const dids::DidPolicy &t, std::initializer_list<std::uint8_t> b,
+                           dids::DidInfo *out = nullptr)
+{
+    std::vector<std::uint8_t> v (b);
+    dids::DidInfo tmp;
+    const ops::Tier r = dids::needForResponse (t, v.data (), v.size (), tmp);
+    if (out != nullptr) *out = tmp;
+    return r;
+}
+
 int main ()
 {
     // ---- A 级别名与解析（10 项）----
@@ -182,6 +202,67 @@ int main ()
         CHECK (std::string (dids::didName (0xF190)) == "VIN", "G2 0xF190 备注是 VIN");
         CHECK (std::string (dids::didName (0x1234)) == "未登记", "G3 没备注的说不认识");
         CHECK (dids::hex4 (0xF1B0) == "0xF1B0", "G4 日志里的 DID 打成四位十六进制");
+    }
+
+    // ---- H 响应方向（M32，14 项）----
+    {
+        dids::DidInfo d;
+        CHECK (isResp ({0x62, 0xF1, 0x90}, &d) && d.did == 0xF190, "H1 62 F1 90 → DID 0xF190");
+        CHECK (d.isRead, "H2 响应认出来的要标 isRead");
+        CHECK (isResp ({0x62, 0xF1, 0xB0}, &d) && d.did == 0xF1B0, "H3 高字节在前");
+        CHECK (!isResp ({0x62, 0xF1}), "H4 只有 2 字节 → 没有 DID，不算");
+        CHECK (!isResp ({0x62}), "H5 只有服务号 → 不算");
+        // 负响应 / 会话控制 / 普通正响应都不是 0x62 <DID>，一个都不该拦。
+        CHECK (!isResp ({0x7F, 0x22, 0x33}), "H6 负响应 7F 22 33 不算读 DID 响应");
+        CHECK (!isResp ({0x50, 0x02}), "H7 会话控制 50 02 不算");
+        CHECK (!isResp ({0x71, 0x01, 0x02}), "H8 普通正响应 71 不算");
+        CHECK (!isResp ({0x22, 0xF1, 0x90}), "H9 0x22 是请求，classifyResponse 不认它");
+
+        dids::DidPolicy t;
+        t.set (0xF190, dids::Level::Open);
+        t.set (0xF184, dids::Level::Guarded);
+        t.set (0xF1B0, dids::Level::Secret);
+
+        CHECK (needResp (t, {0x62, 0xF1, 0x90}) == ops::Tier::Read,
+               "H10 公开 DID 的响应 → 读档");
+        CHECK (needResp (t, {0x62, 0xF1, 0x84}) == ops::Tier::Write,
+               "H11 受限 DID 的响应 → 写档");
+        CHECK (needResp (t, {0x62, 0xF1, 0xB0}) == ops::Tier::Flash,
+               "H12 锁死 DID 的响应 → 刷写档");
+        CHECK (needResp (t, {0x62, 0xF1, 0xFF}) == ops::Tier::Write,
+               "H13 没登记的 DID → 默认受限 → 写档");
+
+        // 不是 DID 读响应：返回 Read 且 isRead=false。调用方必须先看 isRead。
+        dids::DidInfo dn;
+        CHECK (needResp (t, {0x7F, 0x22, 0x33}, &dn) == ops::Tier::Read && !dn.isRead,
+               "H14 非 DID 响应返回 Read 且 isRead=false（原样走）");
+    }
+
+    // ---- I 响应方向拼 PermissionTable（M32，4 项）----
+    {
+        dids::DidPolicy dt;
+        dt.set (0xF190, dids::Level::Open);
+        dt.set (0xF1B0, dids::Level::Secret);
+
+        ops::PermissionTable pt;
+        pt.grant (0x0E00, ops::Tier::Read);
+        pt.grant (0x0E02, ops::Tier::Flash);
+
+        // 读档收公开 DID 的响应：够
+        CHECK (pt.decide (0x0E00, needResp (dt, {0x62, 0xF1, 0x90})).permit,
+               "I1 读档 + 公开 DID 响应 → 放行");
+        // 读档收锁死 DID 的响应：抬到刷写 → 挡（这条 0x62 不发出去）
+        const ops::PermissionTable::Decision d1 =
+            pt.decide (0x0E00, needResp (dt, {0x62, 0xF1, 0xB0}));
+        CHECK (!d1.permit && d1.need == ops::Tier::Flash && d1.have == ops::Tier::Read,
+               "I2 读档 + 锁死 DID 响应 → 挡，判定里写着「要刷写 / 只有读」");
+        // 刷写档收锁死 DID 的响应：够
+        CHECK (pt.decide (0x0E02, needResp (dt, {0x62, 0xF1, 0xB0})).permit,
+               "I3 刷写档 + 锁死 DID 响应 → 放行");
+        // 非 DID 响应（如负响应）isRead=false，调用方直接放行，不经过 decide。
+        dids::DidInfo dn;
+        needResp (dt, {0x7F, 0x22, 0x33}, &dn);
+        CHECK (!dn.isRead, "I4 负响应 isRead=false，响应方向不拦它");
     }
 
     std::printf ("通过 %d 项，失败 %d 项\n", gPass, gFail);

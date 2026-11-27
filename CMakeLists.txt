@@ -151,6 +151,7 @@ target_include_directories(oppermission-selftest PRIVATE include)
 # M31：DID 白名单（0x22 读的"是什么"也分档 / 抬档 / 默认级别）
 add_executable(didpolicy-selftest tests/didpolicy_selftest.cpp)
 target_include_directories(didpolicy-selftest PRIVATE include)
+
 # ---- 工具 ----
 add_executable(doip-dump tools/doip_dump.cpp)
 target_link_libraries(doip-dump PRIVATE doip-codec)

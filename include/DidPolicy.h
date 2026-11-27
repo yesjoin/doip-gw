@@ -118,12 +118,13 @@ inline std::string hex4 (std::uint16_t v)
     return std::string (b);
 }
 
-// 这条请求读的是哪个 DID。只认 0x22 且长度 ≥ 3（服务号 + 2 字节 DID）。
+// 一条"读 DID 相关"的报文：请求 0x22，或它的正响应 0x62。
+//   两个方向都用这同一个结构 —— 请求侧问"你想读什么"，响应侧问"这条数据是什么"。
 struct DidInfo
 {
     std::uint16_t did    = 0;
-    bool          isRead = false;          // 是不是一条"读 DID"请求
-    Level         level  = Level::Guarded;  // 只有 isRead 时有意义（needFor 才填）
+    bool          isRead = false;          // 是不是读 DID 相关（0x22 请求 / 0x62 响应）
+    Level         level  = Level::Guarded;  // 只有 isRead 时有意义（needFor* 才填）
     std::string   what;                    // 给日志看的一句话
 };
 
@@ -131,6 +132,18 @@ inline bool classify (const std::uint8_t *uds, std::size_t len, DidInfo &out)
 {
     out = DidInfo{};
     if (len < 3 || uds[0] != 0x22) return false;
+    out.did    = static_cast<std::uint16_t> ((static_cast<std::uint16_t> (uds[1]) << 8) | uds[2]);
+    out.isRead = true;
+    return true;
+}
+
+// M32：读 DID 的正响应 0x62 <DID> <数据>。
+//   请求侧挡了"想读"还不够 —— **数据就是靠这条 0x62 流出去的**。
+//   两条腿合起来才是完整的防火墙：请求侧问"你想干什么"，响应侧问"数据往哪流"。
+inline bool classifyResponse (const std::uint8_t *uds, std::size_t len, DidInfo &out)
+{
+    out = DidInfo{};
+    if (len < 3 || uds[0] != 0x62) return false;
     out.did    = static_cast<std::uint16_t> ((static_cast<std::uint16_t> (uds[1]) << 8) | uds[2]);
     out.isRead = true;
     return true;
@@ -189,6 +202,19 @@ inline ops::Tier needFor (const DidPolicy &table, const std::uint8_t *uds, std::
     out.what  = "读 DID " + hex4 (out.did) + "（" + didName (out.did) + "，" +
                 levelName (out.level) + "级）";
     return raise (base, tierOf (out.level));
+}
+
+// M32：响应方向。0x62 <DID> 需要什么档；不是 DID 读响应 → 返回 Read 且 out.isRead=false。
+//   调用方先看 out.isRead：false 的响应**不归这一层管**（7F / 50 / 71 / … 都原样走）。
+inline ops::Tier needForResponse (const DidPolicy &table, const std::uint8_t *uds,
+                                  std::size_t len, DidInfo &out)
+{
+    out = DidInfo{};
+    if (!classifyResponse (uds, len, out)) return ops::Tier::Read;
+    out.level = table.levelOf (out.did);
+    out.what  = "读响应 DID " + hex4 (out.did) + "（" + didName (out.did) + "，" +
+                levelName (out.level) + "级）";
+    return tierOf (out.level);
 }
 
 }   // namespace dids

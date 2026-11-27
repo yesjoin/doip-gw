@@ -89,6 +89,11 @@ struct TcpServerConfig
     bool              didGuard = false;
     dids::DidPolicy   didTable;
 
+    // ---- M32：响应方向也按 DID 过滤（0x62 读响应里的数据也分档）----
+    //   请求侧挡"想读"，响应侧挡"数据外流"；两个方向复用同一张 didTable。
+    //   默认关：单独开它不影响请求侧，只是数据出网关前多一道闸。
+    bool              didGuardResp = false;
+
     // M6：谁能当诊断目标。为空 = 只认 entityAddress 自己（M3 语义）。
     std::function<bool (std::uint16_t)> targetKnown;
 
@@ -160,6 +165,7 @@ public:
     //   只报一个总数看不出"是谁在越刷写的界"。
     std::size_t opAllowed () const { return opAllowed_; }
     std::size_t didDenied () const { return didDenied_; }   // M31：其中被 DID 抬档挡掉的
+    std::size_t respDidDenied () const { return respDidDenied_; }   // M32：响应方向被 DID 挡掉的
     std::size_t opDenied () const { return opDenied_; }
     std::size_t opDeniedRead () const { return opDeniedRead_; }
     std::size_t opDeniedWrite () const { return opDeniedWrite_; }
@@ -217,6 +223,9 @@ private:
     bool sendBytes (int fd, const std::vector<std::uint8_t> &b);
     void deliver (const AsyncResult &res);                      // 结果 → 对应连接
     void drainStream ();                                        // M12：把流式答案逐条送出
+    // M32：响应方向防火墙。返回 true = 这条响应不该发给 sa（并给出给人看的一句话）。
+    bool responseDenied (std::uint16_t sa, const std::vector<std::uint8_t> &uds,
+                         std::string &why);
     void log (const std::string &s);
 
     TcpServerConfig cfg_;
@@ -238,6 +247,7 @@ private:
     // M30：诊断防火墙的三个数（挡回按"要哪一档"分开记）
     std::size_t     opAllowed_      = 0;
     std::size_t     didDenied_      = 0;   // M31：因为 DID 级别不够而被挡的条数
+    std::size_t     respDidDenied_  = 0;   // M32：响应方向因为 DID 级别不够而被挡的条数
     std::size_t     opDenied_       = 0;
     std::size_t     opDeniedRead_   = 0;
     std::size_t     opDeniedWrite_  = 0;

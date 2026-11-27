@@ -693,6 +693,18 @@ void DoIpTcpServer::drainStream ()
         {
             if (c.fd < 0 || c.pendingJob != ps.jobId) continue;
 
+            // ---- M32：响应方向防火墙 ----
+            //   流式是"收到一条送一条"，所以这里的拦截发生在数据出网卡的前一刻。
+            //   拦了 = 这条不送；但账要 noteStreamed —— 交卷时那条**别再发一遍**，
+            //   否则拦截就白拦了。
+            std::string why;
+            if (responseDenied (c.pendingSa, ps.reply.uds, why))
+            {
+                ledger_.noteStreamed (ps.jobId);
+                delivered = true;      // 语义：这条已处理（被拦掉），不是连接问题
+                break;
+            }
+
             DiagnosticMessage back;
             back.sourceAddress = ps.reply.sourceAddress;   // 谁答的，SA 就写谁
             back.targetAddress = c.pendingSa;
@@ -715,6 +727,35 @@ void DoIpTcpServer::drainStream ()
                  " 流式送达时连接已断/发送失败 → 丢弃（不转给下一个诊断仪）");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// M32：响应方向防火墙。
+//
+// M30/M31 挡的是**请求**（诊断仪想干什么）；但数据的实际流向是
+// 请求进去 → ECU 应答 → 0x62 带着数据**出来**。请求侧被绕过（哪怕是配置漏写一条）
+// 时，响应侧是最后一道闸 —— 纵深防御的第一条就是"别指望前面那层一定没破"。
+//
+// 只碰 0x62 <DID>：7F / 50 / 71 / … 都不是数据外流，原样走。
+// ---------------------------------------------------------------------------
+bool DoIpTcpServer::responseDenied (std::uint16_t sa, const std::vector<std::uint8_t> &uds,
+                                    std::string &why)
+{
+    if (!cfg_.didGuardResp) return false;
+
+    dids::DidInfo di;
+    const ops::Tier need = dids::needForResponse (cfg_.didTable, uds.data (), uds.size (), di);
+    if (!di.isRead) return false;                    // 不是读 DID 响应 → 不归这一层管
+
+    const ops::PermissionTable::Decision d = cfg_.opTable.decide (sa, need);
+    if (d.permit) return false;
+
+    ++respDidDenied_;
+    why = "响应挡回：要给 SA " + hex4 (sa) + " 的「" + di.what + "」(" +
+          ops::tierName (need) + "档)，但它只有「" + ops::tierName (d.have) +
+          "」→ 这条 0x62 不发给诊断仪（数据不出去）";
+    log (why);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -762,6 +803,13 @@ void DoIpTcpServer::deliver (const AsyncResult &res)
         for (std::size_t i = (already < total ? already : total); i < total; ++i)
         {
             const auto &rep = res.r.replies[i];
+
+            // ---- M32：响应方向防火墙 ----
+            //   请求侧挡的是"想读什么"，这里挡的是"这条数据出去"。
+            //   拦了就不发：诊断仪那侧会等到超时，而不是收到一个"半个答案"。
+            std::string why;
+            if (responseDenied (testerSa, rep.uds, why)) continue;
+
             DiagnosticMessage back;
             back.sourceAddress = rep.sourceAddress;   // 谁答的，SA 就是谁
             back.targetAddress = testerSa;

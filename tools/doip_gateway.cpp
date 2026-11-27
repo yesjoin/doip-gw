@@ -120,6 +120,9 @@ int main (int argc, char **argv)
     //   didTable 记 DID → 公开/受限/锁死；默认"受限"（没登记的 DID 至少要有写档）。
     bool              didGuard = false;
     dids::DidPolicy   didTable;
+    // M32：响应方向也按 DID 过滤。didGuardResp 只挡 0x62 出来的数据，不碰请求侧；
+    //   单独给时同样自动打开防火墙（判定在 PermissionTable 里做）。
+    bool              didGuardResp = false;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -178,6 +181,7 @@ int main (int argc, char **argv)
         //   只给 --did-guard 不给 --enforce-ops 时**自动打开防火墙**：DID 抬档只是把"要什么档"
         //   变高，真正判定和执行在防火墙那一层；少了它，白名单就只是写在纸上的话。
         else if (a == "--did-guard") { didGuard = true; enforceOps = true; }
+        else if (a == "--did-guard-resp") { didGuardResp = true; enforceOps = true; }
         else if (a == "--did-default" && i + 1 < argc)
         {
             dids::Level l{};
@@ -251,6 +255,7 @@ int main (int argc, char **argv)
                           "          [--tester-key 64位十六进制] [--stamp-sa] [--slot-ledger 路径]\n"
                           "          [--enforce-ops] [--grant SA:read|write|flash]... [--default-grant read|write|flash]\n"
                           "          [--did-guard] [--did DID:open|guarded|secret]... [--did-default open|guarded|secret]\n"
+                          "          [--did-guard-resp]\n"
                           "      例：%s --route 0002:7E0:7E8:ECU_A --route 0003:7A0:7A8:ECU_B\n"
                           "          --func 0xE400:0x7DF:ALL\n",
                           argv[0], argv[0]);
@@ -328,6 +333,7 @@ int main (int argc, char **argv)
     cfg.opTable    = opTable;
     cfg.didGuard   = didGuard;
     cfg.didTable   = didTable;
+    cfg.didGuardResp = didGuardResp;
 
     // 谁能当诊断目标 = 物理表里有谁 + 功能表里有谁。都不在的 TA 一律 0x8003 0x03。
     cfg.targetKnown = [&table] (std::uint16_t ta) { return table.reachable (ta); };
@@ -387,6 +393,13 @@ int main (int argc, char **argv)
     }
     else
         std::printf ("DID 白名单：关（0x22 读什么都按「读」档；加 --did-guard 才分 DID）\n");
+    // M32：响应方向。数据就是靠 0x62 流出去的，所以响应侧是另一道闸；
+    //   和请求侧复用同一张 DID 表，但可以单独开（纵深防御：不指望请求侧一定没破）。
+    if (cfg.didGuardResp)
+        std::printf ("DID 白名单（响应）：开（62 <DID> 同样按级别检查；"
+                     "不够档的响应不发给诊断仪 —— 数据不出去）\n");
+    else
+        std::printf ("DID 白名单（响应）：关（62 原样转发；加 --did-guard-resp 才挡）\n");
     // M29：位子账说清楚 —— 账是"谁在什么时候占着哪个位子"，对账工具靠它把 ECU 的位子还原成 SA。
     if (!slotLedgerPath.empty ())
         std::printf ("位子账：写到 %s（退出时落盘；doip-audit 拿它和 ECU 的流水对账）\n",
@@ -524,6 +537,10 @@ int main (int argc, char **argv)
     // M31：其中有多少条是"只看服务号本来能过、被 DID 级别抬掉"的 —— 这一层自己的账。
     if (cfg.didGuard)
         std::printf ("DID 白名单：因 DID 级别不够而挡回 %zu 条\n", srv.didDenied ());
+    // M32：响应方向自己的账。请求侧挡 0 条、响应侧挡 N 条 = 有路在漏请求 —— 这行数一出，
+    //   "纵深防御"就从口号变成能被审计的事实。
+    if (cfg.didGuardResp)
+        std::printf ("DID 白名单（响应）：因 DID 级别不够而挡回 %zu 条\n", srv.respDidDenied ());
     // M28：位子账。**没还的**才叫问题 —— 这里报的是"此刻还占着几个"，
     //   正常收尾应该是 0（每条连接断开都还了）。不是 0 就说明有人没还。
     if (cfg.stampSlots)
