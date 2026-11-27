@@ -12,6 +12,7 @@
 //   排查现场时，这三样东西比"反正串行"有用得多。
 // ============================================================================
 #include "DoIpGateway.h"
+#include "SourceSlot.h"   // M28：按槽号改写请求 ID 的源地址
 
 #include <algorithm>
 #include <cstdio>
@@ -57,6 +58,7 @@ bool DiagnosticGateway::start (std::string &err)
         cfg.frameBytes = e.fd ? kFdFrameBytes : kClassicFrameBytes;
 
         auto ch = std::unique_ptr<Channel> (new Channel (iface_, cfg, tim_));
+        ch->txId = e.txId;   // M28：不装槽号时要回落到表里这一条
         std::string e2;
         if (!ch->client.open (e2))
         {
@@ -128,7 +130,12 @@ void DiagnosticGateway::workerLoop (std::uint16_t ta)
             std::lock_guard<std::mutex> bus (ch.busMu);
             std::vector<std::uint8_t> resp;
             std::string err;
-            if (ch.client.request (job.req.uds, resp, err))
+            // M28：把"谁"写成 CAN 源地址。
+            //   只改 29 位 ID 的最低字节；11 位 ID 原样（它没有源地址那一格）。
+            //   槽号来自**这一次请求**（不是这条通道），两台诊断仪交叠时不串号。
+            const std::uint32_t tx = stampSource_ ? slots::stampSource (ch.txId, job.req.actorSlot)
+                                                  : ch.txId;
+            if (ch.client.request (job.req.uds, resp, err, tx))
             {
                 r.ok = true;
                 r.replies.push_back (DiagnosticReply{job.req.targetAddress, resp});

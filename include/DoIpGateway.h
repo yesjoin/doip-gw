@@ -62,6 +62,11 @@ public:
 
     // 按路由表逐个开通道并起工作线程。任何一条开不起来就整体失败
     bool start (std::string &err);
+
+    // M28：要不要按诊断仪的槽号改写请求 ID 的源地址（默认关 = 透明桥接）。
+    //   关掉时行为与 M27 完全一致：所有诊断仪在总线上都是表里写的那个源地址。
+    void setStampSource (bool on) { stampSource_ = on; }
+    bool stampSource () const { return stampSource_; }
     void stop ();
 
     // ---- 同步接口（M4~M9 的行为，功能寻址/一次性调用仍走它）----
@@ -122,6 +127,7 @@ private:
         {
         }
         IsoTpClient                        client;
+        std::uint32_t                      txId = 0;    // M28：这条通道"不装"时用的请求 ID
         JobQueue                           queue{8};     // 一条通道最多排 8 条，满了当场拒
         std::thread                        worker;
         std::mutex                         busMu;        // "这条通道的总线使用权"（广播要全占）
@@ -157,6 +163,7 @@ private:
     std::atomic<std::size_t> funcRep_{0};
     std::atomic<std::size_t> silent_{0};
     std::atomic<std::size_t> abandoned_{0};
+    bool                     stampSource_ = false;   // M28：默认不装（透明桥接）
     std::atomic<std::size_t> streamed_{0};   // M12：已经边到边发出去的应答条数
     ReplySink                replySink_;    // M12：为空 = 老行为（攒齐再发）
 };

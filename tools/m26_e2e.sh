@@ -88,7 +88,7 @@ cleanup
 rm -f "$STORE_A" "$STORE_B" "$STORE_C" "$STORE_A.tmp" "$STORE_B.tmp" "$STORE_C.tmp" /tmp/m26_state.txt
 start_fleet "$PORT_A" 30 1
 
-grep -q "DOIPKEYRING 3" "$STORE_A" && ok "盘上是 v3 文件（M26 起写新格式）" || bad "盘上不是 v3"
+grep -q "DOIPKEYRING 4" "$STORE_A" && ok "盘上是 v3 起的格式，M28 升到 v4（多了「谁」一格）" || bad "盘上格式不是 v4"
 grep -q "^BOOT " "$STORE_A" && ok "文件里有 BOOT 行（上电序落盘）" || bad "文件里没有 BOOT 行"
 grep -q "流水：最近 0 条（还没有变更）" "$ELOG_A" \
     && ok "出厂横幅说「最近 0 条（还没有变更）」（不假装有账）" || bad "出厂横幅没报流水"
@@ -163,7 +163,7 @@ import sys
 p = sys.argv[1]
 with open(p, "r") as f:
     lines = [ln.rstrip("\n") for ln in f if ln.strip()]
-assert lines[0] == "DOIPKEYRING 3", lines[0]
+assert lines[0] in ("DOIPKEYRING 3", "DOIPKEYRING 4"), lines[0]
 body = "DOIPKEYRING 2\n"
 body += "\n".join(ln for ln in lines[1:-1] if ln.startswith("VER ") or ln.startswith("K ")) + "\n"
 checksum = hashlib.sha256(body.encode()).hexdigest()[:16]

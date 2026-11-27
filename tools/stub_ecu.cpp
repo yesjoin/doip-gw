@@ -39,6 +39,7 @@
 #include "KeyRingStore.h"
 #include "SessionGuard.h"
 #include "IsoTpStack.h"
+#include "SourceSlot.h"   // M28：从 29 位 ID 的最低字节里读"谁"
 
 #include <linux/can.h>
 #include <linux/can/raw.h>
@@ -136,7 +137,12 @@ void sendFrame (int fd, std::uint32_t id, const std::uint8_t d[64], std::size_t 
 }
 
 // 发一条 UDS：单帧一发；多帧先发 FF，等 tester 的流控，再按 STmin 发 CF
-bool sendUds (int fd, std::uint32_t txId, std::uint32_t rxId,
+//
+// M28：等流控也要按**掩码**认帧（rxMask）。网关改写源地址之后，流控帧是从
+//   "位子"那个源地址来的（18DA00F2 / 18DA00F3 …），不是路由表里的那一串。
+//   这里要是还按精确 ID 比，多帧响应会一条也发不出去 —— 表现是
+//   "等 tester 流控超时"，而真正的原因是"等了但不是给我的"。
+bool sendUds (int fd, std::uint32_t txId, std::uint32_t rxId, std::uint32_t rxMask,
               const std::vector<std::uint8_t> &uds, std::size_t frameBytes,
               std::string &err)
 {
@@ -166,7 +172,7 @@ bool sendUds (int fd, std::uint32_t txId, std::uint32_t rxId,
         const ssize_t n = ::read (fd, &f, sizeof (f));
         if (n != static_cast<ssize_t> (sizeof (can_frame)) &&
             n != static_cast<ssize_t> (sizeof (canfd_frame))) continue;
-        if (idFromRecv (f.can_id) != rxId) continue;      // 不是给我的，丢掉（先剥标志位再比）
+        if ((idFromRecv (f.can_id) & rxMask) != (rxId & rxMask)) continue;   // 不是给我的，丢掉
         std::uint8_t d[8];
         std::memcpy (d, f.data, 8);
         if (kindOf (d) != FrameKind::FlowControl) continue;
@@ -514,9 +520,11 @@ static bool persistRing (const keys::KeyRing &ring, keys::Generation generation,
 }
 
 // 记一条流水。指纹取"改完之后"的表 —— 对账时拿它对的是结果，不是起点。
+//   M28：actor 是"谁"——网关写进 CAN 源地址的那个字节。0 = 不知道。
 static keys::LogEntry makeEntry (keys::Act act, std::uint16_t keyId, const keys::KeyRing &ring,
                                  keys::Generation generation, std::uint16_t boot,
-                                 keys::Channel channel, std::uint32_t nowSec)
+                                 keys::Channel channel, std::uint32_t nowSec,
+                                 std::uint8_t actor)
 {
     keys::LogEntry e;
     e.generation  = generation;
@@ -526,12 +534,13 @@ static keys::LogEntry makeEntry (keys::Act act, std::uint16_t keyId, const keys:
     e.channel     = channel;
     e.boot        = boot;
     e.seconds     = nowSec;
+    e.actor       = actor;
     return e;
 }
 
 bool keyService (keys::KeyRing &ring, keys::Generation &generation, keys::ChangeLog &log,
                  std::uint16_t boot, const std::string &storePath, bool storeLocked, bool onFunc,
-                 std::uint32_t nowSec,
+                 std::uint32_t nowSec, std::uint8_t actor,
                  const std::vector<std::uint8_t> &req,
                  std::vector<std::uint8_t> &resp, std::string &why)
 {
@@ -609,7 +618,7 @@ bool keyService (keys::KeyRing &ring, keys::Generation &generation, keys::Change
         return true;
     }
 
-    // M26：0x31 01 02 0B <i> 读流水第 i 条（1 = 最近）。19 字节，只能物理寻址。
+    // M26：0x31 01 02 0B <i> 读流水第 i 条（1 = 最近）。19 → 20 字节，只能物理寻址。
     //   为什么用例程不用 DID：0x22 的 DID 严格是 2 个字节，塞不下"第几条"这个参数；
     //   再开一个 F1B4 也不对 —— 那是"另开一列"，不是"同一列的某一行"。
     if (req.size () >= 4 && req[0] == 0x31 && req[1] == 0x01 && req[2] == 0x02 && req[3] == 0x0B)
@@ -643,12 +652,15 @@ bool keyService (keys::KeyRing &ring, keys::Generation &generation, keys::Change
                 static_cast<std::uint8_t> ((e.seconds >> 24) & 0xFF),
                 static_cast<std::uint8_t> ((e.seconds >> 16) & 0xFF),
                 static_cast<std::uint8_t> ((e.seconds >> 8) & 0xFF),
-                static_cast<std::uint8_t> (e.seconds & 0xFF)};
+                static_cast<std::uint8_t> (e.seconds & 0xFF),
+                e.actor};   // M28：第 20 字节 = 谁（0 = 不知道）
+        char whoHex[8];
+        std::snprintf (whoHex, sizeof whoHex, "%02X", static_cast<unsigned> (e.actor));
         why = "第 " + std::to_string (idx) + " 条：" + keys::actName (e.act) + " 0x" +
               fw::keyIdText (e.keyId) + "，" + keys::channelName (e.channel) + "，版本 " +
               std::to_string (static_cast<unsigned> (e.generation)) + "，第 " +
               std::to_string (static_cast<unsigned> (e.boot)) + " 次上电 +" +
-              std::to_string (e.seconds) + "s";
+              std::to_string (e.seconds) + "s，谁 " + whoHex;
         return true;
     }
 
@@ -701,7 +713,7 @@ bool keyService (keys::KeyRing &ring, keys::Generation &generation, keys::Change
                 generation = keys::nextGeneration (generation);   // M25：成功改一次表 = 下一代
                 log.append (makeEntry (keys::Act::Install, id, ring, generation, boot,
                                        onFunc ? keys::Channel::Broadcast : keys::Channel::Physical,
-                                       nowSec));
+                                       nowSec, actor));
                 std::string pwhy;
                 if (persistRing (ring, generation, log, boot, storePath, pwhy))
                 {
@@ -773,7 +785,7 @@ bool keyService (keys::KeyRing &ring, keys::Generation &generation, keys::Change
                                                       : keys::Act::Revoke;
                 log.append (makeEntry (act, id, ring, generation, boot,
                                        onFunc ? keys::Channel::Broadcast : keys::Channel::Physical,
-                                       nowSec));
+                                       nowSec, actor));
                 std::string pwhy;
                 if (persistRing (ring, generation, log, boot, storePath, pwhy))
                 {
@@ -979,6 +991,10 @@ int main (int argc, char **argv)
     std::string iface = "vcan0";
     std::uint32_t tx = 0x7A8;      // 我发的（ECU → tester）
     std::uint32_t rx = 0x7A0;      // 我收的（tester → ECU）
+    // ★ M28：接收掩码。默认全 29 位都比（= 老行为：只认这一个 ID）。
+    //   网关开了 --stamp-sa 之后，同一台 ECU 会收到 18DA00F1..18DA00F8 八种源地址，
+    //   这时要传 --rx-mask 1FFFFF00（只比高 24 位），否则只认得出第一台诊断仪。
+    std::uint32_t rxMask = 0x1FFFFFFFu;
     std::uint32_t funcRx = 0;      // M8：额外的广播监听 ID（0 = 不听广播）
     bool useFd = false;            // M9：这一台按 CAN FD 说话（帧长 64）
     int  delayMs = 0;              // M10：应答前先睡一会儿（模拟"这台 ECU 慢"）
@@ -1013,6 +1029,7 @@ int main (int argc, char **argv)
         else if (a == "--tx" && i + 1 < argc)     tx = std::strtoul (argv[++i], nullptr, 16);
         else if (a == "--rx" && i + 1 < argc)     rx = std::strtoul (argv[++i], nullptr, 16);
         else if (a == "--func-rx" && i + 1 < argc) funcRx = std::strtoul (argv[++i], nullptr, 16);
+        else if (a == "--rx-mask" && i + 1 < argc) rxMask = std::strtoul (argv[++i], nullptr, 16);
         else if (a == "--vin" && i + 1 < argc)    vin = argv[++i];
         else if (a == "--hw" && i + 1 < argc)     hw = argv[++i];
         else if (a == "--fd")                     useFd = true;
@@ -1047,7 +1064,9 @@ int main (int argc, char **argv)
                           "     --retire-key <id>：启动时把这把钥匙置为退役（默认两把都启用）\n"
                           "     --revoke-key <id>：启动时把这把钥匙置为吊销（终态，拒收它签的一切）\n"
                           "     --key-store <path>：钥匙表落到这个文件，重启后仍然生效（不写就只在内存）\n"
-                          "     --reset-key-store：不管文件里是什么，重建默认两把（现场换钥匙才用）\n", argv[0]);
+                          "     --reset-key-store：不管文件里是什么，重建默认两把（现场换钥匙才用）\n"
+                          "     --rx-mask <hex>：接收 ID 的掩码（默认 1FFFFFFF = 只认 --rx 那一个；\n"
+                          "                      要接网关的 --stamp-sa，用 1FFFFF00，这样八种源地址都收）\n", argv[0]);
             return 2;
         }
     }
@@ -1175,7 +1194,7 @@ int main (int argc, char **argv)
         ++startupChanges;
         keyGen = keys::nextGeneration (keyGen);
         keyLog.append (makeEntry (act, static_cast<std::uint16_t> (rawId), keyRing, keyGen, keyBoot,
-                                  keys::Channel::Startup, 0));
+                                  keys::Channel::Startup, 0, 0));   // M28：上电参数改的，没有"谁"
     };
     for (std::uint32_t id : retireKeys)
         if (keyRing.setState (static_cast<std::uint16_t> (id), keys::State::Retiring) !=
@@ -1276,12 +1295,16 @@ int main (int argc, char **argv)
         std::printf ("           钥匙：0x22 F1B0 读表 / 0x22 F1B1 摘要（4 个计数，7 字节，可广播）/ "
                      "0x22 F1B2 清单指纹（世代 2 + 指纹 2，6 字节，可广播）/ "
                      "0x22 F1B3 流水概览（条数 + 最近动作 + keyId，7 字节，可广播）/ "
-                     "0x31 01 02 0B <i> 读流水第 i 条（1 = 最近，19 字节，只能物理寻址）/ "
+                     "0x31 01 02 0B <i> 读流水第 i 条（1 = 最近，20 字节，只能物理寻址）/ "
                      "0x31 01 02 0A 能不能装（问，不过门）/ 0x31 01 02 06 装 / 0x31 01 02 07 改状态；"
                      "装与改都要编程会话 + 解锁\n");
         std::printf ("           钥匙表：%s —— %s\n",
                      keyStorePath.empty () ? "（内存）" : keyStorePath.c_str (), storeNote.c_str ());
         std::printf ("           流水：最近 %zu 条（%s）\n", keyLog.size (), keyLog.dump ().c_str ());
+        // M28：把"谁从哪来"讲清楚 —— 11 位帧没有源地址这一格，这是硬件事实，不是缺陷。
+        std::printf ("           谁：流水第七格取报文首帧的 CAN 源地址（29 位 ID 的最低字节，0xF1..0xF8）；"
+                     "11 位 ID（0x%03X）没有这一格 → 记 00（不知道）\n",
+                     static_cast<unsigned> (rx));
         std::printf ("           清单：%s（世代落盘跟着走：v3 文件里一行 VER + 一行 BOOT）\n",
                      keys::stampText (keyRing, keyGen).c_str ());
     }
@@ -1296,6 +1319,9 @@ int main (int argc, char **argv)
     };
     const auto deadline = std::chrono::steady_clock::now () + std::chrono::seconds (seconds);
     std::size_t answered = 0;
+    // M28：当前这条报文是"谁"发的（CAN 源地址那 1 个字节；11 位帧 → 0）。
+    //   在**第一帧**（单帧/首帧）定下来，连续帧不许改 —— 一条报文不会中途换人。
+    std::uint8_t msgActor = 0;
 
     while (std::chrono::steady_clock::now () < deadline)
     {
@@ -1313,13 +1339,18 @@ int main (int argc, char **argv)
 
         const std::uint32_t gotId = idFromRecv (f.can_id);      // 先剥标志位再比
         const bool onFunc = (funcRx != 0 && gotId == funcRx);   // M8：这一帧是广播来的吗
-        if (gotId != rx && !onFunc) continue;                   // 不是给我的
+        // M28：按掩码比。rxMask 全 1 时等价于"只认这一个 ID"（老行为一字不改）。
+        if (!onFunc && (gotId & rxMask) != (rx & rxMask)) continue;   // 不是给我的
 
         const std::size_t dlen = f.len;
         if (dlen == 0 || dlen > frameBytes) continue;
 
         std::uint8_t d[kFdFrameBytes] = {0};
         std::memcpy (d, f.data, dlen);
+
+        // M28：记下这条报文的源地址（只在报文的第一帧上取）。
+        if (kindOf (d) == FrameKind::SingleFrame || kindOf (d) == FrameKind::FirstFrame)
+            msgActor = slots::sourceOf (gotId);
 
         // 广播来的请求必须是单帧：网关没法给"所有 ECU"发流控。
         // 收到 FF 说明对端用法错了（或者别的工具在刷）——印一句，不答。
@@ -1412,9 +1443,9 @@ int main (int argc, char **argv)
         //   代价写在协议里：功能寻址的应答必须塞进一个单帧，所以"广播读整张表"在经典帧下答不出来。
         if (!handled &&
             keyService (keyRing, keyGen, keyLog, keyBoot, keyStorePath,
-                        storeStatus == keys::LoadStatus::Corrupt, onFunc, msNow () / 1000u,
-                        req, resp, why))   // M22/M24/M25/M26：F1B0 读表 / F1B1 摘要 / F1B2 指纹 / F1B3 流水概览 /
-                                            //                  020B 读流水 / 0206 装 / 0207 改状态
+                        storeStatus == keys::LoadStatus::Corrupt, onFunc, msNow () / 1000u, msgActor,
+                        req, resp, why))   // M22/M24/M25/M26/M28：F1B0 读表 / F1B1 摘要 / F1B2 指纹 /
+                                            //   F1B3 流水概览 / 020B 读流水 / 0206 装 / 0207 改状态
         {
             handled = true;
         }
@@ -1446,7 +1477,7 @@ int main (int argc, char **argv)
         std::printf ("  ← %s%s  →  %s\n", onFunc ? "[广播] " : "", hex (req).c_str (),
                      hex (resp).c_str ());
         if (handled) std::printf ("     [会话/刷写] %s\n", why.c_str ());
-        if (!sendUds (fd, tx, rx, resp, frameBytes, e2))
+        if (!sendUds (fd, tx, rx, rxMask, resp, frameBytes, e2))
         {
             std::printf ("  [回不出去：%s]\n", e2.c_str ());
         }

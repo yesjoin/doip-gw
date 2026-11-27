@@ -44,7 +44,8 @@ static keys::KeyRing makeRing ()
 }
 
 static keys::LogEntry entryOf (std::uint16_t id, std::uint16_t gen, keys::Act act,
-                               keys::Channel ch, std::uint16_t boot, std::uint32_t sec)
+                               keys::Channel ch, std::uint16_t boot, std::uint32_t sec,
+                               std::uint8_t actor = 0)
 {
     keys::LogEntry e;
     e.keyId       = id;
@@ -54,6 +55,7 @@ static keys::LogEntry entryOf (std::uint16_t id, std::uint16_t gen, keys::Act ac
     e.channel     = ch;
     e.boot        = boot;
     e.seconds     = sec;
+    e.actor       = actor;      // M28：第七格「谁」
     return e;
 }
 
@@ -89,25 +91,31 @@ int main ()
     // ---- B. 一行文本 ----
     {
         const keys::LogEntry e = entryOf (0x0003, 0x0007, keys::Act::Retire,
-                                          keys::Channel::Broadcast, 0x0002, 0x0000002A);
+                                          keys::Channel::Broadcast, 0x0002, 0x0000002A, 0xF2);
         const std::string ln = keys::logLine (e);
-        CHECK (ln.size () == 37 && ln[36] == '\n', "B1 一行是 36 个字符 + 换行（定长，脚本好切）");
+        CHECK (ln.size () == 39 && ln[38] == '\n', "B1 一行是 38 个字符 + 换行（定长，脚本好切）");
         CHECK (ln.compare (0, 2, "L ") == 0, "B2 以「L 」开头（和 K 行区分得开）");
         CHECK (ln.compare (2, 4, "0007") == 0, "B3 第 2–5 位是世代");
         CHECK (ln.compare (12, 2, "02") == 0, "B4 第 12–13 位是动作（退役 = 02）");
         CHECK (ln.compare (15, 2, "02") == 0, "B5 第 15–16 位是通道（广播 = 02）");
         CHECK (ln.compare (18, 4, "0003") == 0, "B6 第 18–21 位是 keyId");
-        CHECK (ln.compare (28, 8, "0000002A") == 0, "B7 最后 8 位是上电后秒数");
+        CHECK (ln.compare (28, 8, "0000002A") == 0, "B7 第 28–35 位是上电后秒数");
+        CHECK (ln.compare (36, 2, "F2") == 0, "B7b 最后 2 位是「谁」（贴着秒数写，老前缀一个字不动）");
 
         keys::LogEntry back;
-        CHECK (keys::parseLogLine (ln.substr (0, 36), back) && back.generation == 7 &&
+        CHECK (keys::parseLogLine (ln.substr (0, 38), back) && back.generation == 7 &&
                    back.keyId == 0x0003 && back.act == keys::Act::Retire &&
-                   back.channel == keys::Channel::Broadcast && back.boot == 2 && back.seconds == 42,
-               "B8 自己写出来的能读回来，字段一个不差");
+                   back.channel == keys::Channel::Broadcast && back.boot == 2 && back.seconds == 42 &&
+                   back.actor == 0xF2,
+               "B8 自己写出来的能读回来，七个字段一个不差");
 
-        // 以下五条：形状或字段不对，一律不认（宁可判坏，不猜）
+        // 以下六条：形状或字段不对，一律不认（宁可判坏，不猜）
         keys::LogEntry dummy;
         CHECK (!keys::parseLogLine (ln.substr (0, 35), dummy), "B9 少一个字符 → 不认");
+        CHECK (!keys::parseLogLine (ln.substr (0, 37), dummy),
+               "B9b 37 个字符（有秒、少了谁的半格）→ 不认（只有 36 与 38 两种合法形状）");
+        CHECK (keys::parseLogLine (ln.substr (0, 36), dummy) && dummy.actor == 0,
+               "B9c 36 字符的老行也认，谁按 0 读（v3 的账不能读不进来）");
         CHECK (!keys::parseLogLine ("L 0007 70D3 06 01 0003 0002 0000002A", dummy),
                "B10 动作 06 不存在 → 不认（0 也不认，0 是「没有变更」）");
         CHECK (!keys::parseLogLine ("L 0007 70D3 01 04 0003 0002 0000002A", dummy),
@@ -157,23 +165,42 @@ int main ()
         keys::KeyRing r = makeRing ();
         r.install (0x0003, fw::demoKey (0x0003));
         keys::ChangeLog L;
-        L.append (entryOf (0x0003, 1, keys::Act::Install, keys::Channel::Physical, 1, 4));
-        L.append (entryOf (0x0003, 2, keys::Act::Retire, keys::Channel::Physical, 2, 7));
+        L.append (entryOf (0x0003, 1, keys::Act::Install, keys::Channel::Physical, 1, 4, 0xF1));
+        L.append (entryOf (0x0003, 2, keys::Act::Retire, keys::Channel::Physical, 2, 7, 0xF2));
 
         const std::string text = keys::encode (r, 2, 2, &L);
-        CHECK (text.compare (0, 14, "DOIPKEYRING 3\n") == 0, "D1 版本行写 3（v3）");
+        CHECK (text.compare (0, 14, "DOIPKEYRING 4\n") == 0, "D1 版本行写 4（v4）");
         CHECK (text.compare (14, 9, "VER 0002\n") == 0, "D2 第二行 VER 0002");
         CHECK (text.compare (23, 10, "BOOT 0002\n") == 0, "D3 第三行 BOOT 0002");
         CHECK (text.find ("\nL 0001 70D3") != std::string::npos, "D4 装着流水（按出现顺序：旧在前）");
-        CHECK (text.find ("\nL 0002 70D3") != std::string::npos, "D5 两条都在");
+        CHECK (text.find ("\nL 0002 70D3 02 01 0003 0002 00000007F2") != std::string::npos,
+               "D5 两条都在，最新那条末尾带着「谁 F2」");
 
         const keys::LoadResult back = keys::decode (text);
-        CHECK (back.status == keys::LoadStatus::Ok, "D6 v3 自己写出来的能读回来");
+        CHECK (back.status == keys::LoadStatus::Ok, "D6 v4 自己写出来的能读回来");
         CHECK (back.generation == 2 && back.boot == 2, "D7 世代与上电序都回来了");
         CHECK (back.ring.size () == 3, "D8 表也还在（3 把）");
         CHECK (back.log.size () == 2 && back.log.at (0).act == keys::Act::Retire,
                "D9 流水读回来还是新在前（最新一条是退役）");
         CHECK (back.log.at (0).seconds == 7, "D10 秒数一个不差");
+        CHECK (back.log.at (0).actor == 0xF2 && back.log.at (1).actor == 0xF1,
+               "D10b 谁也跟着回来（最新 F2、上一条 F1）");
+
+        // v3 兼容：36 字符的老行 → 谁按 0 读
+        std::string v3text = "DOIPKEYRING 3\nVER 0002\nBOOT 0002\n";
+        v3text += "K 0001 00 " + Sha256::hex (fw::demoKey (0x0001)) + "\n";
+        v3text += "L 0002 70D3 02 01 0003 0002 00000007\n";
+        const keys::LoadResult b3 = keys::decode (v3text + "SUM " + keys::checksumOf (v3text) + "\n");
+        CHECK (b3.status == keys::LoadStatus::Ok && b3.log.size () == 1 && b3.log.at (0).actor == 0,
+               "D10c v3 的老文件照样读，谁记成 0（那时候还记不了）");
+
+        // v4 里出现 36 字符的老行 → 判坏（拼过）
+        std::string v4bad = "DOIPKEYRING 4\nVER 0002\nBOOT 0002\n";
+        v4bad += "K 0001 00 " + Sha256::hex (fw::demoKey (0x0001)) + "\n";
+        v4bad += "L 0002 70D3 02 01 0003 0002 00000007\n";
+        CHECK (keys::decode (v4bad + "SUM " + keys::checksumOf (v4bad) + "\n").status ==
+                   keys::LoadStatus::Corrupt,
+               "D10d v4 里混进 36 字符的老行 → 判坏（要么是 v3 的账搬进来，要么手改过）");
 
         // v2 兼容：去掉 BOOT 和 L 行，改版本行 —— 表和世代必须还在，流水按空算
         std::string v2 = "DOIPKEYRING 2\nVER 0002\n";
@@ -226,7 +253,7 @@ int main ()
                "D20 从盘上读回来：流水、上电序、世代都在");
         std::remove (path.c_str ());
 
-        // 没给 log 指针的老调用也得能写（默认参数），且写出来仍是 v3（BOOT 0000、没有 L 行）
+        // 没给 log 指针的老调用也得能写（默认参数），且写出来仍是 v4（BOOT 0000、没有 L 行）
         const std::string plain = keys::encode (r, 1);
         CHECK (plain.find ("BOOT 0000\n") != std::string::npos && plain.find ("\nL ") == std::string::npos,
                "D21 老调用不传 log：BOOT 补 0、没有流水行");

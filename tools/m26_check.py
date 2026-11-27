@@ -177,9 +177,13 @@ def overview(t, ta):
 
 
 def detail(t, ta, idx):
-    """0x31 01 02 0B <idx> → dict；越界/格式不对返回 None"""
+    """0x31 01 02 0B <idx> → dict；越界/格式不对返回 None
+
+    M28 起报文多一个尾字节「谁」（19 → 20）。这里两种都收：M26 的验收脚本
+    不该因为后面加了字段就变红，但也不假装 20 字节是 19。
+    """
     r = t.uds(ta, bytes([0x31, 0x01, 0x02, 0x0B, idx]))
-    if r is None or len(r) != 19 or r[:4] != bytes([0x71, 0x01, 0x02, 0x0B]):
+    if r is None or len(r) not in (19, 20) or r[:4] != bytes([0x71, 0x01, 0x02, 0x0B]):
         return None
     return {
         "idx": r[4],
@@ -190,6 +194,7 @@ def detail(t, ta, idx):
         "key": (r[11] << 8) | r[12],
         "boot": (r[13] << 8) | r[14],
         "sec": struct.unpack("!I", r[15:19])[0],
+        "who": r[19] if len(r) == 20 else 0,
     }
 
 

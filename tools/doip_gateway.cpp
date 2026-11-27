@@ -111,6 +111,7 @@ int main (int argc, char **argv)
     std::uint8_t powerMode = kPowerReady;   // M14：0x4003 的答案
     auth::Secret testerKey{};    // M27：预共享密钥；没给就是"不验票"
     bool haveKey = false;
+    bool stampSa = false;        // M28：把"谁"写成 CAN 源地址（默认关 = 透明桥接）
 
     for (int i = 1; i < argc; ++i)
     {
@@ -123,6 +124,7 @@ int main (int argc, char **argv)
         else if (a == "--route" && i + 1 < argc)    routeSpecs.push_back (argv[++i]);
         else if (a == "--func" && i + 1 < argc)     funcSpecs.push_back (argv[++i]);
         else if (a == "--no-stream")                stream = false;   // M12：退回 M11 的"攒齐再发"
+        else if (a == "--stamp-sa")                 stampSa = true;   // M28：在位子上写源地址
         else if (a == "--tester-key" && i + 1 < argc)
         {
             // M27：64 位十六进制 = 32 字节预共享密钥。
@@ -155,7 +157,7 @@ int main (int argc, char **argv)
                           "用法：%s [--iface vcan0] [--port 13400] [--seconds 20] [--stmin 10]\n"
                           "          [--vin LSVAA0000A1234567] [--route TA:TX:RX[:名字]]...\n"
                           "          [--func 功能地址:广播ID[:名字]]... [--no-stream] [--power-mode 0|1|2]\n"
-                          "          [--tester-key 64位十六进制]\n"
+                          "          [--tester-key 64位十六进制] [--stamp-sa]\n"
                           "      例：%s --route 0002:7E0:7E8:ECU_A --route 0003:7A0:7A8:ECU_B\n"
                           "          --func 0xE400:0x7DF:ALL\n",
                           argv[0], argv[0]);
@@ -199,6 +201,7 @@ int main (int argc, char **argv)
     }
 
     DiagnosticGateway gw (iface, table, tim);
+    gw.setStampSource (stampSa);   // M28
     std::string err;
     if (!gw.start (err))
     {
@@ -223,6 +226,8 @@ int main (int argc, char **argv)
         cfg.authKey      = testerKey;
         cfg.authRequired = true;
     }
+    // M28：开了位子，网关才给每条激活的连接发号；ECU 那边也要按掩码收帧。
+    cfg.stampSlots = stampSa;
 
     // 谁能当诊断目标 = 物理表里有谁 + 功能表里有谁。都不在的 TA 一律 0x8003 0x03。
     cfg.targetKnown = [&table] (std::uint16_t ta) { return table.reachable (ta); };
@@ -246,6 +251,12 @@ int main (int argc, char **argv)
                      "  没带票/票不对 → 0x04 缺认证；*挡住了不等于安全* —— 4 字节静态票可重放，真车靠 TLS\n");
     else
         std::printf ("路由激活凭据：关（谁都能激活，教学默认；加 --tester-key 打开）\n");
+    // M28：把"改不改源地址"摆在明面上 —— 它破坏透明桥接，必须显式说一声。
+    if (cfg.stampSlots)
+        std::printf ("源地址改写：开（每台诊断仪分一个 1 字节位子，29 位 ID 的最低字节写成 0xF1..0xF8；\n"
+                     "  11 位 ID 没有源地址那一格 → 原样发。诊断仪在总线上看到的源地址不再是自己的声明）\n");
+    else
+        std::printf ("源地址改写：关（所有诊断仪在总线上都是路由表里写的那个源地址）\n");
     std::printf ("路由表（%zu 条）：\n", table.size ());
     for (const auto &e : table.entries ())
     {
@@ -371,6 +382,10 @@ int main (int argc, char **argv)
     if (cfg.authRequired)
         std::printf ("凭据：通过 %zu 次，挡回 %zu 次（0x04）\n",
                      srv.authPasses (), srv.authRejects ());
+    // M28：位子账。**没还的**才叫问题 —— 这里报的是"此刻还占着几个"，
+    //   正常收尾应该是 0（每条连接断开都还了）。不是 0 就说明有人没还。
+    if (cfg.stampSlots)
+        std::printf ("位子：此刻还占着 %zu 个（断开就回收；位子不是人，是位子）\n", srv.slotsUsed ());
     if (stream)
     {
         std::printf ("流式交付 %zu 条（收到就转，不等一轮收齐；同一 job 交卷时只补差额）；"

@@ -22,21 +22,22 @@
 //
 // 落盘格式（文本，一行一条，最后一行校验和）：
 //
-//   DOIPKEYRING 3
+//   DOIPKEYRING 4
 //   VER 0007
 //   BOOT 0002
 //   K 0001 00 <64 hex>
 //   K 0002 02 <64 hex>
-//   L 0007 70D3 01 01 0003 0002 00000012
+//   L 0007 70D3 01 01 0003 0002 00000012 F2
 //   SUM 3f7c1a0e5b2d9c48
 //
-// 三个版本一路下来：**写永远写 3，读 1 / 2 / 3 都认**。
-//   · v1（M23）：没有 VER、没有 BOOT、没有流水 → 世代 0、上电序 0、流水空；
+// 四个版本一路下来：**写永远写 4，读 1 / 2 / 3 / 4 都认**。
+//   · v1（M23）：没有 VER、没有 BOOT、没有流水 → 世代 0、上电序 0、流水空、谁 0；
 //   · v2（M25）：有 VER，没有 BOOT / 流水 → 上电序 0、流水空；
-//   · v3（M26）：VER + BOOT + 流水。
+//   · v3（M26）：VER + BOOT + 流水（每行 36 字符，没有"谁"）；
+//   · v4（M28）：流水每行多 2 个字符 = 谁（CAN 源地址 0xF1..0xF8，00 = 不知道）。
 // 为什么老版本也认：老文件升级后钥匙表不能变成空的。人手迁移那一刻，现场通常已经断电了。
-//   v2 → v3 的代价是"历史那一栏没了"（流水没写下来过），这件事必须让启动横幅说出来，
-//   不能假装流水是满的。
+//   v3 → v4 的代价是"最近那 8 笔里没有谁"（那时候还没法记），这件事必须让启动横幅说出来，
+//   不能假装流水是满的、也不能把 00 当成"一台叫 00 的诊断仪"。
 //
 // 为什么用文本：现场排障 `cat` 一眼能看；二进制省下的那点字节在这个场景没有收益，
 //   而"人能直接读一行"有收益。SUM 取 SHA-256 前 8 字节（16 个 hex 字符）——
@@ -97,7 +98,7 @@ inline std::string checksumOf (const std::string &body)
 inline std::string encode (const KeyRing &ring, Generation generation = 0,
                            std::uint16_t boot = 0, const ChangeLog *log = nullptr)
 {
-    std::string body = "DOIPKEYRING 3\n";
+    std::string body = "DOIPKEYRING 4\n";
     char buf[96];
     std::snprintf (buf, sizeof buf, "VER %04X\n", static_cast<unsigned> (generation));
     body += buf;
@@ -171,13 +172,14 @@ inline LoadResult decode (const std::string &text)
         return r;
     }
 
-    // 版本行：写永远写 3，读 1 / 2 / 3 都认。
+    // 版本行：写永远写 4，读 1 / 2 / 3 / 4 都认。
     std::size_t firstBodyLine = 1;
     Generation  gen  = 0;
     std::uint16_t boot = 0;
-    const bool  hasLog = (lines[0] == "DOIPKEYRING 3");
+    const bool  isV4   = (lines[0] == "DOIPKEYRING 4");
+    const bool  hasLog = (isV4 || lines[0] == "DOIPKEYRING 3");
 
-    if (lines[0] == "DOIPKEYRING 3" || lines[0] == "DOIPKEYRING 2")
+    if (hasLog || lines[0] == "DOIPKEYRING 2")
     {
         if (lines.size () < 3)
         {
@@ -231,7 +233,7 @@ inline LoadResult decode (const std::string &text)
     }
     else
     {
-        r.why = "版本行不对（读到「" + lines[0] + "」，只认 DOIPKEYRING 1 / 2 / 3）";
+        r.why = "版本行不对（读到「" + lines[0] + "」，只认 DOIPKEYRING 1 / 2 / 3 / 4）";
         return r;
     }
 
@@ -267,7 +269,15 @@ inline LoadResult decode (const std::string &text)
             LogEntry e;
             if (!hasLog)
             {
-                r.why = "第 " + std::to_string (i + 1) + " 行有流水，但版本行不是 3";
+                r.why = "第 " + std::to_string (i + 1) + " 行有流水，但版本行不是 3/4";
+                return r;
+            }
+            // v4 的行必须带"谁"（38 字符）。v4 里出现 36 字符的老行 = 拼过 ——
+            //   要么是 v3 的账搬进来的，要么是有人手改过。两种都不该照单全收。
+            if (isV4 && ln.size () != 38)
+            {
+                r.why = "v4 里第 " + std::to_string (i + 1) + " 行流水少了「谁」那一格（" +
+                        std::to_string (ln.size ()) + " 字符，应为 38）";
                 return r;
             }
             if (!parseLogLine (ln, e))

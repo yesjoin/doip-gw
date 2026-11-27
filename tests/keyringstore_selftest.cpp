@@ -58,7 +58,7 @@ int main ()
     // ---- A. 编码 ----
     {
         const std::string empty = keys::encode (keys::KeyRing {});
-        CHECK (empty.compare (0, 14, "DOIPKEYRING 3\n") == 0, "A1 第一行是版本行（写永远写 3）");
+        CHECK (empty.compare (0, 14, "DOIPKEYRING 4\n") == 0, "A1 第一行是版本行（写永远写 4）");
         CHECK (empty.compare (14, 9, "VER 0000\n") == 0, "A1b 第二行是 VER（默认世代 0）");
         CHECK (empty.compare (23, 10, "BOOT 0000\n") == 0, "A1c 第三行是 BOOT（默认上电序 0）");
         CHECK (empty.size () == 14 + 9 + 10 + 4 + 16 + 1,
@@ -127,11 +127,19 @@ int main ()
         wrongSum[good.size () - 3] = (good[good.size () - 3] == 'a') ? 'b' : 'a';
         CHECK (keys::decode (wrongSum).status == keys::LoadStatus::Corrupt, "C5 校验和改一位 → 判坏");
 
-        // C6 版本行不认识（1 / 2 / 3 之外的一律不认）
+        // C6 版本行不认识（1 / 2 / 3 / 4 之外的一律不认）
         std::string v2 = body;
-        v2.replace (0, 14, "DOIPKEYRING 4\n");
+        v2.replace (0, 14, "DOIPKEYRING 5\n");
         CHECK (keys::decode (signedText (v2)).status == keys::LoadStatus::Corrupt,
-               "C6 版本行不是 1/2/3 → 判坏");
+               "C6 版本行不是 1/2/3/4 → 判坏");
+
+        // C6b v3 的账（36 字符的 L 行）照样读得进来 —— 那时候还记不下「谁」，按 0 读
+        std::string v3file = "DOIPKEYRING 3\nVER 0001\nBOOT 0002\n";
+        v3file += "K 0001 00 " + Sha256::hex (fw::demoKey (0x0001)) + "\n";
+        v3file += "L 0001 70D3 01 01 0001 0002 00000004\n";
+        const keys::LoadResult c6b = keys::decode (signedText (v3file));
+        CHECK (c6b.status == keys::LoadStatus::Ok && c6b.log.size () == 1 && c6b.log.at (0).actor == 0,
+               "C6b v3 的老账读得进来，谁记成 0（不判坏、也不猜一个出来）");
 
         // 以下四条：校验和都是对的（用 signedText 重算），坏在**内容**
         std::string dup = "DOIPKEYRING 1\nK 0001 00 " + Sha256::hex (fw::demoKey (0x0001)) + "\n" +

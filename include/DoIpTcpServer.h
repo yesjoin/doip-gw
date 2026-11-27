@@ -35,6 +35,7 @@
 #include "DoIpEntityStatus.h"   // M14：实体状态快照的类型
 #include "DoIpRouting.h"
 #include "ActivationAuth.h"     // M27：激活凭据（HMAC token）
+#include "SourceSlot.h"         // M28：SA ↔ 1 字节位子（写上 CAN 源地址）
 #include "StreamLedger.h"   // M12：边收边发的记账（纯逻辑）
 #include "TesterRegistry.h" // M13：实体级的 tester 地址仲裁（纯逻辑）
 
@@ -68,6 +69,10 @@ struct TcpServerConfig
     // token 装在 0x0005 的 OEM 4 字节里，绑源地址（见 ActivationAuth.h）。
     auth::Secret  authKey{};
     bool          authRequired = false;
+
+    // M28：要不要给每条激活的连接分一个 1 字节的"位子"，让它跟着请求走到 CAN。
+    //   默认关：关着的时候总线上所有诊断仪都是路由表里写的那个源地址（透明桥接）。
+    bool          stampSlots = false;
 
     // M6：谁能当诊断目标。为空 = 只认 entityAddress 自己（M3 语义）。
     std::function<bool (std::uint16_t)> targetKnown;
@@ -125,6 +130,8 @@ public:
     // M27：凭据的两本账。通过的次数就是"有过几个能证明自己的人"。
     std::size_t authPasses () const { return authPasses_; }
     std::size_t authRejects () const { return authRejects_; }
+    // M28：现在占了几个"位子"（0 = 没开，或者一台都没激活）
+    std::size_t slotsUsed () const { return slots_.used (); }
     std::size_t activeTesters () const { return registry_.active (); }
     // M14：现在开着几条 TCP_DATA socket（**连接数，不是激活数**）。
     //   原子量：UDP 线程（回答 0x4001）要读它，I/O 线程要写它。
@@ -167,6 +174,8 @@ private:
         std::uint64_t                            pendingJob = 0;   // M10：在途请求号
         std::uint16_t                            pendingSa  = 0;   // M10：谁发的（0x8001 的 TA 写回去）
         std::uint16_t                            pendingTarget = 0; // M10：问的谁（失败时 0x8003 的 SA 写它）
+        std::uint8_t                             slot = 0;         // M28：这条连接分到的"位子"（0 = 不知道/没开）
+        std::uint16_t                            slotSa = 0;       // M28：这位子是发给谁的（归还时认它，不认"当前 SA"）
     };
 
     void acceptPending ();
@@ -200,6 +209,9 @@ private:
     //   ★ 它不是连接状态，所以必须放在服务器上，而不是每条 Conn 里。
     //     放错地方的表现是"两个连接用同一个地址都激活成功"——这正是 M13 要堵的洞。
     TesterRegistry  registry_{4};     // open() 里按 cfg_.maxActivated 改上限
+    // M28：SA ↔ 位子的映射。放在服务器上，因为位子是"实体级资源"（和 M13 的地址账同层）：
+    //   放连接里 = 每条连接自己发号，两台会拿到同一个号。
+    slots::SlotTable slots_;
     std::uint64_t   nextConnId_ = 1;  // 连接号从 1 开始（0 当"没有"用，和 jobId 同一个约定）
 
     // M14：给 UDP 线程读的"现在开着几条 socket"。

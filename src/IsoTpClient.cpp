@@ -371,10 +371,17 @@ bool IsoTpClient::recvFunctional (std::vector<std::uint8_t> &resp, int timeoutMs
 
 bool IsoTpClient::request (const std::vector<std::uint8_t> &uds,
                            std::vector<std::uint8_t> &resp,
-                           std::string &err)
+                           std::string &err,
+                           std::uint32_t txId)
 {
     ++st_.requests;
     resp.clear ();
+
+    // M28：这一次用哪条 ID 发。0 = 回到通道配置的那条（老调用方不受影响）。
+    //   流控帧、连续帧也必须用同一条 ID —— ECU 是按 ID 分组装帧的，
+    //   中间换 ID 会让它把连续帧当成另一台诊断仪的新报文。
+    const std::uint32_t id = txId != 0 ? txId : cfg_.txId;
+    auto send = [&] (const std::uint8_t *d) { return sendFrameAs (id, d, err); };
 
     // 发之前先清仓：共享总线上，缓冲区里可能躺着上一轮/别人家的旧帧
     drainStale ();
@@ -383,7 +390,7 @@ bool IsoTpClient::request (const std::vector<std::uint8_t> &uds,
     if (!segmentMessage (uds, frames, err, cfg_.padByte, cfg_.frameBytes)) return false;
 
     // ---- 第一帧 ----
-    if (!sendFrame (frames[0].data (), err)) return false;
+    if (!send (frames[0].data ())) return false;
 
     // ---- 多帧：等流控，再按 BS / STmin 发连续帧 ----
     if (frames.size () > 1)
@@ -407,7 +414,7 @@ bool IsoTpClient::request (const std::vector<std::uint8_t> &uds,
                 sinceFc = 0;
             }
             if (stmin > 0) std::this_thread::sleep_for (std::chrono::milliseconds (stmin));
-            if (!sendFrame (frames[i].data (), err)) return false;
+            if (!send (frames[i].data ())) return false;
             ++sinceFc;
         }
     }
@@ -444,7 +451,7 @@ bool IsoTpClient::request (const std::vector<std::uint8_t> &uds,
         {
             std::uint8_t fcData[kFdFrameBytes];
             buildFlowControl (0, 0, cfg_.padByte, fcData, cfg_.frameBytes);
-            if (!sendFrame (fcData, err)) return false;
+            if (!send (fcData)) return false;
             ++st_.flowSent;
         }
     }

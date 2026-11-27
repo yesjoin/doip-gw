@@ -113,6 +113,11 @@ struct LogEntry
     Channel       channel     = Channel::Physical;
     std::uint16_t boot        = 0;                    // 第几次带变更的上电
     std::uint32_t seconds     = 0;                    // 那次上电之后多少秒
+    // ★ M28：第七格 —— 谁。
+    //   1 字节 = 网关分的位子（写到 CAN 源地址就是 0xF1..0xF8）。
+    //   0 = 不知道：11 位帧报不出源地址、上电参数改的、或网关没开 --stamp-sa。
+    //   它不是身份证：位子会回收再发，同一位子上午坐 A、下午坐 B。
+    std::uint8_t  actor       = 0;
 };
 
 // 定长环形记录，新在前：at(0) 是最近一条。
@@ -146,7 +151,7 @@ public:
         for (auto &s : slot_) s = LogEntry {};
     }
 
-    // 控制台/退账用："装入 0x0003，广播，版本 2，指纹 70D3，第 1 次上电 +3s"
+    // 控制台/退账用："装入 0x0003，广播，版本 2，指纹 70D3，第 1 次上电 +3s，谁 F1"
     std::string dump () const
     {
         if (empty ()) return "还没有变更";
@@ -155,12 +160,13 @@ public:
         {
             const LogEntry &e = at (i);
             char buf[128];
-            std::snprintf (buf, sizeof buf, "%s%s 0x%04X，%s，版本 %u，指纹 %04X，第 %u 次上电 +%us",
+            std::snprintf (buf, sizeof buf,
+                           "%s%s 0x%04X，%s，版本 %u，指纹 %04X，第 %u 次上电 +%us，谁 %02X",
                            i == 0 ? "" : " ／ ", actName (e.act),
                            static_cast<unsigned> (e.keyId), channelName (e.channel),
                            static_cast<unsigned> (e.generation),
                            static_cast<unsigned> (e.fingerprint), static_cast<unsigned> (e.boot),
-                           static_cast<unsigned> (e.seconds));
+                           static_cast<unsigned> (e.seconds), static_cast<unsigned> (e.actor));
             s += buf;
         }
         return s;
@@ -172,16 +178,19 @@ private:
     std::size_t newest_ = 0;
 };
 
-// 落盘一行：L <世代 4> <指纹 4> <动作 2> <通道 2> <keyId 4> <上电 4> <秒 8>，定长 36。
+// 落盘一行：L <世代 4> <指纹 4> <动作 2> <通道 2> <keyId 4> <上电 4> <秒 8> <谁 2>，定长 38。
 //   为什么这么笨：出事故时人要在串口里 cat 它，越直白越可靠。
+//   M28 把"谁"加在**末尾**：老的 36 字符前缀一个字不动，读旧文件时切掉最后 2 个就够了。
 inline std::string logLine (const LogEntry &e)
 {
     char buf[64];
-    std::snprintf (buf, sizeof buf, "L %04X %04X %02X %02X %04X %04X %08X\n",
+    // "谁"是**贴着秒数**写的（不另加空格）：这样 36 → 38 只多两个字符，
+    //   老的前 36 位一个字不动，读旧文件时直接 `ln.substr(0,36)` 就对得上。
+    std::snprintf (buf, sizeof buf, "L %04X %04X %02X %02X %04X %04X %08X%02X\n",
                    static_cast<unsigned> (e.generation), static_cast<unsigned> (e.fingerprint),
                    static_cast<unsigned> (actCode (e.act)), static_cast<unsigned> (chanCode (e.channel)),
                    static_cast<unsigned> (e.keyId), static_cast<unsigned> (e.boot),
-                   static_cast<unsigned> (e.seconds));
+                   static_cast<unsigned> (e.seconds), static_cast<unsigned> (e.actor));
     return std::string (buf);
 }
 
@@ -203,16 +212,19 @@ inline bool logHex (const std::string &s, std::uint64_t &out)
 }
 
 // 解一行落盘流水。形状不对 / 字段越界都返回 false —— 宁可判坏，不猜。
+//   36 字符（v3 的老行）= 没有"谁"，按 0 读；38 字符（v4）= 末尾多 2 位。
 inline bool parseLogLine (const std::string &ln, LogEntry &out)
 {
-    if (ln.size () != 36 || ln.compare (0, 2, "L ") != 0) return false;
+    const std::size_t n = ln.size ();
+    if ((n != 36 && n != 38) || ln.compare (0, 2, "L ") != 0) return false;
 
-    std::uint64_t gen = 0, fp = 0, act = 0, chan = 0, id = 0, boot = 0, sec = 0;
+    std::uint64_t gen = 0, fp = 0, act = 0, chan = 0, id = 0, boot = 0, sec = 0, who = 0;
     if (!logHex (ln.substr (2, 4), gen) || !logHex (ln.substr (7, 4), fp) ||
         !logHex (ln.substr (12, 2), act) || !logHex (ln.substr (15, 2), chan) ||
         !logHex (ln.substr (18, 4), id) || !logHex (ln.substr (23, 4), boot) ||
         !logHex (ln.substr (28, 8), sec))
         return false;
+    if (n == 38 && !logHex (ln.substr (36, 2), who)) return false;
 
     if (gen > 0xFFFF || fp > 0xFFFF || id > 0xFFFF || boot > 0xFFFF || sec > 0xFFFFFFFF) return false;
     if (!actValid (static_cast<std::uint8_t> (act))) return false;
@@ -227,6 +239,7 @@ inline bool parseLogLine (const std::string &ln, LogEntry &out)
     out.channel     = static_cast<Channel> (chan);
     out.boot        = static_cast<std::uint16_t> (boot);
     out.seconds     = static_cast<std::uint32_t> (sec);
+    out.actor       = static_cast<std::uint8_t> (who);
     return true;
 }
 

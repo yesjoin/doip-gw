@@ -185,6 +185,11 @@ struct DiagnosticMessage
     std::uint16_t             sourceAddress = 0;
     std::uint16_t             targetAddress = 0;
     std::vector<std::uint8_t> uds;           // 原样的 UDS 字节，不解析
+    // ★ M28：这个字段**不是报文的一部分**，也不进编码/解码。
+    //   它是网关内部从连接上下文带下来的"谁"（槽号 0 = 不知道）。
+    //   放这里是因为它必须跟着请求一路走：TCP 进来 → 网关排队 → CAN 发出，
+    //   只有一路带着它，下游（worker）才有东西可写成 CAN 源地址。
+    std::uint8_t              actorSlot = 0;
 };
 
 // 0x8002 诊断正应答（5 字节）

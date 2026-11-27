@@ -338,6 +338,33 @@ bool DoIpTcpServer::handleConn (Conn &c)
                     out.reason = "源地址 " + hex4 (req.sourceAddress) + " 路由激活成功" +
                                  "（实体已登记 " + std::to_string (registry_.active ()) + "/" +
                                  std::to_string (registry_.maxActive ()) + "）" + authNote;
+
+                    // ---- M28：发一个"位子" ----
+                    // 位子是实体级资源，和 M13 的地址账同层。发不出来（8 个都占着）
+                    // 就等于"进来了但记不下名字" —— 那就别进：退回 0x01（资源满），
+                    // 并且把刚登记的地址账也退掉（不然会留下一条"已激活但没位子"的僵尸记录）。
+                    if (cfg_.stampSlots)
+                    {
+                        c.slot   = slots_.take (req.sourceAddress);
+                        c.slotSa = c.slot != 0 ? req.sourceAddress : 0;
+                        if (c.slot == 0)
+                        {
+                            registry_.release (c.id);
+                            c.routing.reset ();
+                            out.activated = false;
+                            out.code      = static_cast<std::uint8_t> (ActivationResponseCode::AllSocketsRegistered);
+                            out.reason    = "位子满了（同时最多记 8 台诊断仪的名字），退回 0x01";
+                        }
+                        else
+                        {
+                            // 注意：canSourceOf 是 std::uint8_t，用 to_string 会打成十进制
+                            //   （"0xF1" 变成 "0x241"）。日志里给人看的东西必须是十六进制。
+                            char saHex[8] = {0};
+                            std::snprintf (saHex, sizeof saHex, "%02X",
+                                           static_cast<unsigned> (slots::canSourceOf (c.slot)));
+                            out.reason += "，位子 " + std::to_string (c.slot) + "（CAN 源地址 0x" + saHex + "）";
+                        }
+                    }
                 }
             }
 
@@ -426,6 +453,8 @@ bool DoIpTcpServer::handleConn (Conn &c)
             req.sourceAddress = o.sourceAddress;
             req.targetAddress = o.targetAddress;
             req.uds           = o.uds;
+            // M28：这条连接上验过的"谁"，跟着请求一路带到 CAN 侧。
+            req.actorSlot     = c.slot;
 
             // ---- M10：异步下游优先 ----
             // 与 M8 的区别：这里**不在这里等结果**，投完就返回 poll 循环。
@@ -708,6 +737,17 @@ void DoIpTcpServer::dropConn (Conn &c, const std::string &why)
         c.pendingJob    = 0;
         c.pendingSa     = 0;
         c.pendingTarget = 0;
+    }
+
+    // M28：位子也要还。不还的后果比地址泄漏更安静：8 台之后新来的一律 0x01，
+    //   而日志里看不出"其实是前面的人没还位子"，只看见"位子满了"。
+    //   为什么要用 slotSa 而不是 activatedSource：下面那行 reset() 会把它清空，
+    //   而且中途换过地址的连接（0x02 那种）也不该拿新地址去还旧位子。
+    if (c.slot != 0)
+    {
+        slots_.release (c.slotSa);
+        c.slot   = 0;
+        c.slotSa = 0;
     }
 
     // ★ 唯一的状态清空入口。

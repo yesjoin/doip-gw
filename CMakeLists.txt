@@ -135,6 +135,10 @@ target_include_directories(keyringlog-selftest PRIVATE include)
 # M27：激活凭据（HMAC 官方向量 / 与 sha256(secret||msg) 的区别 / token 绑 SA / 固定时间比较）
 add_executable(activationauth-selftest tests/activationauth_selftest.cpp)
 target_include_directories(activationauth-selftest PRIVATE include)
+
+# M28：源地址位子（SA→槽位分配 / 29 位 ID 最低字节改写 / 11 位帧没有这一格）
+add_executable(sourceslot-selftest tests/sourceslot_selftest.cpp)
+target_include_directories(sourceslot-selftest PRIVATE include)
 # ---- 工具 ----
 add_executable(doip-dump tools/doip_dump.cpp)
 target_link_libraries(doip-dump PRIVATE doip-codec)
@@ -184,4 +188,5 @@ add_test(NAME doip-keyringstore COMMAND keyringstore-selftest)
 add_test(NAME doip-keyringstamp  COMMAND keyringstamp-selftest)
 add_test(NAME doip-keyringlog    COMMAND keyringlog-selftest)
 add_test(NAME doip-activationauth COMMAND activationauth-selftest)
-set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic doip-isotp doip-route doip-pool doip-collector doip-stream doip-registry doip-entity doip-flash doip-session doip-reset doip-integrity doip-precheck doip-policy doip-keyring doip-keyringstore doip-keyringstamp doip-keyringlog doip-activationauth PROPERTIES LABELS unit)
+add_test(NAME doip-sourceslot COMMAND sourceslot-selftest)
+set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic doip-isotp doip-route doip-pool doip-collector doip-stream doip-registry doip-entity doip-flash doip-session doip-reset doip-integrity doip-precheck doip-policy doip-keyring doip-keyringstore doip-keyringstamp doip-keyringlog doip-activationauth doip-sourceslot PROPERTIES LABELS unit)

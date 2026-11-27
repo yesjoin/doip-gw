@@ -90,7 +90,7 @@ rm -f "$STORE_A" "$STORE_B" "$STORE_C" "$STORE_A.tmp" "$STORE_B.tmp" "$STORE_C.t
 start_fleet "$PORT_A" 30 1
 
 grep -q "清单：" "$ELOG_A" && ok "启动行报了清单（版本 + 指纹）" || bad "启动行没有清单"
-grep -q "DOIPKEYRING 3" "$STORE_A" && ok "盘上是 v3 文件（M26 起写新格式，仍带 VER 行）" || bad "盘上不是 v3"
+grep -q "DOIPKEYRING 4" "$STORE_A" && ok "盘上是带 VER/BOOT/流水的新格式（M28 起 v4，仍带 VER 行）" || bad "盘上格式不对"
 grep -q "^VER " "$STORE_A" && ok "文件里有 VER 行（世代落盘）" || bad "文件里没有 VER 行"
 
 python3 "$CHECK" "$PORT_A" 1 > "$OUT" 2>&1

@@ -42,9 +42,14 @@ public:
     bool isOpen () const { return fd_ >= 0; }
 
     // 发一条 UDS 请求，收回一条 UDS 响应。单帧/多帧都走这里。
+    //
+    // ★ M28：txId 参数是"这一次"用的请求 ID（0 = 用 cfg_.txId）。
+    //   为什么要按次传：一条通道可能被多台诊断仪轮着用，源地址要跟着**这一次请求**走，
+    //   不能跟着通道走——通道级存一个"当前是谁"，两台交叠时就串号了。
     bool request (const std::vector<std::uint8_t> &uds,
                   std::vector<std::uint8_t> &resp,
-                  std::string &err);
+                  std::string &err,
+                  std::uint32_t txId = 0);
 
     // ---- M8：功能寻址的两个动作，故意拆开 ----
     // 为什么拆开：广播只该发**一次**。如果每台 ECU 都调一次"发+收"，
