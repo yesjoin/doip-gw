@@ -156,6 +156,10 @@ target_include_directories(didpolicy-selftest PRIVATE include)
 add_executable(denyledger-selftest tests/denyledger_selftest.cpp)
 target_include_directories(denyledger-selftest PRIVATE include)
 
+# M34：多份越权账合并（跨份累加 / 每份分布 / 不套 32 组上限 / 按人按物求并集）
+add_executable(denymerge-selftest tests/denymerge_selftest.cpp)
+target_include_directories(denymerge-selftest PRIVATE include)
+
 # ---- 工具 ----
 add_executable(doip-dump tools/doip_dump.cpp)
 target_link_libraries(doip-dump PRIVATE doip-codec)
@@ -218,4 +222,5 @@ add_test(NAME doip-slotledger COMMAND slotledger-selftest)
 add_test(NAME doip-oppermission COMMAND oppermission-selftest)
 add_test(NAME doip-didpolicy COMMAND didpolicy-selftest)
 add_test(NAME doip-denyledger COMMAND denyledger-selftest)
-set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic doip-isotp doip-route doip-pool doip-collector doip-stream doip-registry doip-entity doip-flash doip-session doip-reset doip-integrity doip-precheck doip-policy doip-keyring doip-keyringstore doip-keyringstamp doip-keyringlog doip-activationauth doip-sourceslot doip-slotledger doip-oppermission doip-didpolicy doip-denyledger PROPERTIES LABELS unit)
+add_test(NAME doip-denymerge  COMMAND denymerge-selftest)
+set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic doip-isotp doip-route doip-pool doip-collector doip-stream doip-registry doip-entity doip-flash doip-session doip-reset doip-integrity doip-precheck doip-policy doip-keyring doip-keyringstore doip-keyringstamp doip-keyringlog doip-activationauth doip-sourceslot doip-slotledger doip-oppermission doip-didpolicy doip-denyledger doip-denymerge PROPERTIES LABELS unit)
