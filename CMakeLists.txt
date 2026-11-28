@@ -11,6 +11,15 @@ add_compile_options(-Wall -Wextra -Wpedantic)
 option(DOIP_WERROR "把编译警告当错误（-Werror），CI 用" OFF)
 if(DOIP_WERROR)
     add_compile_options(-Werror)
+    # GCC 15 在 -O2 下会对 libstdc++ 里 std::vector<含 vector 成员的对象> 的扩容/析构
+    # 报 -Wfree-nonheap-object，指向 new_allocator.h 的 delete（指针带非零偏移）。
+    # 这是编译器的已知误报（PR 109879 一类），不是本仓库代码"对非堆指针 delete"——
+    # 触发点全在标准库头里，我们自己没有裸 delete / free。
+    # 所以只对 GCC >= 15 关这一条；其余警告仍然 -Werror，老版本编译器不受影响。
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 15)
+        add_compile_options(-Wno-free-nonheap-object)
+        message(STATUS "GCC ${CMAKE_CXX_COMPILER_VERSION}：关掉 -Wfree-nonheap-object（known false positive）")
+    endif()
 endif()
 
 find_package(Threads REQUIRED)

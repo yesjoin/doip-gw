@@ -56,7 +56,7 @@ jobs:
         #   抬成 annotation 之后，一条 curl 就能读到是哪个文件哪一行红的。
         run: |
           if ! cmake --build build -j"$(nproc)" > /tmp/build.log 2>&1; then
-            grep -E "error:|warning:|undefined reference" /tmp/build.log | head -20 \
+            grep -E "error:|warning:|undefined reference|In file included from" /tmp/build.log | head -30 \
               | while IFS= read -r l; do echo "::error::${l}"; done
             tail -n 40 /tmp/build.log
             exit 1
