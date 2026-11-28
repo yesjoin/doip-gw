@@ -4059,6 +4059,8 @@ doip-denymerge 33 项（新）
 
 1. **`runsOfSa` 一开始写成了取最大**：同一个 SA 可能有多组试探分散在不同份账里（A 组在第 1、2 份，B 组在第 3 份），取最大会得到 2，并集才是 3。E 组专门钉这一条。
 2. **单测里两处索引/算术自己写错**（B6 取错 entries 下标、C3 把 40 写成 32）——和 M33 一样，红的是断言不是代码。这也是为什么每条断言都要能被一个具体事实反驳。
+3. **本地 gcc 11 全绿，GitHub 的 gcc 15 红**：GCC 15 在 `-O2` 下对 libstdc++ 里"含 `std::vector` 成员的对象"扩容/析构报 `-Wfree-nonheap-object`，指向 `new_allocator.h` 的 `delete`（指针带非零偏移）。这是编译器已知误报（PR 109879 一类），触发点全在标准库头里，仓库自己没有任何裸 `delete` / `free`。处理是只对 GCC ≥ 15 关这一条（其余警告仍 `-Werror`），并在 `CMakeLists.txt` 里写清理由。
+   同时把 CI 的构建步改成**失败时把 `error:` / `warning:` 抬成 annotation** —— 日志页要登录、`check-runs` 接口只有 exit code，抬成 annotation 之后一条 `curl` 就能读到是哪一行。这条坑本身就是"本地绿 ≠ CI 绿"的活例子：同一份代码，两个编译器版本。
 
 ### 仍然没有的（这一步的边界）
 
