@@ -113,6 +113,7 @@ int main (int argc, char **argv)
     bool haveKey = false;
     bool stampSa = false;        // M28：把"谁"写成 CAN 源地址（默认关 = 透明桥接）
     std::string slotLedgerPath;  // M29：位子租约账落盘的路径（不写 = 不落盘）
+    std::string denyLedgerPath;  // M33：越权账落盘的路径（不写 = 不落盘）
     // M30：诊断防火墙。enforceOps 默认关 —— 关着的时候网关不会多看一眼请求内容。
     bool              enforceOps = false;
     ops::PermissionTable opTable;
@@ -137,6 +138,7 @@ int main (int argc, char **argv)
         else if (a == "--no-stream")                stream = false;   // M12：退回 M11 的"攒齐再发"
         else if (a == "--stamp-sa")                 stampSa = true;   // M28：在位子上写源地址
         else if (a == "--slot-ledger" && i + 1 < argc) slotLedgerPath = argv[++i];   // M29：位子账
+        else if (a == "--deny-ledger" && i + 1 < argc) denyLedgerPath = argv[++i];   // M33：越权账
         // M30：诊断防火墙的三条参数。档位名只认 read / write / flash，
         //   拼错的档名直接退出 —— 权限这种东西，"猜一个差不多的"等于没设。
         else if (a == "--enforce-ops") enforceOps = true;
@@ -256,6 +258,7 @@ int main (int argc, char **argv)
                           "          [--enforce-ops] [--grant SA:read|write|flash]... [--default-grant read|write|flash]\n"
                           "          [--did-guard] [--did DID:open|guarded|secret]... [--did-default open|guarded|secret]\n"
                           "          [--did-guard-resp]\n"
+                          "          [--deny-ledger 路径]\n"
                           "      例：%s --route 0002:7E0:7E8:ECU_A --route 0003:7A0:7A8:ECU_B\n"
                           "          --func 0xE400:0x7DF:ALL\n",
                           argv[0], argv[0]);
@@ -334,6 +337,7 @@ int main (int argc, char **argv)
     cfg.didGuard   = didGuard;
     cfg.didTable   = didTable;
     cfg.didGuardResp = didGuardResp;
+    cfg.denyLedgerPath = denyLedgerPath;
 
     // 谁能当诊断目标 = 物理表里有谁 + 功能表里有谁。都不在的 TA 一律 0x8003 0x03。
     cfg.targetKnown = [&table] (std::uint16_t ta) { return table.reachable (ta); };
@@ -400,6 +404,11 @@ int main (int argc, char **argv)
                      "不够档的响应不发给诊断仪 —— 数据不出去）\n");
     else
         std::printf ("DID 白名单（响应）：关（62 原样转发；加 --did-guard-resp 才挡）\n");
+    // M33：越权账。它记的是"谁在试探什么、挡了多少次"——只有 stdout 的时候，进程一停就没了。
+    //   **这是本次运行的账**：进程单调秒重启归零，两份账的时间不可比，所以要留历史就每次另存。
+    if (!denyLedgerPath.empty ())
+        std::printf ("越权账：写到 %s（只记被网关挡回的；同一组聚合计数；退出时落盘，只代表本次运行）\n",
+                     denyLedgerPath.c_str ());
     // M29：位子账说清楚 —— 账是"谁在什么时候占着哪个位子"，对账工具靠它把 ECU 的位子还原成 SA。
     if (!slotLedgerPath.empty ())
         std::printf ("位子账：写到 %s（退出时落盘；doip-audit 拿它和 ECU 的流水对账）\n",
@@ -541,6 +550,31 @@ int main (int argc, char **argv)
     //   "纵深防御"就从口号变成能被审计的事实。
     if (cfg.didGuardResp)
         std::printf ("DID 白名单（响应）：因 DID 级别不够而挡回 %zu 条\n", srv.respDidDenied ());
+    // M33：越权账的摘要 + 落盘。这里报的是"几条、合计几次、最常被试探的是谁"，
+    //   然后（如果给了路径）写盘 —— 写盘供 doip-deny 事后统计，stdout 只给人当场看一眼。
+    if (!denyLedgerPath.empty ())
+    {
+        const deny::DenyLedger &dl = srv.denyLedger ();
+        std::printf ("越权账：%zu 条记录，合计 %llu 次挡回（账满丢弃 %zu 条 / %zu 次）\n", dl.size (),
+                     static_cast<unsigned long long> (dl.totalHits ()), dl.droppedEntries (),
+                     dl.droppedHits ());
+        const deny::Entry *worst = dl.worst ();
+        if (worst != nullptr)
+        {
+            const std::string didPart =
+                worst->did != 0 ? " / DID " + dids::hex4 (worst->did) + "（" + dids::didName (worst->did) + "）"
+                                : "";
+            std::printf ("最常被试探：SA 0x%04X 想 0x%02X%s（%s）×%llu\n",
+                         static_cast<unsigned> (worst->sa), static_cast<unsigned> (worst->sid),
+                         didPart.c_str (), deny::reasonName (worst->why),
+                         static_cast<unsigned long long> (worst->count));
+        }
+        std::string why;
+        if (srv.saveDenyLedger (denyLedgerPath, why))
+            std::printf ("越权账已写入 %s（供 doip-deny 统计）\n", denyLedgerPath.c_str ());
+        else
+            std::printf ("越权账写失败：%s\n", why.c_str ());
+    }
     // M28：位子账。**没还的**才叫问题 —— 这里报的是"此刻还占着几个"，
     //   正常收尾应该是 0（每条连接断开都还了）。不是 0 就说明有人没还。
     if (cfg.stampSlots)

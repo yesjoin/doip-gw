@@ -38,6 +38,7 @@
 #include "SourceSlot.h"         // M28：SA ↔ 1 字节位子（写上 CAN 源地址）
 #include "OpPermission.h"
 #include "DidPolicy.h"           // M31：DID 白名单（读什么也分档）
+#include "DenyLedger.h"          // M33：越权账（谁在试探什么，挡了多少次）
 #include "SlotLedger.h"          // M29：位子租约账（把 ECU 的"第几号位子"还原成"哪台 SA"）
 #include "StreamLedger.h"   // M12：边收边发的记账（纯逻辑）
 #include "TesterRegistry.h" // M13：实体级的 tester 地址仲裁（纯逻辑）
@@ -93,6 +94,11 @@ struct TcpServerConfig
     //   请求侧挡"想读"，响应侧挡"数据外流"；两个方向复用同一张 didTable。
     //   默认关：单独开它不影响请求侧，只是数据出网关前多一道闸。
     bool              didGuardResp = false;
+
+    // ---- M33：越权账（挡回聚合 + 退出落盘）----
+    //   非空才记（不记就不占内存）；账只记"被网关挡回"，ECU 自己拒的不算。
+    //   挡回有三种来源：服务号档不够 / DID 抬档 / 响应侧拦（M32）；三种分开记。
+    std::string       denyLedgerPath;
 
     // M6：谁能当诊断目标。为空 = 只认 entityAddress 自己（M3 语义）。
     std::function<bool (std::uint16_t)> targetKnown;
@@ -166,6 +172,12 @@ public:
     std::size_t opAllowed () const { return opAllowed_; }
     std::size_t didDenied () const { return didDenied_; }   // M31：其中被 DID 抬档挡掉的
     std::size_t respDidDenied () const { return respDidDenied_; }   // M32：响应方向被 DID 挡掉的
+    // M33：越权账。账只在主 poll 线程里写（与 M29 的位子账同一个理由），退出时才被读。
+    const deny::DenyLedger &denyLedger () const { return denyLedger_; }
+    bool saveDenyLedger (const std::string &path, std::string &why) const
+    {
+        return denyLedger_.save (path, why);
+    }
     std::size_t opDenied () const { return opDenied_; }
     std::size_t opDeniedRead () const { return opDeniedRead_; }
     std::size_t opDeniedWrite () const { return opDeniedWrite_; }
@@ -248,6 +260,7 @@ private:
     std::size_t     opAllowed_      = 0;
     std::size_t     didDenied_      = 0;   // M31：因为 DID 级别不够而被挡的条数
     std::size_t     respDidDenied_  = 0;   // M32：响应方向因为 DID 级别不够而被挡的条数
+    deny::DenyLedger denyLedger_;         // M33：越权账（聚合，最多 32 条）
     std::size_t     opDenied_       = 0;
     std::size_t     opDeniedRead_   = 0;
     std::size_t     opDeniedWrite_  = 0;

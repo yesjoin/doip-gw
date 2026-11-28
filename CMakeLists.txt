@@ -152,6 +152,10 @@ target_include_directories(oppermission-selftest PRIVATE include)
 add_executable(didpolicy-selftest tests/didpolicy_selftest.cpp)
 target_include_directories(didpolicy-selftest PRIVATE include)
 
+# M33：越权账（聚合 / 上限 / 定长落盘带校验和 / 次数那一格是十进制）
+add_executable(denyledger-selftest tests/denyledger_selftest.cpp)
+target_include_directories(denyledger-selftest PRIVATE include)
+
 # ---- 工具 ----
 add_executable(doip-dump tools/doip_dump.cpp)
 target_link_libraries(doip-dump PRIVATE doip-codec)
@@ -159,6 +163,10 @@ target_link_libraries(doip-dump PRIVATE doip-codec)
 # M29：对账工具（ECU 流水 + 网关位子账 → 谁）
 add_executable(doip-audit tools/doip_audit.cpp)
 target_include_directories(doip-audit PRIVATE include)
+
+# M33：越权账查询工具（读一份 DOIPDENY，回答"谁在试探什么、多少次"）
+add_executable(doip-deny tools/doip_deny.cpp)
+target_include_directories(doip-deny PRIVATE include)
 
 add_executable(doip-discover tools/doip_discover.cpp)
 target_link_libraries(doip-discover PRIVATE doip-discovery Threads::Threads)
@@ -209,4 +217,5 @@ add_test(NAME doip-sourceslot COMMAND sourceslot-selftest)
 add_test(NAME doip-slotledger COMMAND slotledger-selftest)
 add_test(NAME doip-oppermission COMMAND oppermission-selftest)
 add_test(NAME doip-didpolicy COMMAND didpolicy-selftest)
-set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic doip-isotp doip-route doip-pool doip-collector doip-stream doip-registry doip-entity doip-flash doip-session doip-reset doip-integrity doip-precheck doip-policy doip-keyring doip-keyringstore doip-keyringstamp doip-keyringlog doip-activationauth doip-sourceslot doip-slotledger doip-oppermission doip-didpolicy PROPERTIES LABELS unit)
+add_test(NAME doip-denyledger COMMAND denyledger-selftest)
+set_tests_properties(doip-codec doip-discovery doip-routing doip-diagnostic doip-isotp doip-route doip-pool doip-collector doip-stream doip-registry doip-entity doip-flash doip-session doip-reset doip-integrity doip-precheck doip-policy doip-keyring doip-keyringstore doip-keyringstamp doip-keyringlog doip-activationauth doip-sourceslot doip-slotledger doip-oppermission doip-didpolicy doip-denyledger PROPERTIES LABELS unit)

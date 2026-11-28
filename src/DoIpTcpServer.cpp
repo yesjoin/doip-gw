@@ -498,6 +498,18 @@ bool DoIpTcpServer::handleConn (Conn &c)
                                            static_cast<std::uint8_t> (d.have);
                     if (byDid) ++didDenied_;
 
+                    // ---- M33：越权账 ----
+                    // ★ 只在给了 --deny-ledger 时记：没这个需求就别占内存。
+                    // ★ 同一组 (SA / 服务号 / DID / 需档 / 有档 / 原因) 聚合成一条，只累加次数。
+                    //   扫服务的机器一分钟能撞几百次，逐条流水会把账撑爆，而且每条几乎一样。
+                    // ★ 不加锁：请求处理全在主 poll 这一条线程里（M3 起的结构），
+                    //   账只有它写、退出时才被读。
+                    if (!cfg_.denyLedgerPath.empty ())
+                        denyLedger_.note (o.sourceAddress, info.sid, did.isRead ? did.did : 0, need,
+                                          d.have,
+                                          byDid ? deny::Reason::DidLevel : deny::Reason::OpTier,
+                                          deny::nowSec ());
+
                     DiagnosticMessage deny;
                     deny.sourceAddress = o.targetAddress;   // 代那台 ECU 说话，源写 ECU
                     deny.targetAddress = o.sourceAddress;
@@ -755,6 +767,14 @@ bool DoIpTcpServer::responseDenied (std::uint16_t sa, const std::vector<std::uin
           ops::tierName (need) + "档)，但它只有「" + ops::tierName (d.have) +
           "」→ 这条 0x62 不发给诊断仪（数据不出去）";
     log (why);
+
+    // M33：出口挡回也进越权账，原因单列第三种。
+    //   ★ 与请求侧那两种分开记：这是"数据差点漏出去"，追责时和"档太低"不是一件事。
+    if (!cfg_.denyLedgerPath.empty ())
+    {
+        const std::uint8_t sid = uds.empty () ? 0x00 : uds[0];
+        denyLedger_.note (sa, sid, di.did, need, d.have, deny::Reason::RespDid, deny::nowSec ());
+    }
     return true;
 }
 
