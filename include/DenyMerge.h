@@ -168,12 +168,15 @@ public:
     }
 
     // 撞得最狠的那一组（次数最多；并列取先出现的）。
+    // 按下标取而不是在 range-for 里 `&e`：后者在部分编译器上是
+    //   -Wdangling-reference 的已知误报触发点（绑定到容器元素其实合法，但机器不总是这么看）。
     const MergedEntry *worst () const
     {
-        const MergedEntry *w = nullptr;
-        for (const auto &e : entries_)
-            if (w == nullptr || e.count > w->count) w = &e;
-        return w;
+        if (entries_.empty ()) return nullptr;
+        std::size_t best = 0;
+        for (std::size_t i = 1; i < entries_.size (); ++i)
+            if (entries_[i].count > entries_[best].count) best = i;
+        return &entries_[best];
     }
 
 private:

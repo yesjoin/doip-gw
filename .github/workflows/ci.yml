@@ -51,7 +51,17 @@ jobs:
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS=-O2 -DDOIP_WERROR=${{ matrix.werror }}
 
       - name: 构建
-        run: cmake --build build -j"$(nproc)"
+        # 失败时把编译器吐的 error / warning 行抬成 annotation。
+        #   目的不是"修"，是"看得见"：日志页要登录，check-runs 接口只有 exit code；
+        #   抬成 annotation 之后，一条 curl 就能读到是哪个文件哪一行红的。
+        run: |
+          if ! cmake --build build -j"$(nproc)" > /tmp/build.log 2>&1; then
+            grep -E "error:|warning:|undefined reference" /tmp/build.log | head -20 \
+              | while IFS= read -r l; do echo "::error::${l}"; done
+            tail -n 40 /tmp/build.log
+            exit 1
+          fi
+          tail -n 3 /tmp/build.log
 
       - name: 自测（ctest）
         run: cd build && ctest --output-on-failure
